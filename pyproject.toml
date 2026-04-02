@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-gateway"
+version = "0.1.0"
+description = "Provider-neutral LLM gateway with cost and reliability controls"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.110,<1",
+  "httpx>=0.27,<1",
+  "pydantic>=2.6,<3",
+  "PyYAML>=6,<7",
+  "uvicorn[standard]>=0.27,<1",
+]
+
+[project.scripts]
+llm-gateway = "llm_gateway.main:run"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["llm_gateway*"]
