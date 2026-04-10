@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import httpx
+
+from .observability import PROVIDER_LATENCY, PROVIDER_REQUESTS
 
 
 class ProviderError(Exception):
@@ -14,7 +17,7 @@ class ProviderError(Exception):
 
 
 def _token_usage(body: dict[str, Any], kind: str) -> dict[str, int]:
-    usage = body.get("usage", {})
+    usage = body.get("usageMetadata", {}) if kind == "gemini" else body.get("usage", {})
     if kind == "anthropic":
         prompt = int(usage.get("input_tokens", 0) or 0)
         completion = int(usage.get("output_tokens", 0) or 0)
@@ -60,19 +63,38 @@ class ProviderClient:
             provider_payload = {**payload, "model": model}
         else:
             raise ProviderError(f"Unsupported provider kind {kind!r}")
+        started = time.perf_counter()
+        outcome = "network_error"
         try:
             response = await self.http.post(url, json=provider_payload, headers=headers, params=params, timeout=self.timeout)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
             raise ProviderError(f"{type(exc).__name__}: upstream request failed", retryable=True) from exc
         if response.status_code >= 400:
+            outcome = "rate_limited" if response.status_code == 429 else "upstream_error"
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
             retryable = response.status_code == 429 or response.status_code >= 500
             # Keep upstream error bodies out of logs and client responses; providers can echo prompts/secrets.
             raise ProviderError(f"Upstream returned HTTP {response.status_code}", retryable=retryable, status_code=response.status_code)
         try:
             body = response.json()
         except ValueError as exc:
+            outcome = "invalid_response"
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
             raise ProviderError("Provider returned invalid JSON", retryable=True) from exc
-        return self._normalize(body, kind, model)
+        try:
+            result = self._normalize(body, kind, model)
+        except ProviderError:
+            outcome = "invalid_response"
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
+            raise
+        PROVIDER_REQUESTS.labels(provider=provider_name, outcome="success").inc()
+        PROVIDER_LATENCY.labels(provider=provider_name, outcome="success").observe(time.perf_counter() - started)
+        return result
 
     @staticmethod
     def _anthropic_payload(model: str, payload: dict[str, Any]) -> dict[str, Any]:

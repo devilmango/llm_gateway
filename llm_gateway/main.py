@@ -7,36 +7,53 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from opentelemetry import trace
 
 from .config import load_config
+from .limiting import RateLimitExceeded
+from .observability import (
+    CACHE_HITS,
+    COST,
+    FALLBACKS,
+    IN_FLIGHT,
+    LATENCY,
+    REQUESTS,
+    TOKENS,
+    initialize_tracing,
+    metrics_response,
+)
 from .providers import ProviderError
 from .redaction import redact
 from .schemas import ChatChoice, ChatRequest, ChatResponse, Usage
 from .service import GatewayService
-from .storage import UsageStore
+from .storage import BudgetExceeded, UsageStore
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("llm_gateway")
+TRACER_PROVIDER = initialize_tracing()
+TRACER = TRACER_PROVIDER.get_tracer("llm_gateway")
 
 
-def create_app(config: dict[str, Any] | None = None) -> FastAPI:
+def create_app(config: dict[str, Any] | None = None,
+               http_transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
     cfg = config or load_config()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         timeout = httpx.Timeout(float(cfg["server"].get("request_timeout_seconds", 45)))
-        app.state.http = httpx.AsyncClient(timeout=timeout)
+        app.state.http = httpx.AsyncClient(timeout=timeout, transport=http_transport)
         app.state.gateway = GatewayService(cfg, app.state.http)
         database = os.getenv("GATEWAY_DATABASE", cfg["server"].get("database", "./gateway.sqlite3"))
         app.state.store = UsageStore(database)
         yield
         await app.state.http.aclose()
+        TRACER_PROVIDER.force_flush()
 
     app = FastAPI(title="LLM Gateway", version="0.1.0", lifespan=lifespan)
 
@@ -51,6 +68,11 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics() -> Response:
+        body, content_type = metrics_response()
+        return Response(content=body, media_type=content_type)
+
     @app.get("/v1/routes", dependencies=[Depends(authenticate)])
     async def routes() -> dict[str, Any]:
         return {name: {"provider": route["provider"], "model": route["model"],
@@ -61,6 +83,9 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     async def chat(body: ChatRequest, request: Request) -> ChatResponse:
         request_id = "gw_" + uuid.uuid4().hex
         started = time.perf_counter()
+        IN_FLIGHT.inc()
+        span = TRACER.start_span("llm.gateway.request")
+        span.set_attribute("llm.gateway.request_id", request_id)
         route_name = body.model
         messages = [{"role": message.role, "content": message.content} for message in body.messages]
         should_redact = bool(cfg.get("security", {}).get("redact_pii", True))
@@ -74,8 +99,22 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
         app_name = body.application.strip() or "default"
         result: dict[str, Any] | None = None
         error_type: str | None = None
+        reservation = 0.0
+        policy: dict[str, Any] = {}
+        monthly_limit: float | None = None
         try:
-            result = await request.app.state.gateway.complete(route_name, upstream_payload)
+            budget_cfg = cfg.get("budgets", {})
+            policy = {**budget_cfg.get("default", {}), **budget_cfg.get("applications", {}).get(app_name, {})}
+            app_rate = policy.get("max_requests_per_minute")
+            if app_rate is not None:
+                await request.app.state.gateway.acquire_application_quota(app_name, int(app_rate))
+            monthly_limit = policy.get("monthly_limit_usd")
+            if monthly_limit is not None:
+                reservation = request.app.state.gateway.budget_reservation(route_name, upstream_payload, policy)
+                await asyncio.to_thread(request.app.state.store.reserve_budget, request_id, app_name,
+                                        reservation, float(monthly_limit))
+            with trace.use_span(span, end_on_exit=False):
+                result = await request.app.state.gateway.complete(route_name, upstream_payload)
             usage = result["usage"]
             provider = result["provider"]
             model = result["model"]
@@ -83,6 +122,12 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             cost = (usage["prompt_tokens"] * float(price.get("input_cost_per_1m", 0)) +
                     usage["completion_tokens"] * float(price.get("output_cost_per_1m", 0))) / 1_000_000
             status = "success"
+            span.set_attribute("llm.gateway.provider", provider)
+            span.set_attribute("llm.gateway.model", model)
+            span.set_attribute("llm.gateway.fallback_used", bool(result["fallback_used"]))
+            span.set_attribute("llm.gateway.cached", bool(result["cached"]))
+            span.set_attribute("llm.usage.total_tokens", usage["total_tokens"])
+            span.set_attribute("llm.cost.usd", cost)
             output = ChatResponse(id=request_id, created=int(time.time()), model=route_name,
                 choices=[ChatChoice(message={"role": "assistant", "content": result["text"]}, finish_reason=result.get("finish_reason"))],
                 usage=Usage(**usage), gateway={"provider": provider, "upstream_model": model,
@@ -92,8 +137,14 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             status, error_type = "failure", "unknown_route"
             raise HTTPException(status_code=400, detail=f"Unknown route {route_name!r}")
         except ValueError as exc:
-            status, error_type = "failure", "configuration_error"
-            raise HTTPException(status_code=500, detail=str(exc))
+            status, error_type = "rejected", "request_limit_exceeded"
+            raise HTTPException(status_code=400, detail=str(exc))
+        except BudgetExceeded as exc:
+            status, error_type = "rejected", "monthly_budget_exceeded"
+            raise HTTPException(status_code=429, detail="Application monthly spend limit reached") from exc
+        except RateLimitExceeded as exc:
+            status, error_type = "rejected", "application_rate_limit_exceeded"
+            raise HTTPException(status_code=429, detail="Application request quota exceeded") from exc
         except ProviderError as exc:
             status, error_type = "failure", "upstream_error"
             raise HTTPException(status_code=502, detail="All configured providers failed") from exc
@@ -110,7 +161,7 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             report_price = cfg["providers"].get(provider_name, {}).get("models", {}).get(configured_model, {}) if provider_name else {}
             cost_value = (usage_data.get("prompt_tokens", 0) * float(report_price.get("input_cost_per_1m", 0)) +
                           usage_data.get("completion_tokens", 0) * float(report_price.get("output_cost_per_1m", 0))) / 1_000_000
-            record = {"request_id": request_id, "occurred_at": datetime.now(timezone.utc).isoformat(),
+            record = {"request_id": request_id, "occurred_at": datetime.now(UTC).isoformat(),
                 "application": app_name, "route": route_name, "provider": provider_name, "model": model_name,
                 "prompt_tokens": usage_data.get("prompt_tokens", 0), "completion_tokens": usage_data.get("completion_tokens", 0),
                 "total_tokens": usage_data.get("total_tokens", 0), "cost_usd": cost_value,
@@ -118,6 +169,29 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
                 "fallback_used": int(bool(result and result.get("fallback_used"))),
                 "cached": int(bool(result and result.get("cached"))), "error_type": error_type}
             await asyncio.to_thread(request.app.state.store.record, record)
+            metric_route = route_name if route_name in cfg["routes"] else "unknown"
+            REQUESTS.labels(route=metric_route, status=record["status"]).inc()
+            TOKENS.labels(route=metric_route, kind="prompt").inc(record["prompt_tokens"])
+            TOKENS.labels(route=metric_route, kind="completion").inc(record["completion_tokens"])
+            COST.labels(route=metric_route).inc(cost_value)
+            if record["fallback_used"]:
+                FALLBACKS.labels(route=metric_route).inc()
+            if record["cached"]:
+                CACHE_HITS.labels(route=metric_route).inc()
+            LATENCY.labels(route=metric_route, status=record["status"]).observe(elapsed_ms / 1000)
+            if monthly_limit is not None:
+                alert_thresholds = policy.get("alert_thresholds", [0.8, 1.0])
+                alerts = await asyncio.to_thread(request.app.state.store.check_budget_alerts,
+                    app_name, float(monthly_limit), [float(value) for value in alert_thresholds])
+                for alert in alerts:
+                    logger.warning("budget_alert application=%s threshold=%s spend_usd=%.8f limit_usd=%.8f",
+                        redact(app_name), alert["threshold"], alert["spend_usd"], alert["limit_usd"])
+            span.set_attribute("llm.gateway.status", record["status"])
+            span.set_attribute("llm.gateway.application", app_name)
+            if error_type:
+                span.set_attribute("error.type", error_type)
+            span.end()
+            IN_FLIGHT.dec()
             logger.info("request_id=%s application=%s route=%s provider=%s model=%s status=%s latency_ms=%s tokens=%s cost_usd=%.8f fallback=%s cached=%s error=%s",
                 request_id, redact(app_name), route_name, provider_name, model_name, record["status"], elapsed_ms,
                 record["total_tokens"], cost_value, record["fallback_used"], record["cached"], error_type)
@@ -130,6 +204,29 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
             return await asyncio.to_thread(request.app.state.store.report, start, end, application)
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Invalid report filters") from exc
+
+    @app.get("/v1/admin/budgets", dependencies=[Depends(authenticate)])
+    async def budgets(request: Request) -> dict[str, Any]:
+        """Return current UTC calendar-month spend and configured application limits."""
+        configured = cfg.get("budgets", {})
+        applications = configured.get("applications", {})
+        defaults = configured.get("default", {})
+        month_start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        budgets_out = []
+        for application, override in applications.items():
+            policy = {**defaults, **override}
+            limit = policy.get("monthly_limit_usd")
+            spent = 0.0
+            if limit is not None:
+                report = await asyncio.to_thread(request.app.state.store.report,
+                    month_start.isoformat(), None, application)
+                spent = float(report["cost_usd"])
+            budgets_out.append({"application": application, "monthly_limit_usd": limit,
+                "monthly_spend_usd": round(spent, 8),
+                "remaining_usd": round(max(0.0, float(limit) - spent), 8) if limit is not None else None,
+                "utilization": spent / float(limit) if limit not in (None, 0) else None,
+                "max_requests_per_minute": policy.get("max_requests_per_minute")})
+        return {"period_start": month_start.isoformat(), "applications": budgets_out}
 
     @app.exception_handler(HTTPException)
     async def safe_http_errors(request: Request, exc: HTTPException) -> JSONResponse:

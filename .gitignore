@@ -1,7 +1,33 @@
+# Local credentials and environment overrides. Keep the documented template tracked.
 .env
+.env.*
+!.env.example
+
+# Python environments and generated package/build output.
 .venv/
 __pycache__/
 *.py[cod]
+build/
+dist/
 *.sqlite3*
+
+# Test, lint, type-check, and coverage caches/reports.
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.hypothesis/
+.tox/
+.nox/
+*.egg-info/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local logs, editor files, and OS metadata.
+*.log
+.idea/
+.vscode/
 .DS_Store
+Thumbs.db
+*.swp

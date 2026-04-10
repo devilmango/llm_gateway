@@ -9,6 +9,19 @@ security:
   redact_pii: true
   # Configure GATEWAY_API_KEY in the environment to require gateway authentication.
 
+# Application budgets and quotas are enforced only when configured for the app
+# or under `default`. Monthly windows are UTC calendar months.
+budgets:
+  default:
+    monthly_limit_usd: null
+    max_requests_per_minute: null
+  applications:
+    support-router:
+      monthly_limit_usd: 100
+      max_requests_per_minute: 300
+      max_input_bytes: 32768
+      max_completion_tokens: 1024
+
 providers:
   openai:
     kind: openai

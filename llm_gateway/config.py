@@ -7,7 +7,6 @@ from typing import Any
 
 import yaml
 
-
 _ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::-([^}]*))?\}")
 
 

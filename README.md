@@ -42,6 +42,9 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Traffic controls | Apply request timeouts, a maximum in-flight request count, and per-provider requests-per-minute limits. |
 | Usage and cost ledger | Persist provider, route, model, token usage, estimated USD cost, status, latency, fallback, and cache-hit metadata in SQLite. |
 | Application reporting | Group usage and reliability totals by the caller-supplied application name. |
+| Application budgets and quotas | Enforce UTC calendar-month spend caps, per-application request rates, and request size/output bounds. Reserve estimated maximum cost before provider calls to limit concurrent overspend. |
+| Budget alerts | Emit structured warning logs once per application and month when configured spend thresholds (80% and 100% by default) are crossed. |
+| Observability | Export Prometheus request, token, cost, fallback, cache, in-flight, end-to-end latency, provider outcome/latency, and retry metrics; emit nested OpenTelemetry request/provider-attempt spans and optionally export them over OTLP/HTTP. |
 | Response cache | Optionally cache a route's completion for a configured TTL. Cache hits have zero upstream usage and cost in the ledger. |
 | PII and secret redaction | Pattern-redact common email addresses, phone-like strings, and API-key forms in message text before sending upstream. |
 | Optional gateway authentication | Require a bearer key for route, completion, and report endpoints by setting `GATEWAY_API_KEY`. |
@@ -91,6 +94,7 @@ Useful local URLs:
 - `GET http://localhost:8000/health` — liveness check
 - `GET http://localhost:8000/docs` — interactive API docs
 - `GET http://localhost:8000/v1/routes` — active logical route configuration
+- `GET http://localhost:8000/metrics` — Prometheus metrics
 
 To require a key from gateway clients, set `GATEWAY_API_KEY` in the gateway process and send it as a bearer token. The health endpoint remains public for liveness probes.
 
@@ -150,6 +154,8 @@ Each route has a primary `provider` and `model`, an ordered optional `fallbacks`
 | `GOOGLE_API_KEY` | Gemini credential when configured | Unset |
 | `PORT` | HTTP listen port | `8000` |
 | `LOG_LEVEL` | Python logging level | `INFO` |
+| `OTEL_SERVICE_NAME` | OpenTelemetry service resource name | `llm-gateway` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Optional OTLP/HTTP traces endpoint | Unset (spans are not exported) |
 
 ## API
 
@@ -202,6 +208,8 @@ Supported request fields are `model`, `messages`, `application`, `temperature`, 
 | `GET` | `/v1/routes` | Configured route names, providers, models, fallbacks, and cache policy. |
 | `POST` | `/v1/chat/completions` | Make a routed chat completion. |
 | `GET` | `/v1/admin/report` | Aggregate token, cost, and reliability data. |
+| `GET` | `/v1/admin/budgets` | Current-month spend, limit, and utilization for configured applications. |
+| `GET` | `/metrics` | Prometheus metrics in exposition format. |
 | `GET` | `/docs` | FastAPI Swagger UI. |
 
 Unless otherwise noted, endpoints under `/v1` require the configured gateway bearer key when `GATEWAY_API_KEY` is set.
@@ -239,6 +247,14 @@ curl -H 'Authorization: Bearer gateway-secret' \
 
 The report is backed by a SQLite ledger keyed by gateway request ID. It records usage and operational metadata, not prompt or completion content. Failed requests may have zero token and cost values when the provider did not return usage.
 
+### Application budget policy
+
+Budgets are configured under `budgets`. Policies in `applications` override fields from `default`. Monthly limits use UTC calendar months. For a configured monthly limit, requests are capped by `max_input_bytes` and `max_completion_tokens`; if `max_tokens` is omitted, the policy's completion cap is applied. Before calling providers, the gateway reserves a conservative estimate based on UTF-8 input bytes, the completion cap, and the highest configured price among the route's primary and fallback models. A SQLite transaction includes active reservations when checking the cap, which bounds concurrent overspend. Correct price entries are required for accurate enforcement. Reservations expire after five minutes to recover from process crashes.
+
+`max_requests_per_minute` is a process-local per-application quota. Configure `alert_thresholds` as fractions of the monthly cap (for example `[0.5, 0.8, 1.0]`) to emit one warning log at each threshold per app and month. `GET /v1/admin/budgets` reports current-month spend and utilization. Alerts currently go to application logs; route those logs to your existing alerting system.
+
+Prometheus counters and histograms are exposed at `/metrics`. OpenTelemetry request spans are always created; set `OTEL_EXPORTER_OTLP_ENDPOINT` to export traces with OTLP over HTTP. Keep `/metrics` on a private network or protect it at the ingress if metrics are sensitive in your environment.
+
 ## Security and privacy
 
 - Set `GATEWAY_API_KEY` to protect all `/v1` endpoints with bearer authentication.
@@ -267,7 +283,7 @@ For persistent data, mount a durable volume at the configured database directory
 ## Current limits
 
 - Streaming responses are not implemented.
-- Rate limits, concurrency limits, and response cache are local to one process; they are not shared across replicas.
+- Provider and per-application rate limits, concurrency limits, and response cache are local to one process; they are not shared across replicas. Monthly budgets use a shared SQLite transaction for a single host, but SQLite is not recommended as a multi-node coordination database.
 - SQLite is intended for a single instance and modest event volume. Multi-replica deployments need a shared database and coordinated migrations.
 - The current gateway accepts text messages, not image/audio/video payloads or tool/function calls.
 - Pricing uses configured per-token rates and provider-reported token counts; it is an estimate and depends on maintaining the model price map.
@@ -277,11 +293,11 @@ For persistent data, mount a durable volume at the configured database directory
 
 Suggested next milestones, ordered by production value:
 
-- [ ] Add automated unit and integration coverage for providers, routing, retries, redaction, caching, pricing, and failure accounting.
-- [ ] Add OpenTelemetry traces and Prometheus metrics for latency, retries, provider health, cost, and cache behavior.
+- [x] Add automated endpoint and provider-adapter coverage for routing, retries, redaction, caching, pricing, failure accounting, budgets, and quotas.
+- [x] Add OpenTelemetry traces and Prometheus metrics for latency, retries, provider health, cost, and cache behavior.
 - [ ] Add streaming support while preserving usage accounting and fallback behavior before the first response chunk.
 - [ ] Add shared Redis rate limits/cache and PostgreSQL-backed event storage for multi-replica deployments.
-- [ ] Add per-application budgets, hard spend limits, quotas, and alerts.
+- [x] Add per-application budgets, estimated hard spend limits, quotas, and log-based alerts.
 - [ ] Add circuit breakers and provider health-aware routing to avoid repeated calls to unhealthy upstreams.
 - [ ] Add more adapters: Azure OpenAI, AWS Bedrock, Vertex AI, and vLLM-native endpoints.
 - [ ] Add model allowlists, per-route policies, request size limits, and stronger authentication options.
@@ -291,6 +307,14 @@ Suggested next milestones, ordered by production value:
 ## Contributing
 
 Issues and pull requests are welcome. A useful contribution includes a clear problem statement, configuration or API examples when relevant, and notes about provider-specific behavior. For a new provider adapter, normalize text, finish reasons, and usage into the gateway's shared response format, and avoid logging request or response content.
+
+Install development dependencies and run the same checks as CI:
+
+```bash
+pip install -e '.[dev]'
+ruff check llm_gateway tests
+pytest
+```
 
 ## License
 
