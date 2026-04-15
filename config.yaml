@@ -4,6 +4,12 @@ server:
   retry_base_delay_seconds: 0.25
   max_concurrent_requests: 100
   database: ${GATEWAY_DATABASE:-./gateway.sqlite3}
+  redis_url: ${REDIS_URL:-}
+
+circuit_breaker:
+  # Open after consecutive retryable upstream failures; allow one probe after recovery_seconds.
+  failure_threshold: 3
+  recovery_seconds: 30
 
 security:
   redact_pii: true

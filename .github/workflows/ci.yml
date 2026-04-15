@@ -10,6 +10,29 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: llm_gateway_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d llm_gateway_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     strategy:
       fail-fast: false
       matrix:
@@ -25,4 +48,7 @@ jobs:
       - name: Lint
         run: ruff check llm_gateway tests
       - name: Run tests
+        env:
+          TEST_REDIS_URL: redis://localhost:6379/0
+          TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/llm_gateway_test
         run: pytest -q

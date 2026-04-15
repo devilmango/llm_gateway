@@ -39,12 +39,13 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Provider-neutral chat API | Accepts a common chat-completions request and translates it for OpenAI-compatible APIs, Anthropic Messages, and Gemini `generateContent`. |
 | Configurable model routes | Map a logical route to a provider and model in YAML. |
 | Retry and fallback | Retry timeouts, network errors, HTTP 429, and upstream 5xx responses with bounded exponential backoff; then try configured fallbacks in order. |
-| Traffic controls | Apply request timeouts, a maximum in-flight request count, and per-provider requests-per-minute limits. |
-| Usage and cost ledger | Persist provider, route, model, token usage, estimated USD cost, status, latency, fallback, and cache-hit metadata in SQLite. |
+| Traffic controls | Apply request timeouts, a maximum in-flight request count, and per-provider requests-per-minute limits. Use Redis to share request limits across replicas. |
+| Usage and cost ledger | Persist provider, route, model, token usage, estimated USD cost, status, latency, fallback, and cache-hit metadata in SQLite or PostgreSQL. |
 | Application reporting | Group usage and reliability totals by the caller-supplied application name. |
 | Application budgets and quotas | Enforce UTC calendar-month spend caps, per-application request rates, and request size/output bounds. Reserve estimated maximum cost before provider calls to limit concurrent overspend. |
 | Budget alerts | Emit structured warning logs once per application and month when configured spend thresholds (80% and 100% by default) are crossed. |
 | Observability | Export Prometheus request, token, cost, fallback, cache, in-flight, end-to-end latency, provider outcome/latency, and retry metrics; emit nested OpenTelemetry request/provider-attempt spans and optionally export them over OTLP/HTTP. |
+| Provider health | Open a circuit after repeated transient failures, skip open providers, and allow a single half-open probe after the recovery period. |
 | Response cache | Optionally cache a route's completion for a configured TTL. Cache hits have zero upstream usage and cost in the ledger. |
 | PII and secret redaction | Pattern-redact common email addresses, phone-like strings, and API-key forms in message text before sending upstream. |
 | Optional gateway authentication | Require a bearer key for route, completion, and report endpoints by setting `GATEWAY_API_KEY`. |
@@ -69,7 +70,7 @@ The goal is a small, understandable infrastructure service: start with one proce
      OpenAI    Anthropic    Gemini / Local
 ```
 
-The current application is a FastAPI service. Provider translation and response normalization live in adapters; route, retry, and cache policy is read from `config.yaml`; usage metadata is stored in SQLite. Request and response bodies are not stored.
+The current application is a FastAPI service. Provider translation and response normalization live in adapters; route, retry, and cache policy is read from `config.yaml`; usage metadata is stored in SQLite or PostgreSQL. Request and response bodies are not written to the usage ledger or application logs. When route caching is enabled, completion responses are held in local memory or Redis until their configured TTL expires.
 
 ## Quick start
 
@@ -147,7 +148,8 @@ Each route has a primary `provider` and `model`, an ordered optional `fallbacks`
 | Variable | Purpose | Default |
 |---|---|---|
 | `GATEWAY_CONFIG` | Path to YAML configuration | `config.yaml` |
-| `GATEWAY_DATABASE` | SQLite database path | `./gateway.sqlite3` |
+| `GATEWAY_DATABASE` | SQLite path or PostgreSQL DSN | `./gateway.sqlite3` |
+| `REDIS_URL` | Optional shared cache and distributed rate-limit store | Unset (process-local backends) |
 | `GATEWAY_API_KEY` | Optional required gateway bearer key | Unset (gateway auth disabled) |
 | `OPENAI_API_KEY` | OpenAI credential when configured | Unset |
 | `ANTHROPIC_API_KEY` | Anthropic credential when configured | Unset |
@@ -209,6 +211,7 @@ Supported request fields are `model`, `messages`, `application`, `temperature`, 
 | `POST` | `/v1/chat/completions` | Make a routed chat completion. |
 | `GET` | `/v1/admin/report` | Aggregate token, cost, and reliability data. |
 | `GET` | `/v1/admin/budgets` | Current-month spend, limit, and utilization for configured applications. |
+| `GET` | `/v1/admin/providers` | Provider circuit state and consecutive failure counts. |
 | `GET` | `/metrics` | Prometheus metrics in exposition format. |
 | `GET` | `/docs` | FastAPI Swagger UI. |
 
@@ -249,11 +252,19 @@ The report is backed by a SQLite ledger keyed by gateway request ID. It records 
 
 ### Application budget policy
 
-Budgets are configured under `budgets`. Policies in `applications` override fields from `default`. Monthly limits use UTC calendar months. For a configured monthly limit, requests are capped by `max_input_bytes` and `max_completion_tokens`; if `max_tokens` is omitted, the policy's completion cap is applied. Before calling providers, the gateway reserves a conservative estimate based on UTF-8 input bytes, the completion cap, and the highest configured price among the route's primary and fallback models. A SQLite transaction includes active reservations when checking the cap, which bounds concurrent overspend. Correct price entries are required for accurate enforcement. Reservations expire after five minutes to recover from process crashes.
+Budgets are configured under `budgets`. Policies in `applications` override fields from `default`. Monthly limits use UTC calendar months. For a configured monthly limit, requests are capped by `max_input_bytes` and `max_completion_tokens`; if `max_tokens` is omitted, the policy's completion cap is applied. Before calling providers, the gateway reserves a conservative estimate based on UTF-8 input bytes, the completion cap, and the highest configured price among the route's primary and fallback models. Database transactions include active reservations when checking the cap, which bounds concurrent overspend. Correct price entries are required for accurate enforcement. Reservations expire after five minutes to recover from process crashes.
 
 `max_requests_per_minute` is a process-local per-application quota. Configure `alert_thresholds` as fractions of the monthly cap (for example `[0.5, 0.8, 1.0]`) to emit one warning log at each threshold per app and month. `GET /v1/admin/budgets` reports current-month spend and utilization. Alerts currently go to application logs; route those logs to your existing alerting system.
 
-Prometheus counters and histograms are exposed at `/metrics`. OpenTelemetry request spans are always created; set `OTEL_EXPORTER_OTLP_ENDPOINT` to export traces with OTLP over HTTP. Keep `/metrics` on a private network or protect it at the ingress if metrics are sensitive in your environment.
+Prometheus counters and histograms are exposed at `/metrics`. OpenTelemetry request and provider-attempt spans are created; set `OTEL_EXPORTER_OTLP_ENDPOINT` to export traces with OTLP over HTTP. Keep `/metrics` on a private network or protect it at the ingress if metrics are sensitive in your environment.
+
+## Multi-replica deployment
+
+Set `REDIS_URL` to enable shared Redis response caching and atomic per-provider/per-application sliding-window quotas. Redis must be available when the service starts; the gateway verifies the connection and fails startup if the configured backend is unavailable. Cache reads/writes fail open and fall through to the provider. Quota checks fail closed with HTTP 503 if Redis becomes unavailable, so traffic is not sent without enforcing configured limits. Use a private Redis network and `rediss://` when TLS is required; cached completions remain readable to Redis operators until their TTL expires.
+
+Set `GATEWAY_DATABASE` to a PostgreSQL DSN such as `postgresql://gateway:password@db:5432/llm_gateway` to use the PostgreSQL ledger and coordinate concurrent budget reservations across replicas. The service creates the required tables and indexes at startup. Use SQLite for single-instance local development.
+
+Provider circuit breakers and their health state are currently process-local. Each replica independently skips providers that have crossed its failure threshold; recovery probes are limited to one per provider per process. Use `/v1/admin/providers` to inspect circuit states. Deploy behind TLS, keep Redis and PostgreSQL private, and protect admin and metrics endpoints at the network edge.
 
 ## Security and privacy
 
@@ -283,8 +294,8 @@ For persistent data, mount a durable volume at the configured database directory
 ## Current limits
 
 - Streaming responses are not implemented.
-- Provider and per-application rate limits, concurrency limits, and response cache are local to one process; they are not shared across replicas. Monthly budgets use a shared SQLite transaction for a single host, but SQLite is not recommended as a multi-node coordination database.
-- SQLite is intended for a single instance and modest event volume. Multi-replica deployments need a shared database and coordinated migrations.
+- Without Redis, rate limits and cache are process-local. Concurrency limits and circuit-breaker health remain process-local even when Redis is configured.
+- PostgreSQL supports shared usage storage and monthly budget reservations across replicas. SQLite remains intended for a single instance and modest event volume.
 - The current gateway accepts text messages, not image/audio/video payloads or tool/function calls.
 - Pricing uses configured per-token rates and provider-reported token counts; it is an estimate and depends on maintaining the model price map.
 - PII redaction covers common patterns only and can miss sensitive information or alter phone-like text.
@@ -296,9 +307,9 @@ Suggested next milestones, ordered by production value:
 - [x] Add automated endpoint and provider-adapter coverage for routing, retries, redaction, caching, pricing, failure accounting, budgets, and quotas.
 - [x] Add OpenTelemetry traces and Prometheus metrics for latency, retries, provider health, cost, and cache behavior.
 - [ ] Add streaming support while preserving usage accounting and fallback behavior before the first response chunk.
-- [ ] Add shared Redis rate limits/cache and PostgreSQL-backed event storage for multi-replica deployments.
+- [x] Add shared Redis rate limits/cache and PostgreSQL-backed event storage for multi-replica deployments.
 - [x] Add per-application budgets, estimated hard spend limits, quotas, and log-based alerts.
-- [ ] Add circuit breakers and provider health-aware routing to avoid repeated calls to unhealthy upstreams.
+- [x] Add circuit breakers and provider health-aware routing to avoid repeated calls to unhealthy upstreams.
 - [ ] Add more adapters: Azure OpenAI, AWS Bedrock, Vertex AI, and vLLM-native endpoints.
 - [ ] Add model allowlists, per-route policies, request size limits, and stronger authentication options.
 - [ ] Add tool calling, structured outputs, and multimodal request support.

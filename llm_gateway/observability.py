@@ -24,6 +24,7 @@ FALLBACKS = Counter("llm_gateway_fallbacks_total", "Requests served by a fallbac
 CACHE_HITS = Counter("llm_gateway_cache_hits_total", "Responses served from gateway cache", ["route"], registry=REGISTRY)
 PROVIDER_REQUESTS = Counter("llm_gateway_provider_requests_total", "Provider request attempts by outcome", ["provider", "outcome"], registry=REGISTRY)
 PROVIDER_RETRIES = Counter("llm_gateway_provider_retries_total", "Retries attempted against providers", ["provider"], registry=REGISTRY)
+PROVIDER_CIRCUIT_STATE = Gauge("llm_gateway_provider_circuit_state", "Provider circuit state (closed=0, half_open=1, open=2)", ["provider"], registry=REGISTRY)
 IN_FLIGHT = Gauge("llm_gateway_requests_in_flight", "Requests currently being handled", registry=REGISTRY)
 LATENCY = Histogram("llm_gateway_request_duration_seconds", "End-to-end request duration", ["route", "status"], registry=REGISTRY,
                     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60))

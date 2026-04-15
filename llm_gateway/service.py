@@ -5,22 +5,30 @@ from typing import Any
 
 from opentelemetry import trace
 
-from .cache import ResponseCache
+from .cache import RedisResponseCache, ResponseCache
+from .circuit import ProviderCircuitBreaker
+from .distributed import RateLimitBackendUnavailable, RedisSlidingWindowLimiter
 from .limiting import RateLimitExceeded, SlidingWindowLimiter
 from .observability import PROVIDER_RETRIES
 from .providers import ProviderClient, ProviderError
 
 
 class GatewayService:
-    def __init__(self, config: dict[str, Any], http: Any):
+    def __init__(self, config: dict[str, Any], http: Any, shared_redis: Any | None = None):
         self.config = config
         self.providers = config["providers"]
         self.routes = config["routes"]
         self.client = ProviderClient(http, self.providers, float(config["server"].get("request_timeout_seconds", 45)))
-        self.limiter = SlidingWindowLimiter()
-        self.cache = ResponseCache()
+        self.limiter = RedisSlidingWindowLimiter(shared_redis) if shared_redis else SlidingWindowLimiter()
+        self.cache = RedisResponseCache(shared_redis) if shared_redis else ResponseCache()
         self.semaphore = asyncio.Semaphore(int(config["server"].get("max_concurrent_requests", 100)))
-        self.application_limiter = SlidingWindowLimiter()
+        self.application_limiter = self.limiter if shared_redis else SlidingWindowLimiter()
+        breaker_config = config.get("circuit_breaker", {})
+        self.breaker = ProviderCircuitBreaker(
+            list(self.providers),
+            failure_threshold=breaker_config.get("failure_threshold", 5),
+            recovery_seconds=breaker_config.get("recovery_seconds", 30),
+        )
 
     async def acquire_application_quota(self, application: str, limit: int) -> None:
         await self.application_limiter.acquire(application, limit)
@@ -61,7 +69,7 @@ class GatewayService:
         cache_cfg = route.get("cache", {})
         cache_key = self.cache.key(payload, candidates[0]["provider"], candidates[0]["model"])
         if cache_cfg.get("enabled"):
-            cached = self.cache.get(cache_key)
+            cached = await self.cache.get(cache_key)
             if cached:
                 # A cache hit incurs no upstream token spend. The response still contains the
                 # cached completion, while gateway usage represents billable upstream usage.
@@ -83,22 +91,34 @@ class GatewayService:
                         span.set_attribute("llm.gateway.attempt", attempt + 1)
                         span.set_attribute("llm.gateway.fallback_index", candidate_index)
                         try:
+                            if not await self.breaker.allow(name):
+                                errors.append(f"{name}: circuit open")
+                                break
                             await self.limiter.acquire(name, limit)
                             result = await self.client.complete(name, model, payload)
+                            await self.breaker.success(name)
                             result.update({"provider": name, "configured_model": model,
                                            "fallback_used": candidate_index > 0, "cached": False})
                             if cache_cfg.get("enabled"):
-                                self.cache.put(cache_key, result, int(cache_cfg.get("ttl_seconds", 60)))
+                                await self.cache.put(cache_key, result, int(cache_cfg.get("ttl_seconds", 60)))
                             return result
                         except RateLimitExceeded:
+                            await self.breaker.abandon(name)
                             errors.append(f"{name}: rate limited")
                             break
                         except ProviderError as exc:
                             span.set_attribute("error.type", type(exc).__name__)
                             span.set_attribute("llm.gateway.retryable", exc.retryable)
                             errors.append(f"{name}: {exc}")
+                            if exc.retryable:
+                                await self.breaker.failure(name)
+                            else:
+                                await self.breaker.abandon(name)
                             if not exc.retryable or attempt >= max_retries:
                                 break
                             PROVIDER_RETRIES.labels(provider=name).inc()
                             await asyncio.sleep(min(base_delay * (2 ** attempt), 4.0))
+                        except RateLimitBackendUnavailable:
+                            await self.breaker.abandon(name)
+                            raise
         raise ProviderError("All configured providers failed: " + "; ".join(errors), retryable=False)

@@ -130,3 +130,11 @@ class UsageStore:
         summary["generated_at"] = datetime.now(UTC).isoformat()
         summary["by_application"] = by_app
         return summary
+
+
+def create_usage_store(database: str) -> Any:
+    if database.startswith(("postgres://", "postgresql://")):
+        from .postgres_storage import PostgresUsageStore
+
+        return PostgresUsageStore(database)
+    return UsageStore(database)

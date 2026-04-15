@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
+import fakeredis.aioredis
 import httpx
 import pytest
 
@@ -31,8 +34,8 @@ def config(database: str) -> dict:
 
 
 @asynccontextmanager
-async def gateway_client(config_data: dict, transport: httpx.AsyncBaseTransport):
-    app = create_app(config_data, http_transport=transport)
+async def gateway_client(config_data: dict, transport: httpx.AsyncBaseTransport, shared_redis=None):
+    app = create_app(config_data, http_transport=transport, shared_redis=shared_redis)
     async with app.router.lifespan_context(app), httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://gateway"
     ) as client:
@@ -175,6 +178,112 @@ async def test_concurrent_requests_cannot_reserve_above_monthly_cap(tmp_path, mo
         )
         assert sorted([first.status_code, second.status_code]) == [200, 429]
         assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_skips_unhealthy_provider_then_recovers(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    primary_calls = 0
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal primary_calls
+        if request.url.host == "primary.test":
+            primary_calls += 1
+            if primary_calls == 1:
+                return httpx.Response(503)
+            return success_response()
+        body = success_response().json()
+        body["model"] = "backup-model"
+        return httpx.Response(200, json=body)
+
+    cfg = config(str(tmp_path / "breaker.sqlite3"))
+    cfg["circuit_breaker"] = {"failure_threshold": 1, "recovery_seconds": 0.05}
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        request = {"model": "simple", "messages": [{"role": "user", "content": "hello"}]}
+        first = (await client.post("/v1/chat/completions", json=request)).json()
+        providers = (await client.get("/v1/admin/providers")).json()["providers"]
+        assert first["gateway"]["fallback_used"] is True
+        assert providers["primary"]["state"] == "open"
+        await asyncio.sleep(0.12)
+        second = (await client.post("/v1/chat/completions", json=request)).json()
+        assert second["gateway"]["provider"] == "primary"
+        assert second["gateway"]["fallback_used"] is False
+        assert (await client.get("/v1/admin/providers")).json()["providers"]["primary"]["state"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_redis_cache_and_quotas_are_shared_across_gateway_instances(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    redis_url = os.getenv("TEST_REDIS_URL")
+    if redis_url:
+        from redis.asyncio import Redis
+
+        redis = Redis.from_url(redis_url, decode_responses=True)
+        await redis.flushdb()
+    else:
+        redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    first_calls = 0
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal first_calls
+        first_calls += 1
+        return success_response()
+
+    cfg1 = config(str(tmp_path / "instance1.sqlite3"))
+    cfg2 = config(str(tmp_path / "instance2.sqlite3"))
+    cfg1["routes"]["simple"]["cache"] = {"enabled": True, "ttl_seconds": 60}
+    cfg2["routes"]["simple"]["cache"] = {"enabled": True, "ttl_seconds": 60}
+    for cfg in (cfg1, cfg2):
+        cfg["budgets"]["applications"]["limited"] = {"max_requests_per_minute": 1}
+    app1 = create_app(cfg1, http_transport=httpx.MockTransport(upstream), shared_redis=redis)
+    app2 = create_app(cfg2, http_transport=httpx.MockTransport(upstream), shared_redis=redis)
+    async with app1.router.lifespan_context(app1), app2.router.lifespan_context(app2), \
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=app1), base_url="http://one") as client1, \
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=app2), base_url="http://two") as client2:
+        cache_request = {"model": "simple", "application": "cache-shared",
+                         "messages": [{"role": "user", "content": "same prompt"}]}
+        await client1.post("/v1/chat/completions", json=cache_request)
+        cached = await client2.post("/v1/chat/completions", json=cache_request)
+        assert cached.json()["gateway"]["cached"] is True
+        assert first_calls == 1
+
+        quota_request = {"model": "simple", "application": "limited",
+                         "messages": [{"role": "user", "content": "different prompt"}]}
+        assert (await client1.post("/v1/chat/completions", json=quota_request)).status_code == 200
+        assert (await client2.post("/v1/chat/completions", json=quota_request)).status_code == 429
+    await redis.aclose()
+
+
+@pytest.mark.asyncio
+async def test_postgres_usage_store_when_test_database_is_configured(monkeypatch):
+    import uuid
+
+    dsn = os.getenv("TEST_POSTGRES_URL")
+    if not dsn:
+        pytest.skip("TEST_POSTGRES_URL is not configured; CI provides a PostgreSQL service")
+    from llm_gateway.postgres_storage import PostgresUsageStore
+
+    store = PostgresUsageStore(dsn)
+    request_id = "pg_test_" + uuid.uuid4().hex
+    application = "pg-test-" + uuid.uuid4().hex
+    store.record({"request_id": request_id, "occurred_at": datetime.now(UTC).isoformat(),
+        "application": application, "route": "simple", "provider": "test", "model": "test-model",
+        "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost_usd": 0.00002,
+        "status": "success", "latency_ms": 25, "fallback_used": 0, "cached": 0, "error_type": None})
+    try:
+        report = store.report(None, None, application)
+        assert report["requests"] == 1
+        assert report["total_tokens"] == 10
+        assert report["cost_usd"] == pytest.approx(0.00002)
+        store.reserve_budget("pg_res_" + request_id, application, 0.00001, 0.0001)
+        alerts = store.check_budget_alerts(application, 0.00002, [0.8])
+        assert len(alerts) == 1
+        assert alerts[0]["threshold"] == 0.8
+        assert alerts[0]["spend_usd"] == pytest.approx(0.00002)
+    finally:
+        store.close()
 
 
 @pytest.mark.asyncio

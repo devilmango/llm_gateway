@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse, Response
 from opentelemetry import trace
 
 from .config import load_config
+from .distributed import RateLimitBackendUnavailable
 from .limiting import RateLimitExceeded
 from .observability import (
     CACHE_HITS,
@@ -32,7 +33,7 @@ from .providers import ProviderError
 from .redaction import redact
 from .schemas import ChatChoice, ChatRequest, ChatResponse, Usage
 from .service import GatewayService
-from .storage import BudgetExceeded, UsageStore
+from .storage import BudgetExceeded, create_usage_store
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("llm_gateway")
@@ -41,19 +42,38 @@ TRACER = TRACER_PROVIDER.get_tracer("llm_gateway")
 
 
 def create_app(config: dict[str, Any] | None = None,
-               http_transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
+               http_transport: httpx.AsyncBaseTransport | None = None,
+               shared_redis: Any | None = None) -> FastAPI:
     cfg = config or load_config()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         timeout = httpx.Timeout(float(cfg["server"].get("request_timeout_seconds", 45)))
         app.state.http = httpx.AsyncClient(timeout=timeout, transport=http_transport)
-        app.state.gateway = GatewayService(cfg, app.state.http)
-        database = os.getenv("GATEWAY_DATABASE", cfg["server"].get("database", "./gateway.sqlite3"))
-        app.state.store = UsageStore(database)
-        yield
-        await app.state.http.aclose()
-        TRACER_PROVIDER.force_flush()
+        redis_client = shared_redis
+        owns_redis = False
+        app.state.store = None
+        try:
+            redis_url = cfg["server"].get("redis_url") or os.getenv("REDIS_URL")
+            if redis_client is None and redis_url:
+                from redis.asyncio import Redis
+
+                redis_client = Redis.from_url(redis_url, decode_responses=True)
+                owns_redis = True
+                await redis_client.ping()
+            app.state.redis = redis_client
+            app.state.gateway = GatewayService(cfg, app.state.http, shared_redis=redis_client)
+            database = os.getenv("GATEWAY_DATABASE", cfg["server"].get("database", "./gateway.sqlite3"))
+            app.state.store = create_usage_store(database)
+            yield
+        finally:
+            await app.state.http.aclose()
+            if owns_redis and redis_client:
+                await redis_client.aclose()
+            close_store = getattr(app.state.store, "close", None) if app.state.store else None
+            if close_store:
+                await asyncio.to_thread(close_store)
+            TRACER_PROVIDER.force_flush()
 
     app = FastAPI(title="LLM Gateway", version="0.1.0", lifespan=lifespan)
 
@@ -145,6 +165,9 @@ def create_app(config: dict[str, Any] | None = None,
         except RateLimitExceeded as exc:
             status, error_type = "rejected", "application_rate_limit_exceeded"
             raise HTTPException(status_code=429, detail="Application request quota exceeded") from exc
+        except RateLimitBackendUnavailable as exc:
+            status, error_type = "failure", "shared_rate_limit_store_unavailable"
+            raise HTTPException(status_code=503, detail="Shared rate-limit store is unavailable") from exc
         except ProviderError as exc:
             status, error_type = "failure", "upstream_error"
             raise HTTPException(status_code=502, detail="All configured providers failed") from exc
@@ -227,6 +250,12 @@ def create_app(config: dict[str, Any] | None = None,
                 "utilization": spent / float(limit) if limit not in (None, 0) else None,
                 "max_requests_per_minute": policy.get("max_requests_per_minute")})
         return {"period_start": month_start.isoformat(), "applications": budgets_out}
+
+    @app.get("/v1/admin/providers", dependencies=[Depends(authenticate)])
+    async def provider_health(request: Request) -> dict[str, Any]:
+        states = await request.app.state.gateway.breaker.snapshot()
+        return {"providers": {name: {"kind": provider["kind"], **states.get(name, {"state": "closed", "failures": 0})}
+                              for name, provider in cfg["providers"].items()}}
 
     @app.exception_handler(HTTPException)
     async def safe_http_errors(request: Request, exc: HTTPException) -> JSONResponse:
