@@ -213,6 +213,125 @@ async def test_circuit_breaker_skips_unhealthy_provider_then_recovers(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_streaming_endpoint_emits_sse_and_records_usage(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    stream_body = (
+        'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{"content":" world"},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}}\n\n'
+        'data: [DONE]\n\n'
+    )
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["stream"] is True
+        return httpx.Response(200, content=stream_body, headers={"content-type": "text/event-stream"})
+
+    async with gateway_client(config(str(tmp_path / "stream.sqlite3")), httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "simple", "application": "stream-app", "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert '"content": "hello"' in response.text
+        assert '"content": " world"' in response.text
+        assert '"total_tokens": 4' in response.text
+        assert "data: [DONE]" in response.text
+        report = (await client.get("/v1/admin/report", params={"application": "stream-app"})).json()
+        assert report["requests"] == 1
+        assert report["total_tokens"] == 4
+
+
+@pytest.mark.asyncio
+async def test_streaming_uses_compatible_fallback_before_emitting_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    stream_body = ('data: {"choices":[{"delta":{"content":"backup"}}]}\n\n'
+                   'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"total_tokens":1}}\n\n'
+                   'data: [DONE]\n\n')
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "backup.test"
+        return httpx.Response(200, content=stream_body, headers={"content-type": "text/event-stream"})
+
+    cfg = config(str(tmp_path / "stream-fallback.sqlite3"))
+    cfg["providers"]["primary"]["kind"] = "anthropic"
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "simple", "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        assert response.status_code == 200
+        assert '"content": "backup"' in response.text
+        report = (await client.get("/v1/admin/report", params={"application": "default"})).json()
+        assert report["fallbacks"] == 1
+
+
+@pytest.mark.asyncio
+async def test_tenant_credentials_scope_routes_applications_and_admin_access(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    monkeypatch.setenv("SUPPORT_TENANT_KEY", "tenant-secret")
+    monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return success_response()
+
+    cfg = config(str(tmp_path / "tenant.sqlite3"))
+    cfg["routes"]["reasoning"] = {"provider": "primary", "model": "primary-model", "fallbacks": []}
+    cfg["tenants"] = {"support": {"api_key_env": "SUPPORT_TENANT_KEY", "allowed_routes": ["simple"],
+        "applications": {"support-router": {"max_requests_per_minute": 50, "max_completion_tokens": 100}}}}
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        request = {"model": "simple", "application": "support-router",
+                   "messages": [{"role": "user", "content": "hello"}]}
+        assert (await client.post("/v1/chat/completions", json=request)).status_code == 401
+        headers = {"Authorization": "Bearer tenant-secret"}
+        assert (await client.get("/v1/routes", headers=headers)).json().keys() == {"simple"}
+        assert (await client.get("/v1/admin/report", headers=headers)).status_code == 401
+        denied_app = {**request, "application": "other-app"}
+        assert (await client.post("/v1/chat/completions", json=denied_app, headers=headers)).status_code == 403
+        denied_route = {**request, "model": "reasoning"}
+        assert (await client.post("/v1/chat/completions", json=denied_route, headers=headers)).status_code == 403
+        assert (await client.post("/v1/chat/completions", json=request, headers=headers)).status_code == 200
+        report = (await client.get("/v1/admin/report", params={"application": "support:support-router"},
+                                   headers={"Authorization": "Bearer admin-secret"})).json()
+        assert report["requests"] == 1
+
+
+@pytest.mark.asyncio
+async def test_latency_aware_routing_uses_shared_provider_health_signal(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    calls: list[str] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        body = success_response().json()
+        if request.url.host == "backup.test":
+            body["model"] = "backup-model"
+        return httpx.Response(200, json=body)
+
+    cfg = config(str(tmp_path / "latency.sqlite3"))
+    cfg["routing"] = {"strategy": "latency_aware"}
+    app = create_app(cfg, http_transport=httpx.MockTransport(upstream))
+    async with app.router.lifespan_context(app), httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://gateway"
+    ) as client:
+        health = app.state.gateway.provider_health
+        await health.record("primary", 500, True)
+        await health.record("backup", 50, True)
+        response = await client.post("/v1/chat/completions", json={
+            "model": "simple", "messages": [{"role": "user", "content": "hello"}],
+        })
+        assert response.status_code == 200
+        assert calls == ["backup.test"]
+        assert response.json()["gateway"]["fallback_used"] is True
+        providers = (await client.get("/v1/admin/providers")).json()["providers"]
+        assert providers["primary"]["ewma_latency_ms"] == 500
+        assert providers["backup"]["ewma_latency_ms"] < 50
+
+
+@pytest.mark.asyncio
 async def test_redis_cache_and_quotas_are_shared_across_gateway_instances(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
     monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
@@ -248,6 +367,8 @@ async def test_redis_cache_and_quotas_are_shared_across_gateway_instances(tmp_pa
         cached = await client2.post("/v1/chat/completions", json=cache_request)
         assert cached.json()["gateway"]["cached"] is True
         assert first_calls == 1
+        shared_health = await app2.state.gateway.health_snapshot()
+        assert shared_health["primary"]["successes"] == 1
 
         quota_request = {"model": "simple", "application": "limited",
                          "messages": [{"role": "user", "content": "different prompt"}]}

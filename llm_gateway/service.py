@@ -10,6 +10,7 @@ from .circuit import ProviderCircuitBreaker
 from .distributed import RateLimitBackendUnavailable, RedisSlidingWindowLimiter
 from .limiting import RateLimitExceeded, SlidingWindowLimiter
 from .observability import PROVIDER_RETRIES
+from .provider_health import ProviderHealth
 from .providers import ProviderClient, ProviderError
 
 
@@ -29,6 +30,7 @@ class GatewayService:
             failure_threshold=breaker_config.get("failure_threshold", 5),
             recovery_seconds=breaker_config.get("recovery_seconds", 30),
         )
+        self.provider_health = ProviderHealth(shared_redis)
 
     async def acquire_application_quota(self, application: str, limit: int) -> None:
         await self.application_limiter.acquire(application, limit)
@@ -63,11 +65,31 @@ class GatewayService:
                 raise ValueError(f"Route {route_name!r} refers to unknown provider {provider!r}")
         return candidates
 
+    async def health_snapshot(self) -> dict[str, dict[str, float | int]]:
+        return await self.provider_health.snapshot(list(self.providers))
+
+    async def _order_candidates(self, candidates: list[dict[str, str]]) -> list[dict[str, str]]:
+        if self.config.get("routing", {}).get("strategy") != "latency_aware" or len(candidates) < 2:
+            return candidates
+        health = await self.health_snapshot()
+        # Unseen providers retain configured order; observed failure rate is penalized
+        # so one fast failure does not attract traffic over a healthy provider.
+        indexed = list(enumerate(candidates))
+        def score(item: tuple[int, dict[str, str]]) -> tuple[float, int]:
+            index, candidate = item
+            sample = health.get(candidate["provider"])
+            if not sample:
+                return (float("inf"), index)
+            return (float(sample.get("ewma_latency_ms", 1e9)) *
+                    (1.0 + float(sample.get("failure_rate", 0.0)) * 4.0), index)
+        return [candidate for _, candidate in sorted(indexed, key=score)]
+
     async def complete(self, route_name: str, payload: dict[str, Any]) -> dict[str, Any]:
-        candidates = self.route_candidates(route_name)
         route = self.routes[route_name]
+        preferred = (route["provider"], route["model"])
+        candidates = await self._order_candidates(self.route_candidates(route_name))
         cache_cfg = route.get("cache", {})
-        cache_key = self.cache.key(payload, candidates[0]["provider"], candidates[0]["model"])
+        cache_key = self.cache.key(payload, preferred[0], preferred[1])
         if cache_cfg.get("enabled"):
             cached = await self.cache.get(cache_key)
             if cached:
@@ -85,6 +107,7 @@ class GatewayService:
                 provider_config = self.providers[name]
                 limit = int(provider_config.get("requests_per_minute", 600))
                 for attempt in range(max_retries + 1):
+                    started: float | None = None
                     with trace.get_tracer("llm_gateway").start_as_current_span("llm.gateway.provider_attempt") as span:
                         span.set_attribute("llm.gateway.provider", name)
                         span.set_attribute("llm.gateway.model", model)
@@ -95,10 +118,12 @@ class GatewayService:
                                 errors.append(f"{name}: circuit open")
                                 break
                             await self.limiter.acquire(name, limit)
+                            started = asyncio.get_running_loop().time()
                             result = await self.client.complete(name, model, payload)
+                            await self.provider_health.record(name, (asyncio.get_running_loop().time() - started) * 1000, True)
                             await self.breaker.success(name)
                             result.update({"provider": name, "configured_model": model,
-                                           "fallback_used": candidate_index > 0, "cached": False})
+                                           "fallback_used": (name, model) != preferred, "cached": False})
                             if cache_cfg.get("enabled"):
                                 await self.cache.put(cache_key, result, int(cache_cfg.get("ttl_seconds", 60)))
                             return result
@@ -107,6 +132,8 @@ class GatewayService:
                             errors.append(f"{name}: rate limited")
                             break
                         except ProviderError as exc:
+                            if started is not None:
+                                await self.provider_health.record(name, (asyncio.get_running_loop().time() - started) * 1000, False)
                             span.set_attribute("error.type", type(exc).__name__)
                             span.set_attribute("llm.gateway.retryable", exc.retryable)
                             errors.append(f"{name}: {exc}")
@@ -121,4 +148,81 @@ class GatewayService:
                         except RateLimitBackendUnavailable:
                             await self.breaker.abandon(name)
                             raise
+        raise ProviderError("All configured providers failed: " + "; ".join(errors), retryable=False)
+
+    async def stream_complete(self, route_name: str, payload: dict[str, Any]):
+        """Yield provider text deltas; retries/fallbacks stop once text was emitted."""
+        route = self.routes[route_name]
+        preferred = (route["provider"], route["model"])
+        candidates = await self._order_candidates(self.route_candidates(route_name))
+        cache_cfg = route.get("cache", {})
+        cache_key = self.cache.key(payload, preferred[0], preferred[1])
+        if cache_cfg.get("enabled"):
+            cached = await self.cache.get(cache_key)
+            if cached:
+                yield {"delta": cached["text"]}
+                yield {**cached, "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                       "provider": cached["provider"], "configured_model": cached.get("configured_model", cached["model"]),
+                       "fallback_used": False, "cached": True, "final": True}
+                return
+
+        errors: list[str] = []
+        max_retries = int(self.config["server"].get("max_retries", 2))
+        base_delay = float(self.config["server"].get("retry_base_delay_seconds", 0.25))
+        async with self.semaphore:
+            for candidate_index, candidate in enumerate(candidates):
+                name, model = candidate["provider"], candidate["model"]
+                provider_config = self.providers[name]
+                emitted = False
+                for attempt in range(max_retries + 1):
+                    started: float | None = None
+                    try:
+                        if not await self.breaker.allow(name):
+                            errors.append(f"{name}: circuit open")
+                            break
+                        await self.limiter.acquire(name, int(provider_config.get("requests_per_minute", 600)))
+                        started = asyncio.get_running_loop().time()
+                        text_parts: list[str] = []
+                        final: dict[str, Any] = {}
+                        async for item in self.client.stream(name, model, payload):
+                            if "delta" in item:
+                                emitted = True
+                                text_parts.append(item["delta"])
+                                yield {"delta": item["delta"]}
+                            else:
+                                final = item
+                        elapsed_ms = (asyncio.get_running_loop().time() - started) * 1000
+                        await self.provider_health.record(name, elapsed_ms, True)
+                        await self.breaker.success(name)
+                        result = {"text": "".join(text_parts), "usage": final.get("usage", {}),
+                                  "finish_reason": final.get("finish_reason"), "model": final.get("model", model),
+                                  "provider": name, "configured_model": model,
+                                  "fallback_used": (name, model) != preferred, "cached": False}
+                        if cache_cfg.get("enabled"):
+                            await self.cache.put(cache_key, result, int(cache_cfg.get("ttl_seconds", 60)))
+                        yield {**result, "final": True}
+                        return
+                    except RateLimitExceeded:
+                        await self.breaker.abandon(name)
+                        errors.append(f"{name}: rate limited")
+                        break
+                    except ProviderError as exc:
+                        unsupported_streaming = "Streaming is currently supported" in str(exc)
+                        if started is not None and not unsupported_streaming:
+                            await self.provider_health.record(name, (asyncio.get_running_loop().time() - started) * 1000, False)
+                        errors.append(f"{name}: {exc}")
+                        if exc.retryable:
+                            await self.breaker.failure(name)
+                        else:
+                            await self.breaker.abandon(name)
+                        if unsupported_streaming and not emitted:
+                            break
+                        # Once a delta is visible to the caller, retrying could duplicate text.
+                        if emitted or not exc.retryable or attempt >= max_retries:
+                            raise
+                        PROVIDER_RETRIES.labels(provider=name).inc()
+                        await asyncio.sleep(min(base_delay * (2 ** attempt), 4.0))
+                    except RateLimitBackendUnavailable:
+                        await self.breaker.abandon(name)
+                        raise
         raise ProviderError("All configured providers failed: " + "; ".join(errors), retryable=False)

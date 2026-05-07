@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Any
@@ -95,6 +96,69 @@ class ProviderClient:
         PROVIDER_REQUESTS.labels(provider=provider_name, outcome="success").inc()
         PROVIDER_LATENCY.labels(provider=provider_name, outcome="success").observe(time.perf_counter() - started)
         return result
+
+    async def stream(self, provider_name: str, model: str, payload: dict[str, Any]):
+        """Yield normalized text deltas from an OpenAI-compatible provider."""
+        cfg = self.providers[provider_name]
+        if cfg["kind"] != "openai":
+            raise ProviderError("Streaming is currently supported for OpenAI-compatible providers only")
+        key = os.getenv(cfg.get("api_key_env", "")) if cfg.get("api_key_env") else None
+        if not key and not cfg.get("api_key_optional", False):
+            raise ProviderError(f"Provider {provider_name!r} has no API key configured")
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        request_payload = {**payload, "model": model, "stream": True, "stream_options": {"include_usage": True}}
+        started = time.perf_counter()
+        outcome = "network_error"
+        try:
+            async with self.http.stream("POST", f"{cfg['base_url'].rstrip('/')}/chat/completions",
+                                        json=request_payload, headers=headers, timeout=self.timeout) as response:
+                if response.status_code >= 400:
+                    outcome = "rate_limited" if response.status_code == 429 else "upstream_error"
+                    retryable = response.status_code == 429 or response.status_code >= 500
+                    raise ProviderError(f"Upstream returned HTTP {response.status_code}",
+                                        retryable=retryable, status_code=response.status_code)
+                saw_delta = False
+                usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                finish_reason = None
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(data)
+                    except ValueError as exc:
+                        raise ProviderError("Provider returned invalid stream data", retryable=True) from exc
+                    event_usage = event.get("usage")
+                    if event_usage:
+                        usage = {"prompt_tokens": int(event_usage.get("prompt_tokens", 0) or 0),
+                                 "completion_tokens": int(event_usage.get("completion_tokens", 0) or 0),
+                                 "total_tokens": int(event_usage.get("total_tokens", 0) or 0)}
+                    choices = event.get("choices", [])
+                    if choices:
+                        choice = choices[0]
+                        finish_reason = choice.get("finish_reason") or finish_reason
+                        delta = choice.get("delta", {}).get("content")
+                        if isinstance(delta, str) and delta:
+                            saw_delta = True
+                            yield {"delta": delta}
+                if not saw_delta:
+                    raise ProviderError("Provider returned no text completion", retryable=False)
+                PROVIDER_REQUESTS.labels(provider=provider_name, outcome="success").inc()
+                PROVIDER_LATENCY.labels(provider=provider_name, outcome="success").observe(time.perf_counter() - started)
+                yield {"usage": usage, "finish_reason": finish_reason, "model": model}
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
+            raise ProviderError(f"{type(exc).__name__}: upstream request failed", retryable=True) from exc
+        except ProviderError as exc:
+            outcome = "rate_limited" if exc.status_code == 429 else "upstream_error"
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
+            raise
 
     @staticmethod
     def _anthropic_payload(model: str, payload: dict[str, Any]) -> dict[str, Any]:

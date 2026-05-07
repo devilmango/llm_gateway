@@ -20,6 +20,7 @@ class ChatRequest(BaseModel):
     top_p: float | None = Field(default=None, gt=0, le=1)
     user: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    stream: bool = False
 
 
 class Usage(BaseModel):

@@ -46,6 +46,9 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Budget alerts | Emit structured warning logs once per application and month when configured spend thresholds (80% and 100% by default) are crossed. |
 | Observability | Export Prometheus request, token, cost, fallback, cache, in-flight, end-to-end latency, provider outcome/latency, and retry metrics; emit nested OpenTelemetry request/provider-attempt spans and optionally export them over OTLP/HTTP. |
 | Provider health | Open a circuit after repeated transient failures, skip open providers, and allow a single half-open probe after the recovery period. |
+| Latency-aware routing | Optionally order a route's primary and fallback candidates using shared provider EWMA latency and failure-rate signals. |
+| Streaming | Stream OpenAI-compatible provider output as server-sent events, with usage accounting at completion and fallback only before text has been emitted. |
+| Tenant access controls | Configure per-tenant bearer credentials, route allowlists, application allowlists, and tenant-specific budget/limit policies. |
 | Response cache | Optionally cache a route's completion for a configured TTL. Cache hits have zero upstream usage and cost in the ledger. |
 | PII and secret redaction | Pattern-redact common email addresses, phone-like strings, and API-key forms in message text before sending upstream. |
 | Optional gateway authentication | Require a bearer key for route, completion, and report endpoints by setting `GATEWAY_API_KEY`. |
@@ -99,6 +102,8 @@ Useful local URLs:
 
 To require a key from gateway clients, set `GATEWAY_API_KEY` in the gateway process and send it as a bearer token. The health endpoint remains public for liveness probes.
 
+For tenant-level access, define `tenants` in the YAML configuration. Each tenant maps an API key environment variable to allowed logical routes and application policy overrides. When tenants are configured, `/v1/chat/completions` and `/v1/routes` require a matching tenant key; admin endpoints require the separate `GATEWAY_API_KEY`.
+
 ## Configuration
 
 Edit `config.yaml`. Provider credentials are read from environment variables named by each provider's `api_key_env`; do not put API keys in the YAML file.
@@ -135,6 +140,23 @@ routes:
     cache:
       enabled: true
       ttl_seconds: 60
+
+# Optional: enable shared latency/failure EWMA ordering among route candidates.
+routing:
+  strategy: primary_first # or latency_aware
+
+# Optional tenant configuration. Keep key values in the process environment.
+tenants:
+  support-team:
+    api_key_env: SUPPORT_TEAM_GATEWAY_KEY
+    allowed_routes: [simple]
+    default_policy:
+      max_requests_per_minute: 120
+      max_completion_tokens: 1000
+    applications:
+      support-router:
+        monthly_limit_usd: 50
+        max_input_bytes: 32768
 ```
 
 Each route has a primary `provider` and `model`, an ordered optional `fallbacks` list, and optional cache settings. Each provider's `kind` must be `openai`, `anthropic`, or `gemini`. The local example uses `kind: openai` with an OpenAI-compatible base URL and an optional key.
@@ -151,6 +173,7 @@ Each route has a primary `provider` and `model`, an ordered optional `fallbacks`
 | `GATEWAY_DATABASE` | SQLite path or PostgreSQL DSN | `./gateway.sqlite3` |
 | `REDIS_URL` | Optional shared cache and distributed rate-limit store | Unset (process-local backends) |
 | `GATEWAY_API_KEY` | Optional required gateway bearer key | Unset (gateway auth disabled) |
+| Tenant key variables | Configure each tenant's `api_key_env` with a unique secret variable | Required for each configured tenant |
 | `OPENAI_API_KEY` | OpenAI credential when configured | Unset |
 | `ANTHROPIC_API_KEY` | Anthropic credential when configured | Unset |
 | `GOOGLE_API_KEY` | Gemini credential when configured | Unset |
@@ -256,19 +279,24 @@ Budgets are configured under `budgets`. Policies in `applications` override fiel
 
 `max_requests_per_minute` is a process-local per-application quota. Configure `alert_thresholds` as fractions of the monthly cap (for example `[0.5, 0.8, 1.0]`) to emit one warning log at each threshold per app and month. `GET /v1/admin/budgets` reports current-month spend and utilization. Alerts currently go to application logs; route those logs to your existing alerting system.
 
+Tenant application names are scoped in the ledger as `<tenant-id>:<application>`, so same-named applications belonging to different tenants do not share budget accounting. Tenant application policies override global application policies, and each tenant may also define a `default_policy`.
+
+Set `"stream": true` on a chat request to receive OpenAI-compatible SSE frames (`data: ...`) followed by `[DONE]`. Provider streaming currently supports OpenAI-compatible endpoints; if a configured primary cannot stream, the gateway can move to a compatible fallback before sending text. After the first text delta, provider failures are returned as an SSE `error` event because replaying a second provider response could duplicate output. Token usage is included when the upstream sends final usage metadata.
+
 Prometheus counters and histograms are exposed at `/metrics`. OpenTelemetry request and provider-attempt spans are created; set `OTEL_EXPORTER_OTLP_ENDPOINT` to export traces with OTLP over HTTP. Keep `/metrics` on a private network or protect it at the ingress if metrics are sensitive in your environment.
 
 ## Multi-replica deployment
 
-Set `REDIS_URL` to enable shared Redis response caching and atomic per-provider/per-application sliding-window quotas. Redis must be available when the service starts; the gateway verifies the connection and fails startup if the configured backend is unavailable. Cache reads/writes fail open and fall through to the provider. Quota checks fail closed with HTTP 503 if Redis becomes unavailable, so traffic is not sent without enforcing configured limits. Use a private Redis network and `rediss://` when TLS is required; cached completions remain readable to Redis operators until their TTL expires.
+Set `REDIS_URL` to enable shared Redis response caching, atomic per-provider/per-application sliding-window quotas, and provider health/latency signals used by latency-aware routing. Redis must be available when the service starts; the gateway verifies the connection and fails startup if the configured backend is unavailable. Cache reads/writes and provider health writes fail open; quota checks fail closed with HTTP 503 if Redis becomes unavailable, so traffic is not sent without enforcing configured limits. Use a private Redis network and `rediss://` when TLS is required; cached completions remain readable to Redis operators until their TTL expires.
 
 Set `GATEWAY_DATABASE` to a PostgreSQL DSN such as `postgresql://gateway:password@db:5432/llm_gateway` to use the PostgreSQL ledger and coordinate concurrent budget reservations across replicas. The service creates the required tables and indexes at startup. Use SQLite for single-instance local development.
 
-Provider circuit breakers and their health state are currently process-local. Each replica independently skips providers that have crossed its failure threshold; recovery probes are limited to one per provider per process. Use `/v1/admin/providers` to inspect circuit states. Deploy behind TLS, keep Redis and PostgreSQL private, and protect admin and metrics endpoints at the network edge.
+Provider circuit breakers remain process-local. Each replica independently skips providers that have crossed its failure threshold; recovery probes are limited to one per provider per process. Latency and success/failure summaries are shared in Redis when configured. Set `routing.strategy: latency_aware` to order configured route candidates by their shared EWMA latency, penalized by failure rate. Use `/v1/admin/providers` to inspect circuit and performance signals. Deploy behind TLS, keep Redis and PostgreSQL private, and protect admin and metrics endpoints at the network edge.
 
 ## Security and privacy
 
 - Set `GATEWAY_API_KEY` to protect all `/v1` endpoints with bearer authentication.
+- When using tenant credentials, configure a separate `GATEWAY_API_KEY` for admin routes; tenant keys are restricted to allowed routes and applications.
 - Keep provider credentials in environment variables or a secrets manager. Do not commit credentials or `.env` files.
 - With `security.redact_pii: true`, the gateway pattern-redacts common email, phone-like, and API-key strings in message text **before forwarding it to the model**.
 - Redaction is pattern-based and is not a full data loss prevention system. Review whether this protection is sufficient for your data and use case.
@@ -293,8 +321,8 @@ For persistent data, mount a durable volume at the configured database directory
 
 ## Current limits
 
-- Streaming responses are not implemented.
-- Without Redis, rate limits and cache are process-local. Concurrency limits and circuit-breaker health remain process-local even when Redis is configured.
+- Streaming currently supports OpenAI-compatible provider endpoints; Anthropic and Gemini native stream formats are not implemented.
+- Without Redis, rate limits, cache, and provider performance signals are process-local. Concurrency limits and circuit-breaker health remain process-local even when Redis is configured.
 - PostgreSQL supports shared usage storage and monthly budget reservations across replicas. SQLite remains intended for a single instance and modest event volume.
 - The current gateway accepts text messages, not image/audio/video payloads or tool/function calls.
 - Pricing uses configured per-token rates and provider-reported token counts; it is an estimate and depends on maintaining the model price map.
@@ -306,10 +334,11 @@ Suggested next milestones, ordered by production value:
 
 - [x] Add automated endpoint and provider-adapter coverage for routing, retries, redaction, caching, pricing, failure accounting, budgets, and quotas.
 - [x] Add OpenTelemetry traces and Prometheus metrics for latency, retries, provider health, cost, and cache behavior.
-- [ ] Add streaming support while preserving usage accounting and fallback behavior before the first response chunk.
+- [x] Add streaming support while preserving usage accounting and fallback behavior before the first text chunk.
 - [x] Add shared Redis rate limits/cache and PostgreSQL-backed event storage for multi-replica deployments.
 - [x] Add per-application budgets, estimated hard spend limits, quotas, and log-based alerts.
 - [x] Add circuit breakers and provider health-aware routing to avoid repeated calls to unhealthy upstreams.
+- [x] Add tenant credentials with route/application scopes and tenant-specific budget policies.
 - [ ] Add more adapters: Azure OpenAI, AWS Bedrock, Vertex AI, and vLLM-native endpoints.
 - [ ] Add model allowlists, per-route policies, request size limits, and stronger authentication options.
 - [ ] Add tool calling, structured outputs, and multimodal request support.
