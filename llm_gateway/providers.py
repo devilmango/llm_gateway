@@ -163,24 +163,101 @@ class ProviderClient:
     @staticmethod
     def _anthropic_payload(model: str, payload: dict[str, Any]) -> dict[str, Any]:
         messages = payload["messages"]
-        system = "\n".join(m["content"] for m in messages if m["role"] in ("system", "developer"))
-        result: dict[str, Any] = {"model": model, "messages": [m for m in messages if m["role"] in ("user", "assistant")], "max_tokens": payload.get("max_tokens", 1024)}
+        system = "\n".join(m["content"] for m in messages
+                            if m["role"] in ("system", "developer") and m.get("content"))
+        api_messages: list[dict[str, Any]] = []
+        for message in messages:
+            role = message["role"]
+            if role in ("system", "developer"):
+                continue
+            if role == "tool":
+                content = [{"type": "tool_result", "tool_use_id": message["tool_call_id"],
+                            "content": message.get("content") or ""}]
+                api_messages.append({"role": "user", "content": content})
+                continue
+            content: list[dict[str, Any]] = []
+            if message.get("content"):
+                content.append({"type": "text", "text": message["content"]})
+            for call in message.get("tool_calls", []):
+                function = call.get("function", {})
+                try:
+                    arguments = json.loads(function.get("arguments", "{}"))
+                except (TypeError, ValueError):
+                    arguments = {}
+                content.append({"type": "tool_use", "id": call.get("id", ""),
+                                "name": function.get("name", ""), "input": arguments})
+            api_messages.append({"role": role, "content": content or (message.get("content") or "")})
+        result: dict[str, Any] = {"model": model, "messages": api_messages,
+                                  "max_tokens": payload.get("max_tokens", 1024)}
         if system:
             result["system"] = system
         for key in ("temperature", "top_p"):
             if payload.get(key) is not None:
                 result[key] = payload[key]
+        if payload.get("tools"):
+            result["tools"] = []
+            for tool in payload["tools"]:
+                function = tool["function"]
+                converted = {"name": function["name"],
+                             "input_schema": function.get("parameters", {"type": "object"})}
+                if function.get("description"):
+                    converted["description"] = function["description"]
+                if function.get("strict"):
+                    converted["strict"] = True
+                result["tools"].append(converted)
+            choice = payload.get("tool_choice")
+            if choice == "none":
+                result.pop("tools")
+            elif isinstance(choice, dict):
+                result["tool_choice"] = {"type": "tool", "name": choice.get("function", {}).get("name")}
+            elif choice == "required":
+                result["tool_choice"] = {"type": "any"}
+            elif choice == "auto":
+                result["tool_choice"] = {"type": "auto"}
+        response_format = payload.get("response_format")
+        if response_format:
+            if response_format["type"] == "json_object":
+                instruction = "Respond with one valid JSON object only. Do not include markdown fences or surrounding prose."
+                result["system"] = f"{result['system']}\n{instruction}" if result.get("system") else instruction
+            else:
+                result["output_config"] = {"format": {"type": "json_schema",
+                    "schema": response_format["json_schema"]["schema"]}}
         return result
 
     @staticmethod
     def _gemini_payload(payload: dict[str, Any]) -> dict[str, Any]:
         system = [m["content"] for m in payload["messages"] if m["role"] in ("system", "developer")]
         contents = []
+        function_names: dict[str, str] = {}
+        for message in payload["messages"]:
+            if message["role"] == "assistant":
+                for call in message.get("tool_calls", []):
+                    function_names[call.get("id", "")] = call.get("function", {}).get("name", "")
         for message in payload["messages"]:
             if message["role"] in ("system", "developer"):
                 continue
-            contents.append({"role": "model" if message["role"] == "assistant" else "user",
-                             "parts": [{"text": message["content"]}]})
+            if message["role"] == "tool":
+                name = message.get("name") or function_names.get(message.get("tool_call_id", ""), "")
+                try:
+                    response = json.loads(message.get("content") or "{}")
+                except (TypeError, ValueError):
+                    response = {"result": message.get("content") or ""}
+                parts = [{"functionResponse": {"name": name, "response": response}}]
+            else:
+                parts = []
+                if message.get("content"):
+                    parts.append({"text": message["content"]})
+                for call in message.get("tool_calls", []):
+                    function = call.get("function", {})
+                    try:
+                        args = json.loads(function.get("arguments", "{}"))
+                    except (TypeError, ValueError):
+                        args = {}
+                    function_call = {"name": function.get("name", ""), "args": args}
+                    if call.get("id"):
+                        function_call["id"] = call["id"]
+                    parts.append({"functionCall": function_call})
+            contents.append({"role": "model" if message["role"] == "assistant" else "user", "parts": parts})
         result: dict[str, Any] = {"contents": contents, "generationConfig": {}}
         if system:
             result["systemInstruction"] = {"parts": [{"text": "\n".join(system)}]}
@@ -189,26 +266,72 @@ class ProviderClient:
                 result["generationConfig"][dst] = payload[src]
         if not result["generationConfig"]:
             result.pop("generationConfig")
+        tools = payload.get("tools")
+        if tools:
+            declarations = []
+            for tool in tools:
+                function = tool["function"]
+                declaration = {"name": function["name"],
+                               "parameters": function.get("parameters", {"type": "object"})}
+                if function.get("description"):
+                    declaration["description"] = function["description"]
+                declarations.append(declaration)
+            result["tools"] = [{"functionDeclarations": declarations}]
+            choice = payload.get("tool_choice")
+            mode = "NONE" if choice == "none" else "ANY" if choice == "required" or isinstance(choice, dict) else "AUTO"
+            function_calling = {"mode": mode}
+            if isinstance(choice, dict):
+                function_calling["allowedFunctionNames"] = [choice.get("function", {}).get("name")]
+            result["toolConfig"] = {"functionCallingConfig": function_calling}
+        response_format = payload.get("response_format")
+        if response_format:
+            generation = result.setdefault("generationConfig", {})
+            generation["responseMimeType"] = "application/json"
+            if response_format["type"] == "json_schema":
+                generation["responseSchema"] = response_format["json_schema"]["schema"]
         return result
 
     @staticmethod
     def _normalize(body: dict[str, Any], kind: str, model: str) -> dict[str, Any]:
+        tool_calls: list[dict[str, Any]] = []
         if kind == "anthropic":
-            text = "".join(block.get("text", "") for block in body.get("content", []) if block.get("type") == "text")
+            text_parts = []
+            for block in body.get("content", []):
+                if block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                elif block.get("type") == "tool_use":
+                    tool_calls.append({"id": block.get("id"), "type": "function",
+                        "function": {"name": block.get("name"),
+                                     "arguments": json.dumps(block.get("input", {}), separators=(",", ":"))}})
+            text = "".join(text_parts)
             finish = body.get("stop_reason")
             response_id = body.get("id")
         elif kind == "gemini":
             candidates = body.get("candidates", [])
             parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
-            text = "".join(part.get("text", "") for part in parts)
+            text_parts = []
+            for part in parts:
+                if part.get("text"):
+                    text_parts.append(part["text"])
+                if part.get("functionCall"):
+                    call = part["functionCall"]
+                    tool_calls.append({"id": call.get("id") or f"call_{len(tool_calls)}", "type": "function",
+                        "function": {"name": call.get("name", ""),
+                                     "arguments": json.dumps(call.get("args", {}), separators=(",", ":"))}})
+            text = "".join(text_parts)
             finish = candidates[0].get("finishReason") if candidates else None
             response_id = None
         else:
             choices = body.get("choices", [])
-            text = choices[0].get("message", {}).get("content", "") if choices else ""
+            message = choices[0].get("message", {}) if choices else {}
+            text = message.get("content") or ""
+            tool_calls = message.get("tool_calls", []) or []
             finish = choices[0].get("finish_reason") if choices else None
             response_id = body.get("id")
-        if not text:
+        if not text and not tool_calls:
             raise ProviderError("Provider returned no text completion", retryable=False)
-        return {"text": text, "finish_reason": finish, "usage": _token_usage(body, kind),
-                "provider_response_id": response_id, "model": body.get("model", model)}
+        result = {"text": text, "finish_reason": finish, "usage": _token_usage(body, kind),
+                  "provider_response_id": response_id, "model": body.get("model", model)}
+        if tool_calls:
+            result["tool_calls"] = tool_calls
+        return result

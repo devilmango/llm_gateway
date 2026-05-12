@@ -44,6 +44,11 @@ budgets:
       max_requests_per_minute: 300
       max_input_bytes: 32768
       max_completion_tokens: 1024
+      alert_thresholds: [0.8, 1.0]
+      # Optional JSON webhook POST for each newly crossed alert threshold.
+      # alert_webhook_url: https://alerts.example.com/llm-gateway
+      # alert_webhook_secret_env: LLM_BUDGET_WEBHOOK_SECRET
+      # alert_webhook_max_attempts: 3
 
 providers:
   openai:

@@ -43,12 +43,14 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Usage and cost ledger | Persist provider, route, model, token usage, estimated USD cost, status, latency, fallback, and cache-hit metadata in SQLite or PostgreSQL. |
 | Application reporting | Group usage and reliability totals by the caller-supplied application name. |
 | Application budgets and quotas | Enforce UTC calendar-month spend caps, per-application request rates, and request size/output bounds. Reserve estimated maximum cost before provider calls to limit concurrent overspend. |
-| Budget alerts | Emit structured warning logs once per application and month when configured spend thresholds (80% and 100% by default) are crossed. |
+| Budget alerts | Emit structured warning logs and optional signed webhook events when configured spend thresholds (80% and 100% by default) are crossed. |
 | Observability | Export Prometheus request, token, cost, fallback, cache, in-flight, end-to-end latency, provider outcome/latency, and retry metrics; emit nested OpenTelemetry request/provider-attempt spans and optionally export them over OTLP/HTTP. |
 | Provider health | Open a circuit after repeated transient failures, skip open providers, and allow a single half-open probe after the recovery period. |
 | Latency-aware routing | Optionally order a route's primary and fallback candidates using shared provider EWMA latency and failure-rate signals. |
 | Streaming | Stream OpenAI-compatible provider output as server-sent events, with usage accounting at completion and fallback only before text has been emitted. |
 | Tenant access controls | Configure per-tenant bearer credentials, route allowlists, application allowlists, and tenant-specific budget/limit policies. |
+| Tool calling and structured outputs | Pass OpenAI-style function definitions and JSON response schemas; adapters translate them for OpenAI-compatible, Anthropic, and Gemini providers. Tool execution stays in the calling application. |
+| Budget alert webhooks | POST newly crossed budget-threshold events to an application-configured webhook, optionally signed with HMAC-SHA256. |
 | Response cache | Optionally cache a route's completion for a configured TTL. Cache hits have zero upstream usage and cost in the ledger. |
 | PII and secret redaction | Pattern-redact common email addresses, phone-like strings, and API-key forms in message text before sending upstream. |
 | Optional gateway authentication | Require a bearer key for route, completion, and report endpoints by setting `GATEWAY_API_KEY`. |
@@ -223,7 +225,28 @@ The response includes the normalized completion, usage, actual provider/model se
 }
 ```
 
-Supported request fields are `model`, `messages`, `application`, `temperature`, `max_tokens`, `top_p`, `user`, and `metadata`. The current implementation forwards message text and generation settings; `user` and `metadata` are accepted for compatibility but are not forwarded or persisted.
+Supported request fields include `model`, `messages`, `application`, `temperature`, `max_tokens`, `top_p`, `tools`, `tool_choice`, `response_format`, and `stream`. `user` and `metadata` are accepted for compatibility but are not forwarded or persisted.
+
+For tool calling, send OpenAI-style function declarations. The gateway returns normalized assistant `tool_calls`; the application remains responsible for authorizing and executing the functions, then sending their results as `role: "tool"` messages in a follow-up request.
+
+```json
+{
+  "model": "simple",
+  "messages": [{"role": "user", "content": "Look up order A-17"}],
+  "tools": [{"type": "function", "function": {
+    "name": "lookup_order",
+    "description": "Look up an order by its ID",
+    "parameters": {
+      "type": "object",
+      "properties": {"order_id": {"type": "string"}},
+      "required": ["order_id"]
+    }
+  }}],
+  "tool_choice": "auto"
+}
+```
+
+Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status","strict":true,"schema":{"type":"object","properties":{"status":{"type":"string"}},"required":["status"],"additionalProperties":false}}}` for schema-constrained output. `json_object` is also accepted when a specific schema is not needed. The gateway translates these options for OpenAI-compatible, Anthropic, and Gemini APIs; Anthropic JSON-object mode uses an explicit instruction, while Anthropic schema mode and Gemini modes use provider formatting controls. Each provider may impose its own JSON Schema limits.
 
 ### Other endpoints
 
@@ -238,7 +261,7 @@ Supported request fields are `model`, `messages`, `application`, `temperature`, 
 | `GET` | `/metrics` | Prometheus metrics in exposition format. |
 | `GET` | `/docs` | FastAPI Swagger UI. |
 
-Unless otherwise noted, endpoints under `/v1` require the configured gateway bearer key when `GATEWAY_API_KEY` is set.
+When tenant credentials are configured, `/v1/chat/completions` and `/v1/routes` require a tenant key, while `/v1/admin/*` requires `GATEWAY_API_KEY`. Without tenant configuration, `GATEWAY_API_KEY` optionally protects `/v1` endpoints.
 
 ## Cost and reliability reporting
 
@@ -277,11 +300,15 @@ The report is backed by a SQLite ledger keyed by gateway request ID. It records 
 
 Budgets are configured under `budgets`. Policies in `applications` override fields from `default`. Monthly limits use UTC calendar months. For a configured monthly limit, requests are capped by `max_input_bytes` and `max_completion_tokens`; if `max_tokens` is omitted, the policy's completion cap is applied. Before calling providers, the gateway reserves a conservative estimate based on UTF-8 input bytes, the completion cap, and the highest configured price among the route's primary and fallback models. Database transactions include active reservations when checking the cap, which bounds concurrent overspend. Correct price entries are required for accurate enforcement. Reservations expire after five minutes to recover from process crashes.
 
-`max_requests_per_minute` is a process-local per-application quota. Configure `alert_thresholds` as fractions of the monthly cap (for example `[0.5, 0.8, 1.0]`) to emit one warning log at each threshold per app and month. `GET /v1/admin/budgets` reports current-month spend and utilization. Alerts currently go to application logs; route those logs to your existing alerting system.
+`max_requests_per_minute` is a per-application quota (shared across replicas with Redis). Configure `alert_thresholds` as fractions of the monthly cap (for example `[0.5, 0.8, 1.0]`) to emit one warning log and optional webhook event at each threshold per app and month. `GET /v1/admin/budgets` reports current-month spend and utilization.
 
 Tenant application names are scoped in the ledger as `<tenant-id>:<application>`, so same-named applications belonging to different tenants do not share budget accounting. Tenant application policies override global application policies, and each tenant may also define a `default_policy`.
 
+Add `alert_webhook_url` to the matching application policy to deliver each newly crossed `alert_thresholds` event. Optionally set `alert_webhook_secret_env` to the name of an environment variable containing a shared secret. The gateway POSTs compact JSON with the `X-LLM-Gateway-Signature: sha256=<hex>` header and a stable `Idempotency-Key`. It retries transient HTTP 429/5xx and network failures up to `alert_webhook_max_attempts` (3 by default, capped at 5), with a three-second timeout per attempt. Permanent 4xx responses are not retried. Webhook failures do not fail the model request. Configure webhook URLs only in trusted gateway configuration.
+
 Set `"stream": true` on a chat request to receive OpenAI-compatible SSE frames (`data: ...`) followed by `[DONE]`. Provider streaming currently supports OpenAI-compatible endpoints; if a configured primary cannot stream, the gateway can move to a compatible fallback before sending text. After the first text delta, provider failures are returned as an SSE `error` event because replaying a second provider response could duplicate output. Token usage is included when the upstream sends final usage metadata.
+
+Requests may include OpenAI-style `tools`, `tool_choice`, and `response_format`. The gateway translates function declarations, prior assistant tool calls, and tool-result messages for Anthropic and Gemini as well as OpenAI-compatible endpoints. Tool calls are returned in the normalized assistant response; the gateway never runs the requested function. `response_format` accepts `json_object` or `json_schema`. Streaming tool calls are currently rejected. Requests containing tool definitions or tool-call history bypass response caching to avoid replaying stale actions.
 
 Prometheus counters and histograms are exposed at `/metrics`. OpenTelemetry request and provider-attempt spans are created; set `OTEL_EXPORTER_OTLP_ENDPOINT` to export traces with OTLP over HTTP. Keep `/metrics` on a private network or protect it at the ingress if metrics are sensitive in your environment.
 
@@ -324,7 +351,7 @@ For persistent data, mount a durable volume at the configured database directory
 - Streaming currently supports OpenAI-compatible provider endpoints; Anthropic and Gemini native stream formats are not implemented.
 - Without Redis, rate limits, cache, and provider performance signals are process-local. Concurrency limits and circuit-breaker health remain process-local even when Redis is configured.
 - PostgreSQL supports shared usage storage and monthly budget reservations across replicas. SQLite remains intended for a single instance and modest event volume.
-- The current gateway accepts text messages, not image/audio/video payloads or tool/function calls.
+- The gateway accepts text messages and normalized tool calls, but not image/audio/video payloads. It returns tool calls for the application to execute and does not run them itself.
 - Pricing uses configured per-token rates and provider-reported token counts; it is an estimate and depends on maintaining the model price map.
 - PII redaction covers common patterns only and can miss sensitive information or alter phone-like text.
 
@@ -339,9 +366,11 @@ Suggested next milestones, ordered by production value:
 - [x] Add per-application budgets, estimated hard spend limits, quotas, and log-based alerts.
 - [x] Add circuit breakers and provider health-aware routing to avoid repeated calls to unhealthy upstreams.
 - [x] Add tenant credentials with route/application scopes and tenant-specific budget policies.
+- [x] Add normalized tool calling and structured JSON output formats across configured providers.
+- [x] Deliver budget threshold alerts to optional signed webhooks.
 - [ ] Add more adapters: Azure OpenAI, AWS Bedrock, Vertex AI, and vLLM-native endpoints.
 - [ ] Add model allowlists, per-route policies, request size limits, and stronger authentication options.
-- [ ] Add tool calling, structured outputs, and multimodal request support.
+- [ ] Add native provider streaming for Anthropic and Gemini, plus multimodal request support.
 - [ ] Add a dashboard and export endpoints for finance and operations workflows.
 
 ## Contributing

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -103,6 +104,54 @@ def create_app(config: dict[str, Any] | None = None,
         await authenticate_admin(authorization)
         return None
 
+    async def publish_budget_alerts(request: Request, alerts: list[dict[str, Any]], policy: dict[str, Any],
+                                    application: str, request_id: str) -> None:
+        webhook_url = policy.get("alert_webhook_url")
+        secret_env = policy.get("alert_webhook_secret_env")
+        secret = os.getenv(secret_env, "") if secret_env else ""
+        try:
+            max_attempts = min(5, max(1, int(policy.get("alert_webhook_max_attempts", 3))))
+        except (TypeError, ValueError):
+            max_attempts = 3
+        for alert in alerts:
+            safe_application = redact(application)
+            logger.warning("budget_alert application=%s threshold=%s spend_usd=%.8f limit_usd=%.8f",
+                safe_application, alert["threshold"], alert["spend_usd"], alert["limit_usd"])
+            if not webhook_url:
+                continue
+            event = {"event": "budget.threshold_crossed", "request_id": request_id,
+                "occurred_at": datetime.now(UTC).isoformat(), "application": safe_application,
+                "threshold": alert["threshold"], "spend_usd": alert["spend_usd"],
+                "limit_usd": alert["limit_usd"], "currency": "USD", "window": "utc_calendar_month"}
+            alert_identity = f"{application}:{event['occurred_at'][:7]}:{alert['threshold']}"
+            alert_id = hashlib.sha256(alert_identity.encode("utf-8")).hexdigest()
+            event["alert_id"] = alert_id
+            body = json.dumps(event, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            headers["Idempotency-Key"] = alert_id
+            if secret:
+                signature = hmac.new(secret.encode("utf-8"), body, "sha256").hexdigest()
+                headers["X-LLM-Gateway-Signature"] = f"sha256={signature}"
+            for attempt in range(max_attempts):
+                try:
+                    response = await request.app.state.http.post(webhook_url, content=body,
+                        headers=headers, timeout=3.0)
+                    if not response.is_error:
+                        break
+                    if response.status_code < 500 and response.status_code != 429:
+                        logger.warning("budget_webhook_failed application=%s status_code=%s",
+                            safe_application, response.status_code)
+                        break
+                    error_type = f"HTTP{response.status_code}"
+                except (httpx.HTTPError, ValueError) as exc:
+                    error_type = type(exc).__name__
+                if attempt + 1 < max_attempts:
+                    await asyncio.sleep(0.1 * (2 ** attempt))
+                else:
+                    # Alert delivery must not turn an otherwise successful model call into an error.
+                    logger.warning("budget_webhook_failed application=%s error_type=%s attempts=%s",
+                        safe_application, error_type, max_attempts)
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -125,15 +174,20 @@ def create_app(config: dict[str, Any] | None = None,
         request_id = "gw_" + uuid.uuid4().hex
         started = time.perf_counter()
         route_name = body.model
-        messages = [{"role": message.role, "content": message.content} for message in body.messages]
+        messages = [message.model_dump(exclude_none=True) for message in body.messages]
         should_redact = bool(cfg.get("security", {}).get("redact_pii", True))
         if should_redact:
-            messages = [{**message, "content": redact(message["content"])} for message in messages]
+            messages = [{**message, "content": redact(message["content"])}
+                        if isinstance(message.get("content"), str) else message for message in messages]
         upstream_payload = {"messages": messages}
         for source, destination in (("temperature", "temperature"), ("max_tokens", "max_tokens"), ("top_p", "top_p")):
             value = getattr(body, source)
             if value is not None:
                 upstream_payload[destination] = value
+        for field in ("tools", "tool_choice", "response_format"):
+            value = getattr(body, field)
+            if value is not None:
+                upstream_payload[field] = value
         app_name = body.application.strip() or "default"
         if tenant:
             tenant_cfg = tenant["config"]
@@ -233,9 +287,7 @@ def create_app(config: dict[str, Any] | None = None,
                             thresholds = [float(value) for value in policy.get("alert_thresholds", [0.8, 1.0])]
                             alerts = await asyncio.to_thread(request.app.state.store.check_budget_alerts,
                                 ledger_app_name, float(monthly_limit), thresholds)
-                            for alert in alerts:
-                                logger.warning("budget_alert application=%s threshold=%s spend_usd=%.8f limit_usd=%.8f",
-                                    redact(ledger_app_name), alert["threshold"], alert["spend_usd"], alert["limit_usd"])
+                            await publish_budget_alerts(request, alerts, policy, ledger_app_name, request_id)
                         span.set_attribute("llm.gateway.status", status)
                         span.set_attribute("llm.gateway.application", ledger_app_name)
                         if stream_error:
@@ -265,7 +317,9 @@ def create_app(config: dict[str, Any] | None = None,
             span.set_attribute("llm.usage.total_tokens", usage["total_tokens"])
             span.set_attribute("llm.cost.usd", cost)
             output = ChatResponse(id=request_id, created=int(time.time()), model=route_name,
-                choices=[ChatChoice(message={"role": "assistant", "content": result["text"]}, finish_reason=result.get("finish_reason"))],
+                choices=[ChatChoice(message={"role": "assistant", "content": result.get("text") or None,
+                    **({"tool_calls": result["tool_calls"]} if result.get("tool_calls") else {})},
+                    finish_reason=result.get("finish_reason"))],
                 usage=Usage(**usage), gateway={"provider": provider, "upstream_model": model,
                     "fallback_used": result["fallback_used"], "cached": result["cached"], "cost_usd": round(cost, 8)})
             return output
@@ -323,9 +377,7 @@ def create_app(config: dict[str, Any] | None = None,
                     alert_thresholds = policy.get("alert_thresholds", [0.8, 1.0])
                     alerts = await asyncio.to_thread(request.app.state.store.check_budget_alerts,
                         ledger_app_name, float(monthly_limit), [float(value) for value in alert_thresholds])
-                    for alert in alerts:
-                        logger.warning("budget_alert application=%s threshold=%s spend_usd=%.8f limit_usd=%.8f",
-                            redact(ledger_app_name), alert["threshold"], alert["spend_usd"], alert["limit_usd"])
+                    await publish_budget_alerts(request, alerts, policy, ledger_app_name, request_id)
                 span.set_attribute("llm.gateway.status", record["status"])
                 span.set_attribute("llm.gateway.application", app_name)
                 if error_type:

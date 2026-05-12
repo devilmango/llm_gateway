@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 from contextlib import asynccontextmanager
@@ -11,6 +13,7 @@ import httpx
 import pytest
 
 from llm_gateway.main import create_app
+from llm_gateway.providers import ProviderClient
 
 
 def config(database: str) -> dict:
@@ -146,6 +149,148 @@ async def test_budget_alerts_once_at_configured_threshold(tmp_path, monkeypatch,
         assert budget["utilization"] == 0.875
         assert (await client.post("/v1/chat/completions", json=request)).status_code == 429
         assert caplog.text.count("budget_alert application=alert-app threshold=0.8") == 1
+
+
+@pytest.mark.asyncio
+async def test_budget_alert_webhook_is_signed_and_retries_idempotently(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    monkeypatch.setenv("ALERT_SIGNING_SECRET", "webhook-secret")
+    webhook_events: list[dict] = []
+    webhook_keys: list[str] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "alerts.test":
+            body = request.content
+            signature = request.headers["X-LLM-Gateway-Signature"]
+            expected = "sha256=" + hmac.new(b"webhook-secret", body, hashlib.sha256).hexdigest()
+            assert hmac.compare_digest(signature, expected)
+            webhook_events.append(json.loads(body))
+            webhook_keys.append(request.headers["Idempotency-Key"])
+            return httpx.Response(503 if len(webhook_events) == 1 else 204)
+        return httpx.Response(200, json={
+            "model": "primary-model",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+        })
+
+    cfg = config(str(tmp_path / "webhook.sqlite3"))
+    cfg["budgets"]["applications"]["alert-app"] = {
+        "monthly_limit_usd": 0.000008, "max_input_bytes": 5, "max_completion_tokens": 1,
+        "alert_thresholds": [0.8], "alert_webhook_url": "https://alerts.test/hook",
+        "alert_webhook_secret_env": "ALERT_SIGNING_SECRET", "alert_webhook_max_attempts": 2,
+    }
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        request = {"model": "simple", "application": "alert-app",
+                   "messages": [{"role": "user", "content": "hello"}]}
+        assert (await client.post("/v1/chat/completions", json=request)).status_code == 200
+        assert (await client.post("/v1/chat/completions", json=request)).status_code == 429
+    assert len(webhook_events) == 2
+    assert webhook_keys[0] == webhook_keys[1] == webhook_events[0]["alert_id"]
+    assert webhook_events[0]["alert_id"] == webhook_events[1]["alert_id"]
+    assert webhook_events[0]["event"] == "budget.threshold_crossed"
+    assert webhook_events[0]["application"] == "alert-app"
+    assert webhook_events[0]["threshold"] == 0.8
+
+
+@pytest.mark.asyncio
+async def test_budget_webhook_delivery_failure_does_not_fail_model_request(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "alerts.test":
+            raise httpx.ConnectError("webhook unavailable", request=request)
+        return httpx.Response(200, json={
+            "model": "primary-model",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+        })
+
+    cfg = config(str(tmp_path / "webhook-failure.sqlite3"))
+    cfg["budgets"]["applications"]["alert-app"] = {
+        "monthly_limit_usd": 0.000008, "max_input_bytes": 5, "max_completion_tokens": 1,
+        "alert_thresholds": [0.8], "alert_webhook_url": "https://alerts.test/hook",
+    }
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "simple", "application": "alert-app",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_calls_and_structured_output_are_normalized(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    received: dict = {}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        received.update(json.loads(request.content))
+        return httpx.Response(200, json={
+            "model": "primary-model",
+            "choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_123", "type": "function",
+                "function": {"name": "lookup_order", "arguments": "{\"order_id\":\"A-17\"}"},
+            }]}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
+        })
+
+    cfg = config(str(tmp_path / "tools.sqlite3"))
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "simple", "messages": [{"role": "user", "content": "Find order A-17"}],
+            "tools": [{"type": "function", "function": {"name": "lookup_order",
+                "description": "Look up an order", "parameters": {"type": "object",
+                    "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}}}],
+            "tool_choice": {"type": "function", "function": {"name": "lookup_order"}},
+            "response_format": {"type": "json_schema", "json_schema": {"name": "order_result",
+                "strict": True, "schema": {"type": "object", "properties": {"status": {"type": "string"}},
+                    "required": ["status"], "additionalProperties": False}}},
+        })
+        assert response.status_code == 200
+        body = response.json()
+        assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "lookup_order"
+        assert json.loads(body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]) == {"order_id": "A-17"}
+        assert received["tool_choice"]["function"]["name"] == "lookup_order"
+        assert received["response_format"]["json_schema"]["name"] == "order_result"
+
+
+def test_anthropic_and_gemini_tool_and_schema_translation():
+    payload = {"messages": [
+        {"role": "user", "content": "Find order A-17"},
+        {"role": "assistant", "tool_calls": [{"id": "call_123", "type": "function",
+            "function": {"name": "lookup_order", "arguments": "{\"order_id\":\"A-17\"}"}}]},
+        {"role": "tool", "tool_call_id": "call_123", "name": "lookup_order", "content": "{\"status\":\"shipped\"}"},
+    ], "tools": [{"type": "function", "function": {"name": "lookup_order",
+        "description": "Look up an order", "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}}}}],
+        "tool_choice": "required", "response_format": {"type": "json_schema", "json_schema": {
+            "name": "order_result", "schema": {"type": "object", "properties": {"status": {"type": "string"}}}}}}
+    anthropic = ProviderClient._anthropic_payload("claude-test", payload)
+    assert anthropic["tools"][0]["name"] == "lookup_order"
+    assert anthropic["tool_choice"] == {"type": "any"}
+    assert anthropic["messages"][1]["content"][0]["type"] == "tool_use"
+    assert anthropic["messages"][2]["content"][0]["type"] == "tool_result"
+    assert anthropic["output_config"]["format"]["schema"]["properties"]["status"]["type"] == "string"
+
+    gemini = ProviderClient._gemini_payload(payload)
+    assert gemini["tools"][0]["functionDeclarations"][0]["name"] == "lookup_order"
+    assert gemini["toolConfig"]["functionCallingConfig"]["mode"] == "ANY"
+    assert gemini["contents"][1]["parts"][0]["functionCall"]["args"] == {"order_id": "A-17"}
+    assert gemini["contents"][2]["parts"][0]["functionResponse"]["response"] == {"status": "shipped"}
+    assert gemini["generationConfig"]["responseSchema"]["properties"]["status"]["type"] == "string"
+
+
+def test_provider_normalization_preserves_tool_calls_without_text():
+    anthropic = ProviderClient._normalize({"id": "msg_1", "content": [{"type": "tool_use", "id": "toolu_1",
+        "name": "lookup_order", "input": {"order_id": "A-17"}}], "usage": {"input_tokens": 3, "output_tokens": 4}},
+        "anthropic", "claude-test")
+    assert anthropic["text"] == ""
+    assert anthropic["tool_calls"][0]["id"] == "toolu_1"
+    gemini = ProviderClient._normalize({"candidates": [{"content": {"parts": [{"functionCall": {
+        "name": "lookup_order", "args": {"order_id": "A-17"}}}]}}], "usageMetadata": {"promptTokenCount": 2}},
+        "gemini", "gemini-test")
+    assert gemini["tool_calls"][0]["function"]["name"] == "lookup_order"
 
 
 @pytest.mark.asyncio

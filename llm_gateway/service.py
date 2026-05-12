@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from opentelemetry import trace
@@ -37,7 +38,11 @@ class GatewayService:
 
     def budget_reservation(self, route_name: str, payload: dict[str, Any], policy: dict[str, Any]) -> float:
         max_input_bytes = int(policy.get("max_input_bytes", 32_768))
-        input_bytes = sum(len(message["content"].encode("utf-8")) for message in payload["messages"])
+        input_bytes = sum(len((message.get("content") or "").encode("utf-8"))
+                          for message in payload["messages"])
+        if payload.get("tools") or payload.get("response_format"):
+            input_bytes += len(json.dumps({"tools": payload.get("tools"),
+                "response_format": payload.get("response_format")}, ensure_ascii=False).encode("utf-8"))
         if input_bytes > max_input_bytes:
             raise ValueError(f"Request exceeds application input limit of {max_input_bytes} bytes")
         max_completion_tokens = int(policy.get("max_completion_tokens", 1_024))
@@ -90,7 +95,8 @@ class GatewayService:
         candidates = await self._order_candidates(self.route_candidates(route_name))
         cache_cfg = route.get("cache", {})
         cache_key = self.cache.key(payload, preferred[0], preferred[1])
-        if cache_cfg.get("enabled"):
+        cache_safe = not payload.get("tools") and not any(message.get("tool_calls") for message in payload["messages"])
+        if cache_cfg.get("enabled") and cache_safe:
             cached = await self.cache.get(cache_key)
             if cached:
                 # A cache hit incurs no upstream token spend. The response still contains the
@@ -124,7 +130,7 @@ class GatewayService:
                             await self.breaker.success(name)
                             result.update({"provider": name, "configured_model": model,
                                            "fallback_used": (name, model) != preferred, "cached": False})
-                            if cache_cfg.get("enabled"):
+                            if cache_cfg.get("enabled") and cache_safe:
                                 await self.cache.put(cache_key, result, int(cache_cfg.get("ttl_seconds", 60)))
                             return result
                         except RateLimitExceeded:
@@ -157,7 +163,8 @@ class GatewayService:
         candidates = await self._order_candidates(self.route_candidates(route_name))
         cache_cfg = route.get("cache", {})
         cache_key = self.cache.key(payload, preferred[0], preferred[1])
-        if cache_cfg.get("enabled"):
+        cache_safe = not payload.get("tools") and not any(message.get("tool_calls") for message in payload["messages"])
+        if cache_cfg.get("enabled") and cache_safe:
             cached = await self.cache.get(cache_key)
             if cached:
                 yield {"delta": cached["text"]}
@@ -198,7 +205,7 @@ class GatewayService:
                                   "finish_reason": final.get("finish_reason"), "model": final.get("model", model),
                                   "provider": name, "configured_model": model,
                                   "fallback_used": (name, model) != preferred, "cached": False}
-                        if cache_cfg.get("enabled"):
+                        if cache_cfg.get("enabled") and cache_safe:
                             await self.cache.put(cache_key, result, int(cache_cfg.get("ttl_seconds", 60)))
                         yield {**result, "final": True}
                         return
