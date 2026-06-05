@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
 import hmac
 import json
@@ -9,7 +10,8 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from io import StringIO
 from typing import Any
 
 import httpx
@@ -43,6 +45,54 @@ TRACER_PROVIDER = initialize_tracing()
 TRACER = TRACER_PROVIDER.get_tracer("llm_gateway")
 
 
+async def _deliver_webhook_batch(app: FastAPI, batch_size: int = 20) -> None:
+    store = app.state.store
+    if store is None:
+        return
+    events = await asyncio.to_thread(store.due_webhooks, batch_size)
+    for event in events:
+        try:
+            body = event["body"].encode("utf-8")
+            headers = {"Content-Type": "application/json", "Idempotency-Key": event["event_id"]}
+            secret = os.getenv(event.get("secret_env") or "", "")
+            if secret:
+                signature = hmac.new(secret.encode("utf-8"), body, "sha256").hexdigest()
+                headers["X-LLM-Gateway-Signature"] = f"sha256={signature}"
+            response = await app.state.http.post(event["webhook_url"], content=body,
+                                                  headers=headers, timeout=3.0)
+            attempts = int(event["attempts"]) + 1
+            if not response.is_error:
+                await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
+                    status="delivered", delivered_at=datetime.now(UTC), last_error=None)
+            elif response.status_code < 500 and response.status_code != 429:
+                await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
+                    status="dead_letter", last_error=f"HTTP{response.status_code}")
+            else:
+                status = "dead_letter" if attempts >= 8 else "pending"
+                delay = min(300, 2 ** min(attempts, 8))
+                await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
+                    status=status, next_attempt_at=datetime.now(UTC) + timedelta(seconds=delay),
+                    last_error=f"HTTP{response.status_code}")
+        except (httpx.HTTPError, ValueError) as exc:
+            attempts = int(event["attempts"]) + 1
+            status = "dead_letter" if attempts >= 8 else "pending"
+            delay = min(300, 2 ** min(attempts, 8))
+            await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
+                status=status, next_attempt_at=datetime.now(UTC) + timedelta(seconds=delay),
+                last_error=type(exc).__name__)
+
+
+async def _webhook_delivery_loop(app: FastAPI) -> None:
+    while True:
+        try:
+            await _deliver_webhook_batch(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("webhook_delivery_batch_failed")
+        await asyncio.sleep(1)
+
+
 def create_app(config: dict[str, Any] | None = None,
                http_transport: httpx.AsyncBaseTransport | None = None,
                shared_redis: Any | None = None) -> FastAPI:
@@ -52,6 +102,7 @@ def create_app(config: dict[str, Any] | None = None,
     async def lifespan(app: FastAPI):
         timeout = httpx.Timeout(float(cfg["server"].get("request_timeout_seconds", 45)))
         app.state.http = httpx.AsyncClient(timeout=timeout, transport=http_transport)
+        app.state.webhook_task = None
         redis_client = shared_redis
         owns_redis = False
         app.state.store = None
@@ -67,8 +118,15 @@ def create_app(config: dict[str, Any] | None = None,
             app.state.gateway = GatewayService(cfg, app.state.http, shared_redis=redis_client)
             database = os.getenv("GATEWAY_DATABASE", cfg["server"].get("database", "./gateway.sqlite3"))
             app.state.store = create_usage_store(database)
+            app.state.webhook_task = asyncio.create_task(_webhook_delivery_loop(app))
             yield
         finally:
+            if app.state.webhook_task:
+                app.state.webhook_task.cancel()
+                try:
+                    await app.state.webhook_task
+                except asyncio.CancelledError:
+                    pass
             await app.state.http.aclose()
             if owns_redis and redis_client:
                 await redis_client.aclose()
@@ -82,14 +140,28 @@ def create_app(config: dict[str, Any] | None = None,
     def configured_tenants() -> dict[str, Any]:
         return cfg.get("tenants", cfg.get("security", {}).get("tenants", {}))
 
-    async def authenticate_admin(authorization: str | None = Header(default=None)) -> None:
+    async def validate_admin(authorization: str | None, scope: str = "") -> None:
+        provided = authorization.removeprefix("Bearer ") if authorization else ""
+        key_records = cfg.get("security", {}).get("admin_api_keys", [])
+        if key_records:
+            for record in key_records:
+                expected = os.getenv(record.get("api_key_env", ""), "") if record.get("enabled", True) else ""
+                if expected and hmac.compare_digest(provided, expected):
+                    scopes = set(record.get("scopes", []))
+                    if "*" not in scopes and scope not in scopes:
+                        raise HTTPException(status_code=403, detail="Admin key lacks required scope")
+                    return
+            raise HTTPException(status_code=401, detail="Invalid gateway credentials")
         expected = os.getenv("GATEWAY_API_KEY")
         if configured_tenants() and not expected:
             raise HTTPException(status_code=503, detail="Admin API key is not configured")
-        if expected:
-            provided = authorization.removeprefix("Bearer ") if authorization else ""
-            if not hmac.compare_digest(provided, expected):
-                raise HTTPException(status_code=401, detail="Invalid gateway credentials")
+        if expected and not hmac.compare_digest(provided, expected):
+            raise HTTPException(status_code=401, detail="Invalid gateway credentials")
+
+    def admin_dependency(scope: str):
+        async def dependency(authorization: str | None = Header(default=None)) -> None:
+            await validate_admin(authorization, scope)
+        return dependency
 
     async def authenticate_client(authorization: str | None = Header(default=None)) -> dict[str, Any] | None:
         tenants = configured_tenants()
@@ -101,18 +173,13 @@ def create_app(config: dict[str, Any] | None = None,
                 if expected and hmac.compare_digest(provided, expected):
                     return {"id": tenant_id, "config": tenant}
             raise HTTPException(status_code=401, detail="Invalid tenant credentials")
-        await authenticate_admin(authorization)
+        await validate_admin(authorization)
         return None
 
     async def publish_budget_alerts(request: Request, alerts: list[dict[str, Any]], policy: dict[str, Any],
                                     application: str, request_id: str) -> None:
         webhook_url = policy.get("alert_webhook_url")
         secret_env = policy.get("alert_webhook_secret_env")
-        secret = os.getenv(secret_env, "") if secret_env else ""
-        try:
-            max_attempts = min(5, max(1, int(policy.get("alert_webhook_max_attempts", 3))))
-        except (TypeError, ValueError):
-            max_attempts = 3
         for alert in alerts:
             safe_application = redact(application)
             logger.warning("budget_alert application=%s threshold=%s spend_usd=%.8f limit_usd=%.8f",
@@ -126,31 +193,7 @@ def create_app(config: dict[str, Any] | None = None,
             alert_identity = f"{application}:{event['occurred_at'][:7]}:{alert['threshold']}"
             alert_id = hashlib.sha256(alert_identity.encode("utf-8")).hexdigest()
             event["alert_id"] = alert_id
-            body = json.dumps(event, separators=(",", ":"), sort_keys=True).encode("utf-8")
-            headers = {"Content-Type": "application/json"}
-            headers["Idempotency-Key"] = alert_id
-            if secret:
-                signature = hmac.new(secret.encode("utf-8"), body, "sha256").hexdigest()
-                headers["X-LLM-Gateway-Signature"] = f"sha256={signature}"
-            for attempt in range(max_attempts):
-                try:
-                    response = await request.app.state.http.post(webhook_url, content=body,
-                        headers=headers, timeout=3.0)
-                    if not response.is_error:
-                        break
-                    if response.status_code < 500 and response.status_code != 429:
-                        logger.warning("budget_webhook_failed application=%s status_code=%s",
-                            safe_application, response.status_code)
-                        break
-                    error_type = f"HTTP{response.status_code}"
-                except (httpx.HTTPError, ValueError) as exc:
-                    error_type = type(exc).__name__
-                if attempt + 1 < max_attempts:
-                    await asyncio.sleep(0.1 * (2 ** attempt))
-                else:
-                    # Alert delivery must not turn an otherwise successful model call into an error.
-                    logger.warning("budget_webhook_failed application=%s error_type=%s attempts=%s",
-                        safe_application, error_type, max_attempts)
+            await asyncio.to_thread(request.app.state.store.enqueue_webhook, event, webhook_url, secret_env)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -178,7 +221,10 @@ def create_app(config: dict[str, Any] | None = None,
         should_redact = bool(cfg.get("security", {}).get("redact_pii", True))
         if should_redact:
             messages = [{**message, "content": redact(message["content"])}
-                        if isinstance(message.get("content"), str) else message for message in messages]
+                        if isinstance(message.get("content"), str) else
+                        {**message, "content": [({**part, "text": redact(part["text"])}
+                            if part.get("type") == "text" else part) for part in message["content"]]}
+                        if isinstance(message.get("content"), list) else message for message in messages]
         upstream_payload = {"messages": messages}
         for source, destination in (("temperature", "temperature"), ("max_tokens", "max_tokens"), ("top_p", "top_p")):
             value = getattr(body, source)
@@ -189,6 +235,7 @@ def create_app(config: dict[str, Any] | None = None,
             if value is not None:
                 upstream_payload[field] = value
         app_name = body.application.strip() or "default"
+        cost_center = body.cost_center.strip() if body.cost_center else None
         if tenant:
             tenant_cfg = tenant["config"]
             if route_name not in tenant_cfg.get("allowed_routes", []):
@@ -266,6 +313,7 @@ def create_app(config: dict[str, Any] | None = None,
                                       usage_data.get("completion_tokens", 0) * float(price.get("output_cost_per_1m", 0))) / 1_000_000
                         record = {"request_id": request_id, "occurred_at": datetime.now(UTC).isoformat(),
                             "application": ledger_app_name, "route": route_name, "provider": provider_name,
+                            "cost_center": cost_center,
                             "model": model_name, "prompt_tokens": usage_data.get("prompt_tokens", 0),
                             "completion_tokens": usage_data.get("completion_tokens", 0),
                             "total_tokens": usage_data.get("total_tokens", 0), "cost_usd": cost_value,
@@ -357,6 +405,7 @@ def create_app(config: dict[str, Any] | None = None,
                               usage_data.get("completion_tokens", 0) * float(report_price.get("output_cost_per_1m", 0))) / 1_000_000
                 record = {"request_id": request_id, "occurred_at": datetime.now(UTC).isoformat(),
                     "application": ledger_app_name, "route": route_name, "provider": provider_name, "model": model_name,
+                    "cost_center": cost_center,
                     "prompt_tokens": usage_data.get("prompt_tokens", 0), "completion_tokens": usage_data.get("completion_tokens", 0),
                     "total_tokens": usage_data.get("total_tokens", 0), "cost_usd": cost_value,
                     "status": locals().get("status", "failure"), "latency_ms": elapsed_ms,
@@ -387,16 +436,41 @@ def create_app(config: dict[str, Any] | None = None,
                 logger.info("request_id=%s application=%s route=%s provider=%s model=%s status=%s latency_ms=%s tokens=%s cost_usd=%.8f fallback=%s cached=%s error=%s",
                     request_id, redact(ledger_app_name), route_name, provider_name, model_name, record["status"], elapsed_ms,
                     record["total_tokens"], cost_value, record["fallback_used"], record["cached"], error_type)
-    @app.get("/v1/admin/report", dependencies=[Depends(authenticate_admin)])
+    @app.get("/v1/admin/report", dependencies=[Depends(admin_dependency("report"))])
     async def report(request: Request, start: str | None = Query(default=None), end: str | None = Query(default=None),
-                     application: str | None = Query(default=None)) -> dict[str, Any]:
+                     application: str | None = Query(default=None), cost_center: str | None = Query(default=None),
+                     provider: str | None = Query(default=None), route: str | None = Query(default=None)) -> dict[str, Any]:
         """UTC ISO-8601 bounds; end is exclusive. Example: ?start=2026-10-01T00:00:00Z"""
         try:
-            return await asyncio.to_thread(request.app.state.store.report, start, end, application)
+            return await asyncio.to_thread(request.app.state.store.report, start, end, application,
+                                           cost_center, provider, route)
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Invalid report filters") from exc
 
-    @app.get("/v1/admin/budgets", dependencies=[Depends(authenticate_admin)])
+    @app.get("/v1/admin/report.csv", dependencies=[Depends(admin_dependency("report"))])
+    async def report_csv(request: Request, start: str | None = Query(default=None), end: str | None = Query(default=None),
+                         application: str | None = Query(default=None), cost_center: str | None = Query(default=None),
+                         provider: str | None = Query(default=None), route: str | None = Query(default=None),
+                         limit: int = Query(default=10_000, ge=1, le=100_000)) -> Response:
+        rows = await asyncio.to_thread(request.app.state.store.export_rows, start, end, application,
+                                        cost_center, provider, route, limit)
+        output = StringIO()
+        fields = ["request_id", "occurred_at", "application", "cost_center", "route", "provider", "model",
+                  "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status", "latency_ms",
+                  "fallback_used", "cached", "error_type"]
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            safe_row = {}
+            for field, value in row.items():
+                if isinstance(value, str) and value.startswith(("=", "+", "-", "@", "\t", "\r")):
+                    value = "'" + value
+                safe_row[field] = value
+            writer.writerow(safe_row)
+        return Response(output.getvalue(), media_type="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=llm-gateway-usage.csv"})
+
+    @app.get("/v1/admin/budgets", dependencies=[Depends(admin_dependency("budgets"))])
     async def budgets(request: Request) -> dict[str, Any]:
         """Return current UTC calendar-month spend and configured application limits."""
         configured = cfg.get("budgets", {})
@@ -435,13 +509,28 @@ def create_app(config: dict[str, Any] | None = None,
                     "max_requests_per_minute": policy.get("max_requests_per_minute")})
         return {"period_start": month_start.isoformat(), "applications": budgets_out}
 
-    @app.get("/v1/admin/providers", dependencies=[Depends(authenticate_admin)])
+    @app.get("/v1/admin/providers", dependencies=[Depends(admin_dependency("providers"))])
     async def provider_health(request: Request) -> dict[str, Any]:
         states = await request.app.state.gateway.breaker.snapshot()
         performance = await request.app.state.gateway.health_snapshot()
         return {"providers": {name: {"kind": provider["kind"], **states.get(name, {"state": "closed", "failures": 0})}
                               | performance.get(name, {})
                               for name, provider in cfg["providers"].items()}}
+
+    @app.get("/v1/admin/webhooks", dependencies=[Depends(admin_dependency("webhooks"))])
+    async def webhook_events(request: Request, status: str | None = Query(default=None),
+                             limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
+        if status not in {None, "pending", "processing", "delivered", "dead_letter"}:
+            raise HTTPException(status_code=400, detail="Invalid webhook delivery status")
+        events = await asyncio.to_thread(request.app.state.store.webhook_events, status, limit)
+        return {"events": events}
+
+    @app.post("/v1/admin/webhooks/{event_id}/redrive", dependencies=[Depends(admin_dependency("webhooks"))])
+    async def redrive_webhook(event_id: str, request: Request) -> dict[str, Any]:
+        redriven = await asyncio.to_thread(request.app.state.store.redrive_webhook, event_id)
+        if not redriven:
+            raise HTTPException(status_code=404, detail="Dead-letter webhook event not found")
+        return {"event_id": event_id, "status": "pending"}
 
     @app.exception_handler(HTTPException)
     async def safe_http_errors(request: Request, exc: HTTPException) -> JSONResponse:

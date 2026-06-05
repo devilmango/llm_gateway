@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -98,22 +99,40 @@ class ProviderClient:
         return result
 
     async def stream(self, provider_name: str, model: str, payload: dict[str, Any]):
-        """Yield normalized text deltas from an OpenAI-compatible provider."""
+        """Yield text deltas normalized from each supported provider's native SSE API."""
         cfg = self.providers[provider_name]
-        if cfg["kind"] != "openai":
-            raise ProviderError("Streaming is currently supported for OpenAI-compatible providers only")
+        kind = cfg["kind"]
         key = os.getenv(cfg.get("api_key_env", "")) if cfg.get("api_key_env") else None
         if not key and not cfg.get("api_key_optional", False):
             raise ProviderError(f"Provider {provider_name!r} has no API key configured")
         headers = {"Content-Type": "application/json"}
-        if key:
-            headers["Authorization"] = f"Bearer {key}"
-        request_payload = {**payload, "model": model, "stream": True, "stream_options": {"include_usage": True}}
+        params = None
+        base = cfg["base_url"].rstrip("/")
+        if kind == "openai":
+            url = f"{base}/chat/completions"
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            request_payload = {**payload, "model": model, "stream": True, "stream_options": {"include_usage": True}}
+        elif kind == "anthropic":
+            url = f"{base}/v1/messages"
+            headers["anthropic-version"] = "2023-06-01"
+            if key:
+                headers["x-api-key"] = key
+            request_payload = self._anthropic_payload(model, payload)
+            request_payload["stream"] = True
+        elif kind == "gemini":
+            url = f"{base}/models/{model}:streamGenerateContent"
+            params = {"alt": "sse"}
+            if key:
+                params["key"] = key
+            request_payload = self._gemini_payload(payload)
+        else:
+            raise ProviderError(f"Unsupported provider kind {kind!r}")
         started = time.perf_counter()
         outcome = "network_error"
         try:
-            async with self.http.stream("POST", f"{cfg['base_url'].rstrip('/')}/chat/completions",
-                                        json=request_payload, headers=headers, timeout=self.timeout) as response:
+            async with self.http.stream("POST", url, json=request_payload, headers=headers,
+                                        params=params, timeout=self.timeout) as response:
                 if response.status_code >= 400:
                     outcome = "rate_limited" if response.status_code == 429 else "upstream_error"
                     retryable = response.status_code == 429 or response.status_code >= 500
@@ -132,19 +151,47 @@ class ProviderClient:
                         event = json.loads(data)
                     except ValueError as exc:
                         raise ProviderError("Provider returned invalid stream data", retryable=True) from exc
-                    event_usage = event.get("usage")
-                    if event_usage:
+                    delta = None
+                    if kind == "openai":
+                        event_usage = event.get("usage")
+                        choices = event.get("choices", [])
+                        choice = choices[0] if choices else {}
+                        delta = choice.get("delta", {}).get("content")
+                        finish_reason = choice.get("finish_reason") or finish_reason
+                        if event_usage:
+                            usage = {"prompt_tokens": int(event_usage.get("prompt_tokens", 0) or 0),
+                                     "completion_tokens": int(event_usage.get("completion_tokens", 0) or 0),
+                                     "total_tokens": int(event_usage.get("total_tokens", 0) or 0)}
+                    elif kind == "anthropic":
+                        event_type = event.get("type")
+                        event_usage = event.get("message", {}).get("usage") if event_type == "message_start" else event.get("usage")
+                        if event_type == "content_block_delta":
+                            delta = event.get("delta", {}).get("text")
+                        elif event_type == "message_delta":
+                            finish_reason = event.get("delta", {}).get("stop_reason") or finish_reason
+                        if event_usage:
+                            usage["prompt_tokens"] = int(event_usage.get("input_tokens", usage["prompt_tokens"]) or 0)
+                            usage["completion_tokens"] = int(event_usage.get("output_tokens", usage["completion_tokens"]) or 0)
+                            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+                    else:
+                        candidates = event.get("candidates", [])
+                        candidate = candidates[0] if candidates else {}
+                        parts = candidate.get("content", {}).get("parts", [])
+                        delta = "".join(part.get("text", "") for part in parts if isinstance(part.get("text"), str))
+                        finish_reason = candidate.get("finishReason") or finish_reason
+                        event_usage = event.get("usageMetadata")
+                        if event_usage:
+                            prompt = int(event_usage.get("promptTokenCount", 0) or 0)
+                            completion = int(event_usage.get("candidatesTokenCount", 0) or 0)
+                            usage = {"prompt_tokens": prompt, "completion_tokens": completion,
+                                     "total_tokens": int(event_usage.get("totalTokenCount", 0) or prompt + completion)}
+                    if kind == "openai" and event_usage:
                         usage = {"prompt_tokens": int(event_usage.get("prompt_tokens", 0) or 0),
                                  "completion_tokens": int(event_usage.get("completion_tokens", 0) or 0),
                                  "total_tokens": int(event_usage.get("total_tokens", 0) or 0)}
-                    choices = event.get("choices", [])
-                    if choices:
-                        choice = choices[0]
-                        finish_reason = choice.get("finish_reason") or finish_reason
-                        delta = choice.get("delta", {}).get("content")
-                        if isinstance(delta, str) and delta:
-                            saw_delta = True
-                            yield {"delta": delta}
+                    if isinstance(delta, str) and delta:
+                        saw_delta = True
+                        yield {"delta": delta}
                 if not saw_delta:
                     raise ProviderError("Provider returned no text completion", retryable=False)
                 PROVIDER_REQUESTS.labels(provider=provider_name, outcome="success").inc()
@@ -161,9 +208,22 @@ class ProviderClient:
             raise
 
     @staticmethod
+    def _content_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text")
+        return ""
+
+    @staticmethod
+    def _image_url(part: dict[str, Any]) -> str:
+        value = part.get("image_url", "")
+        return value.get("url", "") if isinstance(value, dict) else value
+
+    @staticmethod
     def _anthropic_payload(model: str, payload: dict[str, Any]) -> dict[str, Any]:
         messages = payload["messages"]
-        system = "\n".join(m["content"] for m in messages
+        system = "\n".join(ProviderClient._content_text(m.get("content")) for m in messages
                             if m["role"] in ("system", "developer") and m.get("content"))
         api_messages: list[dict[str, Any]] = []
         for message in messages:
@@ -176,8 +236,21 @@ class ProviderClient:
                 api_messages.append({"role": "user", "content": content})
                 continue
             content: list[dict[str, Any]] = []
-            if message.get("content"):
-                content.append({"type": "text", "text": message["content"]})
+            message_content = message.get("content")
+            if isinstance(message_content, str) and message_content:
+                content.append({"type": "text", "text": message_content})
+            elif isinstance(message_content, list):
+                for part in message_content:
+                    if part.get("type") == "text":
+                        content.append({"type": "text", "text": part["text"]})
+                    elif part.get("type") == "image_url":
+                        url = ProviderClient._image_url(part)
+                        match = re.fullmatch(r"data:(image/[\w.+-]+);base64,(.+)", url, re.DOTALL)
+                        if match:
+                            content.append({"type": "image", "source": {"type": "base64",
+                                "media_type": match.group(1), "data": match.group(2)}})
+                        else:
+                            content.append({"type": "image", "source": {"type": "url", "url": url}})
             for call in message.get("tool_calls", []):
                 function = call.get("function", {})
                 try:
@@ -226,7 +299,8 @@ class ProviderClient:
 
     @staticmethod
     def _gemini_payload(payload: dict[str, Any]) -> dict[str, Any]:
-        system = [m["content"] for m in payload["messages"] if m["role"] in ("system", "developer")]
+        system = [ProviderClient._content_text(m.get("content")) for m in payload["messages"]
+                  if m["role"] in ("system", "developer")]
         contents = []
         function_names: dict[str, str] = {}
         for message in payload["messages"]:
@@ -245,8 +319,20 @@ class ProviderClient:
                 parts = [{"functionResponse": {"name": name, "response": response}}]
             else:
                 parts = []
-                if message.get("content"):
-                    parts.append({"text": message["content"]})
+                message_content = message.get("content")
+                if isinstance(message_content, str) and message_content:
+                    parts.append({"text": message_content})
+                elif isinstance(message_content, list):
+                    for part in message_content:
+                        if part.get("type") == "text":
+                            parts.append({"text": part["text"]})
+                        elif part.get("type") == "image_url":
+                            url = ProviderClient._image_url(part)
+                            match = re.fullmatch(r"data:(image/[\w.+-]+);base64,(.+)", url, re.DOTALL)
+                            if match:
+                                parts.append({"inlineData": {"mimeType": match.group(1), "data": match.group(2)}})
+                            else:
+                                parts.append({"fileData": {"mimeType": "image/jpeg", "fileUri": url}})
                 for call in message.get("tool_calls", []):
                     function = call.get("function", {})
                     try:

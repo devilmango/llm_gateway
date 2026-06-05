@@ -31,6 +31,9 @@ class UsageStore:
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_requests_time ON requests(occurred_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_requests_application ON requests(application)")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(requests)")}
+            if "cost_center" not in columns:
+                db.execute("ALTER TABLE requests ADD COLUMN cost_center TEXT")
             db.execute("""CREATE TABLE IF NOT EXISTS budget_reservations (
                 request_id TEXT PRIMARY KEY, application TEXT NOT NULL,
                 amount_usd REAL NOT NULL, reserved_at TEXT NOT NULL, expires_at TEXT NOT NULL
@@ -41,6 +44,13 @@ class UsageStore:
                 threshold REAL NOT NULL, emitted_at TEXT NOT NULL,
                 PRIMARY KEY(application, month_start, threshold)
             )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS webhook_outbox (
+                event_id TEXT PRIMARY KEY, application TEXT NOT NULL, webhook_url TEXT NOT NULL,
+                secret_env TEXT, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
+                created_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_webhook_outbox_due ON webhook_outbox(status, next_attempt_at)")
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.database, timeout=10)
@@ -71,7 +81,7 @@ class UsageStore:
     def record(self, record: dict[str, Any]) -> None:
         columns = ("request_id", "occurred_at", "application", "route", "provider", "model",
                    "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status",
-                   "latency_ms", "fallback_used", "cached", "error_type")
+                   "latency_ms", "fallback_used", "cached", "error_type", "cost_center")
         values = [record.get(c) for c in columns]
         with self._lock, self._connect() as db:
             db.execute(f"INSERT OR REPLACE INTO requests ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", values)
@@ -99,7 +109,61 @@ class UsageStore:
                     crossed.append({"threshold": threshold, "spend_usd": spent, "limit_usd": monthly_limit_usd})
         return crossed
 
-    def report(self, start: str | None, end: str | None, application: str | None) -> dict[str, Any]:
+    def enqueue_webhook(self, event: dict[str, Any], webhook_url: str, secret_env: str | None = None,
+                        now: datetime | None = None) -> None:
+        now = now or datetime.now(UTC)
+        import json
+        with self._lock, self._connect() as db:
+            db.execute("""INSERT OR IGNORE INTO webhook_outbox
+                (event_id, application, webhook_url, secret_env, body, status, attempts,
+                 next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)""",
+                (event["alert_id"], event["application"], webhook_url, secret_env,
+                 json.dumps(event, separators=(",", ":"), sort_keys=True), now.isoformat(), now.isoformat()))
+
+    def due_webhooks(self, limit: int = 20, now: datetime | None = None) -> list[dict[str, Any]]:
+        now = now or datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            due = db.execute("""SELECT event_id FROM webhook_outbox
+                WHERE status IN ('pending','processing') AND next_attempt_at <= ? ORDER BY created_at LIMIT ?""",
+                (now.isoformat(), limit)).fetchall()
+            ids = [row[0] for row in due]
+            for event_id in ids:
+                db.execute("UPDATE webhook_outbox SET status='processing', next_attempt_at=? WHERE event_id=?",
+                           ((now + timedelta(seconds=60)).isoformat(), event_id))
+            if not ids:
+                return []
+            placeholders = ",".join("?" for _ in ids)
+            return [dict(row) for row in db.execute(f"SELECT * FROM webhook_outbox WHERE event_id IN ({placeholders})", ids).fetchall()]
+
+    def update_webhook(self, event_id: str, *, attempts: int, status: str,
+                       next_attempt_at: datetime | None = None, delivered_at: datetime | None = None,
+                       last_error: str | None = None) -> None:
+        with self._lock, self._connect() as db:
+            db.execute("""UPDATE webhook_outbox SET attempts=?, status=?, next_attempt_at=?,
+                delivered_at=?, last_error=? WHERE event_id=?""",
+                (attempts, status, (next_attempt_at or datetime.now(UTC)).isoformat(),
+                 delivered_at.isoformat() if delivered_at else None, last_error, event_id))
+
+    def redrive_webhook(self, event_id: str, now: datetime | None = None) -> bool:
+        now = now or datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            cursor = db.execute("""UPDATE webhook_outbox SET status='pending', attempts=0,
+                next_attempt_at=?, delivered_at=NULL, last_error=NULL
+                WHERE event_id=? AND status='dead_letter'""", (now.isoformat(), event_id))
+            return bool(cursor.rowcount)
+
+    def webhook_events(self, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as db:
+            if status:
+                rows = db.execute("SELECT event_id, application, status, attempts, created_at, delivered_at, last_error FROM webhook_outbox WHERE status=? ORDER BY created_at DESC LIMIT ?", (status, limit)).fetchall()
+            else:
+                rows = db.execute("SELECT event_id, application, status, attempts, created_at, delivered_at, last_error FROM webhook_outbox ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(row) for row in rows]
+
+    @staticmethod
+    def _filters(start: str | None, end: str | None, application: str | None,
+                 cost_center: str | None, provider: str | None, route: str | None) -> tuple[str, list[Any]]:
         clauses, values = [], []
         if start:
             clauses.append("occurred_at >= ?"); values.append(start)
@@ -107,7 +171,19 @@ class UsageStore:
             clauses.append("occurred_at < ?"); values.append(end)
         if application:
             clauses.append("application = ?"); values.append(application)
+        if cost_center:
+            clauses.append("cost_center = ?"); values.append(cost_center)
+        if provider:
+            clauses.append("provider = ?"); values.append(provider)
+        if route:
+            clauses.append("route = ?"); values.append(route)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        return where, values
+
+    def report(self, start: str | None, end: str | None, application: str | None,
+               cost_center: str | None = None, provider: str | None = None,
+               route: str | None = None) -> dict[str, Any]:
+        where, values = self._filters(start, end, application, cost_center, provider, route)
         with self._lock, self._connect() as db:
             summary = dict(db.execute(f"""SELECT COUNT(*) AS requests,
                 COALESCE(SUM(prompt_tokens),0) AS prompt_tokens,
@@ -125,11 +201,27 @@ class UsageStore:
                 SUM(cost_usd) AS cost_usd, SUM(status != 'success') AS failures,
                 SUM(fallback_used) AS fallbacks FROM requests{where}
                 GROUP BY application ORDER BY cost_usd DESC""", values).fetchall()]
+            by_provider = [dict(row) for row in db.execute(f"SELECT COALESCE(provider,'unknown') AS provider, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd FROM requests{where} GROUP BY provider ORDER BY cost_usd DESC", values).fetchall()]
+            by_model = [dict(row) for row in db.execute(f"SELECT COALESCE(model,'unknown') AS model, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd FROM requests{where} GROUP BY model ORDER BY cost_usd DESC", values).fetchall()]
+            by_route = [dict(row) for row in db.execute(f"SELECT route, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd FROM requests{where} GROUP BY route ORDER BY cost_usd DESC", values).fetchall()]
+            by_cost_center = [dict(row) for row in db.execute(f"SELECT COALESCE(cost_center,'unassigned') AS cost_center, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd FROM requests{where} GROUP BY cost_center ORDER BY cost_usd DESC", values).fetchall()]
         summary["failure_rate"] = summary["failures"] / summary["requests"] if summary["requests"] else 0
         summary["fallback_rate"] = summary["fallbacks"] / summary["requests"] if summary["requests"] else 0
         summary["generated_at"] = datetime.now(UTC).isoformat()
         summary["by_application"] = by_app
+        summary["by_provider"] = by_provider
+        summary["by_model"] = by_model
+        summary["by_route"] = by_route
+        summary["by_cost_center"] = by_cost_center
         return summary
+
+    def export_rows(self, start: str | None, end: str | None, application: str | None,
+                    cost_center: str | None = None, provider: str | None = None,
+                    route: str | None = None, limit: int = 10_000) -> list[dict[str, Any]]:
+        where, values = self._filters(start, end, application, cost_center, provider, route)
+        with self._lock, self._connect() as db:
+            return [dict(row) for row in db.execute(
+                f"SELECT * FROM requests{where} ORDER BY occurred_at DESC LIMIT ?", [*values, limit]).fetchall()]
 
 
 def create_usage_store(database: str) -> Any:

@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 
 class ChatMessage(BaseModel):
     role: Literal["system", "developer", "user", "assistant", "tool"]
-    content: str | None = None
+    content: str | list[dict[str, Any]] | None = None
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
@@ -20,6 +20,18 @@ class ChatMessage(BaseModel):
             raise ValueError("Message content is required unless an assistant message contains tool_calls")
         if self.role == "tool" and not self.tool_call_id:
             raise ValueError("tool_call_id is required for tool messages")
+        if isinstance(self.content, list):
+            for part in self.content:
+                if not isinstance(part, dict) or part.get("type") not in {"text", "image_url"}:
+                    raise ValueError("Multimodal content supports text and image_url parts")
+                if part["type"] == "text" and not isinstance(part.get("text"), str):
+                    raise ValueError("Text content parts require a text value")
+                if part["type"] == "image_url":
+                    image_url = part.get("image_url")
+                    if isinstance(image_url, dict):
+                        image_url = image_url.get("url")
+                    if not isinstance(image_url, str) or not image_url.startswith(("https://", "http://", "data:image/")):
+                        raise ValueError("image_url must be an HTTP(S) URL or image data URI")
         return self
 
 
@@ -37,6 +49,7 @@ class ChatRequest(BaseModel):
     tools: list[dict[str, Any]] | None = Field(default=None, max_length=128)
     tool_choice: str | dict[str, Any] | None = None
     response_format: dict[str, Any] | None = None
+    cost_center: str | None = Field(default=None, max_length=120)
 
     @model_validator(mode="after")
     def validate_generation_options(self) -> ChatRequest:

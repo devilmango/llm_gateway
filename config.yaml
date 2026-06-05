@@ -18,6 +18,16 @@ routing:
 security:
   redact_pii: true
   # Configure GATEWAY_API_KEY in the environment to require gateway authentication.
+  # For rotating admin credentials, multiple entries may overlap. Disable the old
+  # entry after callers have moved to the replacement key.
+  # admin_api_keys:
+  #   - id: finance-reporting
+  #     api_key_env: GATEWAY_FINANCE_KEY
+  #     scopes: [report]
+  #   - id: platform-operations
+  #     api_key_env: GATEWAY_OPERATIONS_KEY
+  #     scopes: [budgets, providers, webhooks]
+  #     enabled: true
 
 # Optional tenant credentials scope logical routes and application-level policies.
 # Each api_key_env must name a secret supplied to the gateway process.
@@ -48,7 +58,6 @@ budgets:
       # Optional JSON webhook POST for each newly crossed alert threshold.
       # alert_webhook_url: https://alerts.example.com/llm-gateway
       # alert_webhook_secret_env: LLM_BUDGET_WEBHOOK_SECRET
-      # alert_webhook_max_attempts: 3
 
 providers:
   openai:

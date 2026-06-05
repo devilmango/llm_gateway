@@ -38,8 +38,10 @@ class GatewayService:
 
     def budget_reservation(self, route_name: str, payload: dict[str, Any], policy: dict[str, Any]) -> float:
         max_input_bytes = int(policy.get("max_input_bytes", 32_768))
-        input_bytes = sum(len((message.get("content") or "").encode("utf-8"))
-                          for message in payload["messages"])
+        input_bytes = sum(len((content if isinstance(content, str) else
+                               json.dumps(content, ensure_ascii=False)).encode("utf-8"))
+                          for message in payload["messages"]
+                          for content in [message.get("content") or ""])
         if payload.get("tools") or payload.get("response_format"):
             input_bytes += len(json.dumps({"tools": payload.get("tools"),
                 "response_format": payload.get("response_format")}, ensure_ascii=False).encode("utf-8"))

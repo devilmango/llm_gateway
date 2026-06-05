@@ -34,6 +34,7 @@ class PostgresUsageStore:
             )""",
             "CREATE INDEX IF NOT EXISTS idx_requests_time ON requests(occurred_at)",
             "CREATE INDEX IF NOT EXISTS idx_requests_application ON requests(application)",
+            "ALTER TABLE requests ADD COLUMN IF NOT EXISTS cost_center TEXT",
             """CREATE TABLE IF NOT EXISTS budget_reservations (
                 request_id TEXT PRIMARY KEY, application TEXT NOT NULL,
                 amount_usd DOUBLE PRECISION NOT NULL, reserved_at TEXT NOT NULL, expires_at TEXT NOT NULL
@@ -44,6 +45,13 @@ class PostgresUsageStore:
                 threshold DOUBLE PRECISION NOT NULL, emitted_at TEXT NOT NULL,
                 PRIMARY KEY(application, month_start, threshold)
             )""",
+            """CREATE TABLE IF NOT EXISTS webhook_outbox (
+                event_id TEXT PRIMARY KEY, application TEXT NOT NULL, webhook_url TEXT NOT NULL,
+                secret_env TEXT, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
+                created_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_webhook_outbox_due ON webhook_outbox(status, next_attempt_at)",
         ]
         with self.pool.connection() as conn, conn.cursor() as cursor:
             for statement in statements:
@@ -77,7 +85,7 @@ class PostgresUsageStore:
     def record(self, record: dict[str, Any]) -> None:
         columns = ("request_id", "occurred_at", "application", "route", "provider", "model",
                    "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status",
-                   "latency_ms", "fallback_used", "cached", "error_type")
+                   "latency_ms", "fallback_used", "cached", "error_type", "cost_center")
         assignments = ", ".join(f"{column}=EXCLUDED.{column}" for column in columns[1:])
         placeholders = ", ".join("%s" for _ in columns)
         with self.pool.connection() as conn, conn.cursor() as cursor:
@@ -109,7 +117,57 @@ class PostgresUsageStore:
                     crossed.append({"threshold": threshold, "spend_usd": spent, "limit_usd": monthly_limit_usd})
         return crossed
 
-    def report(self, start: str | None, end: str | None, application: str | None) -> dict[str, Any]:
+    def enqueue_webhook(self, event: dict[str, Any], webhook_url: str, secret_env: str | None = None,
+                        now: datetime | None = None) -> None:
+        import json
+        now = now or datetime.now(UTC)
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("""INSERT INTO webhook_outbox
+                (event_id, application, webhook_url, secret_env, body, status, attempts,
+                 next_attempt_at, created_at) VALUES (%s,%s,%s,%s,%s,'pending',0,%s,%s)
+                ON CONFLICT (event_id) DO NOTHING""",
+                (event["alert_id"], event["application"], webhook_url, secret_env,
+                 json.dumps(event, separators=(",", ":"), sort_keys=True), now.isoformat(), now.isoformat()))
+
+    def due_webhooks(self, limit: int = 20, now: datetime | None = None) -> list[dict[str, Any]]:
+        now = now or datetime.now(UTC)
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("""WITH due AS (
+                SELECT event_id FROM webhook_outbox WHERE status IN ('pending','processing') AND next_attempt_at <= %s
+                ORDER BY created_at LIMIT %s FOR UPDATE SKIP LOCKED
+            ) UPDATE webhook_outbox AS w SET status='processing', next_attempt_at=%s
+              FROM due WHERE w.event_id=due.event_id RETURNING w.*""",
+                (now.isoformat(), limit, (now + timedelta(seconds=60)).isoformat()))
+            return cursor.fetchall()
+
+    def update_webhook(self, event_id: str, *, attempts: int, status: str,
+                       next_attempt_at: datetime | None = None, delivered_at: datetime | None = None,
+                       last_error: str | None = None) -> None:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("""UPDATE webhook_outbox SET attempts=%s,status=%s,next_attempt_at=%s,
+                delivered_at=%s,last_error=%s WHERE event_id=%s""",
+                (attempts, status, (next_attempt_at or datetime.now(UTC)).isoformat(),
+                 delivered_at.isoformat() if delivered_at else None, last_error, event_id))
+
+    def redrive_webhook(self, event_id: str, now: datetime | None = None) -> bool:
+        now = now or datetime.now(UTC)
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("""UPDATE webhook_outbox SET status='pending', attempts=0, next_attempt_at=%s,
+                delivered_at=NULL,last_error=NULL WHERE event_id=%s AND status='dead_letter'""",
+                (now.isoformat(), event_id))
+            return bool(cursor.rowcount)
+
+    def webhook_events(self, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            if status:
+                cursor.execute("SELECT event_id,application,status,attempts,created_at,delivered_at,last_error FROM webhook_outbox WHERE status=%s ORDER BY created_at DESC LIMIT %s", (status, limit))
+            else:
+                cursor.execute("SELECT event_id,application,status,attempts,created_at,delivered_at,last_error FROM webhook_outbox ORDER BY created_at DESC LIMIT %s", (limit,))
+            return cursor.fetchall()
+
+    @staticmethod
+    def _filters(start: str | None, end: str | None, application: str | None,
+                 cost_center: str | None, provider: str | None, route: str | None) -> tuple[str, list[Any]]:
         filters, values = [], []
         if start:
             filters.append("occurred_at >= %s")
@@ -120,7 +178,22 @@ class PostgresUsageStore:
         if application:
             filters.append("application = %s")
             values.append(application)
+        if cost_center:
+            filters.append("cost_center = %s")
+            values.append(cost_center)
+        if provider:
+            filters.append("provider = %s")
+            values.append(provider)
+        if route:
+            filters.append("route = %s")
+            values.append(route)
         where = " WHERE " + " AND ".join(filters) if filters else ""
+        return where, values
+
+    def report(self, start: str | None, end: str | None, application: str | None,
+               cost_center: str | None = None, provider: str | None = None,
+               route: str | None = None) -> dict[str, Any]:
+        where, values = self._filters(start, end, application, cost_center, provider, route)
         with self.pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute(f"""SELECT COUNT(*) AS requests,
                 COALESCE(SUM(prompt_tokens),0) AS prompt_tokens,
@@ -139,11 +212,24 @@ class PostgresUsageStore:
                 SUM(fallback_used) AS fallbacks FROM requests{where}
                 GROUP BY application ORDER BY cost_usd DESC""", values)
             by_application = cursor.fetchall()
+            breakdowns = {}
+            for dimension in ("provider", "model", "route", "cost_center"):
+                cursor.execute(f"SELECT COALESCE({dimension}::text,'unassigned') AS {dimension}, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd FROM requests{where} GROUP BY {dimension} ORDER BY cost_usd DESC", values)
+                breakdowns[f"by_{dimension}"] = cursor.fetchall()
         summary["failure_rate"] = summary["failures"] / summary["requests"] if summary["requests"] else 0
         summary["fallback_rate"] = summary["fallbacks"] / summary["requests"] if summary["requests"] else 0
         summary["generated_at"] = datetime.now(UTC).isoformat()
         summary["by_application"] = by_application
+        summary.update(breakdowns)
         return summary
+
+    def export_rows(self, start: str | None, end: str | None, application: str | None,
+                    cost_center: str | None = None, provider: str | None = None,
+                    route: str | None = None, limit: int = 10_000) -> list[dict[str, Any]]:
+        where, values = self._filters(start, end, application, cost_center, provider, route)
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute(f"SELECT * FROM requests{where} ORDER BY occurred_at DESC LIMIT %s", [*values, limit])
+            return cursor.fetchall()
 
     def close(self) -> None:
         self.pool.close()

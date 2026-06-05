@@ -7,13 +7,15 @@ import json
 import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import fakeredis.aioredis
 import httpx
 import pytest
 
-from llm_gateway.main import create_app
+from llm_gateway.main import _deliver_webhook_batch, create_app
 from llm_gateway.providers import ProviderClient
+from llm_gateway.storage import create_usage_store
 
 
 def config(database: str) -> dict:
@@ -152,22 +154,11 @@ async def test_budget_alerts_once_at_configured_threshold(tmp_path, monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_budget_alert_webhook_is_signed_and_retries_idempotently(tmp_path, monkeypatch):
+async def test_budget_alert_webhook_is_persisted_for_durable_delivery(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
     monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
     monkeypatch.setenv("ALERT_SIGNING_SECRET", "webhook-secret")
-    webhook_events: list[dict] = []
-    webhook_keys: list[str] = []
-
     def upstream(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "alerts.test":
-            body = request.content
-            signature = request.headers["X-LLM-Gateway-Signature"]
-            expected = "sha256=" + hmac.new(b"webhook-secret", body, hashlib.sha256).hexdigest()
-            assert hmac.compare_digest(signature, expected)
-            webhook_events.append(json.loads(body))
-            webhook_keys.append(request.headers["Idempotency-Key"])
-            return httpx.Response(503 if len(webhook_events) == 1 else 204)
         return httpx.Response(200, json={
             "model": "primary-model",
             "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
@@ -185,12 +176,10 @@ async def test_budget_alert_webhook_is_signed_and_retries_idempotently(tmp_path,
                    "messages": [{"role": "user", "content": "hello"}]}
         assert (await client.post("/v1/chat/completions", json=request)).status_code == 200
         assert (await client.post("/v1/chat/completions", json=request)).status_code == 429
-    assert len(webhook_events) == 2
-    assert webhook_keys[0] == webhook_keys[1] == webhook_events[0]["alert_id"]
-    assert webhook_events[0]["alert_id"] == webhook_events[1]["alert_id"]
-    assert webhook_events[0]["event"] == "budget.threshold_crossed"
-    assert webhook_events[0]["application"] == "alert-app"
-    assert webhook_events[0]["threshold"] == 0.8
+        events = (await client.get("/v1/admin/webhooks")).json()["events"]
+        assert len(events) == 1
+        assert events[0]["status"] == "pending"
+    assert events[0]["event_id"]
 
 
 @pytest.mark.asyncio
@@ -199,8 +188,6 @@ async def test_budget_webhook_delivery_failure_does_not_fail_model_request(tmp_p
     monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
 
     def upstream(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "alerts.test":
-            raise httpx.ConnectError("webhook unavailable", request=request)
         return httpx.Response(200, json={
             "model": "primary-model",
             "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
@@ -218,6 +205,53 @@ async def test_budget_webhook_delivery_failure_does_not_fail_model_request(tmp_p
             "messages": [{"role": "user", "content": "hello"}],
         })
         assert response.status_code == 200
+        events = (await client.get("/v1/admin/webhooks")).json()["events"]
+        assert events[0]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_webhook_delivery_signs_event_and_records_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("ALERT_SIGNING_SECRET", "webhook-secret")
+    store = create_usage_store(str(tmp_path / "outbox.sqlite3"))
+    event = {"alert_id": "stable-alert-id", "application": "app", "event": "budget.threshold_crossed"}
+    store.enqueue_webhook(event, "https://alerts.test/hook", "ALERT_SIGNING_SECRET")
+    received = []
+
+    def delivery(request: httpx.Request) -> httpx.Response:
+        expected = "sha256=" + hmac.new(b"webhook-secret", request.content, hashlib.sha256).hexdigest()
+        assert hmac.compare_digest(request.headers["X-LLM-Gateway-Signature"], expected)
+        assert request.headers["Idempotency-Key"] == "stable-alert-id"
+        received.append(request.content)
+        return httpx.Response(204)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(delivery))
+    app = SimpleNamespace(state=SimpleNamespace(store=store, http=client))
+    await _deliver_webhook_batch(app)
+    assert len(received) == 1
+    assert store.webhook_events()[0]["status"] == "delivered"
+    await client.aclose()
+    if hasattr(store, "close"):
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_transient_failures_dead_letter_and_redrive(tmp_path):
+    store = create_usage_store(str(tmp_path / "outbox-retries.sqlite3"))
+    store.enqueue_webhook({"alert_id": "retry-alert", "application": "app"}, "https://alerts.test/hook")
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(503)))
+    app = SimpleNamespace(state=SimpleNamespace(store=store, http=client))
+    for attempt in range(8):
+        if attempt:
+            store.update_webhook("retry-alert", attempts=attempt, status="pending", next_attempt_at=datetime.now(UTC))
+        await _deliver_webhook_batch(app)
+    event = store.webhook_events()[0]
+    assert event["status"] == "dead_letter"
+    assert event["attempts"] == 8
+    assert store.redrive_webhook("retry-alert") is True
+    assert store.webhook_events("pending")[0]["event_id"] == "retry-alert"
+    await client.aclose()
+    if hasattr(store, "close"):
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -279,6 +313,91 @@ def test_anthropic_and_gemini_tool_and_schema_translation():
     assert gemini["contents"][1]["parts"][0]["functionCall"]["args"] == {"order_id": "A-17"}
     assert gemini["contents"][2]["parts"][0]["functionResponse"]["response"] == {"status": "shipped"}
     assert gemini["generationConfig"]["responseSchema"]["properties"]["status"]["type"] == "string"
+
+
+def test_image_content_is_translated_for_anthropic_and_gemini():
+    payload = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "Describe this"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+    ]}]}
+    anthropic = ProviderClient._anthropic_payload("claude-test", payload)
+    assert anthropic["messages"][0]["content"][0] == {"type": "text", "text": "Describe this"}
+    assert anthropic["messages"][0]["content"][1]["source"] == {
+        "type": "base64", "media_type": "image/png", "data": "aGVsbG8="}
+    gemini = ProviderClient._gemini_payload(payload)
+    assert gemini["contents"][0]["parts"][1]["inlineData"] == {
+        "mimeType": "image/png", "data": "aGVsbG8="}
+
+
+@pytest.mark.asyncio
+async def test_gemini_native_streaming_and_image_payload(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    stream_body = ('data: {"candidates":[{"content":{"parts":[{"text":"gemini"}]}}],'
+                   '"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":2,"totalTokenCount":4}}\n\n')
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith(":streamGenerateContent")
+        assert request.url.params["alt"] == "sse"
+        body = json.loads(request.content)
+        assert body["contents"][0]["parts"][1]["inlineData"]["mimeType"] == "image/png"
+        return httpx.Response(200, content=stream_body, headers={"content-type": "text/event-stream"})
+
+    cfg = config(str(tmp_path / "gemini-stream.sqlite3"))
+    cfg["providers"]["primary"].update({"kind": "gemini", "base_url": "https://primary.test/v1beta"})
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "simple", "stream": True,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+            ]}],
+        })
+        assert response.status_code == 200
+        assert '"content": "gemini"' in response.text
+        report = (await client.get("/v1/admin/report")).json()
+        assert report["total_tokens"] == 4
+
+
+@pytest.mark.asyncio
+async def test_cost_center_reporting_and_csv_export(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return success_response()
+
+    async with gateway_client(config(str(tmp_path / "exports.sqlite3")), httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "simple", "application": "billing", "cost_center": "=HYPERLINK(1)",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        assert response.status_code == 200
+        report = (await client.get("/v1/admin/report", params={"cost_center": "=HYPERLINK(1)"})).json()
+        assert report["requests"] == 1
+        assert report["by_cost_center"][0]["cost_center"] == "=HYPERLINK(1)"
+        assert report["by_provider"][0]["provider"] == "primary"
+        exported = await client.get("/v1/admin/report.csv", params={"cost_center": "=HYPERLINK(1)"})
+        assert exported.status_code == 200
+        assert "'=HYPERLINK(1)" in exported.text
+        assert "cost_usd" in exported.text.splitlines()[0]
+
+
+@pytest.mark.asyncio
+async def test_admin_keys_support_scopes_rotation_and_revocation(tmp_path, monkeypatch):
+    monkeypatch.setenv("REPORT_KEY", "report-key")
+    monkeypatch.setenv("OLD_REPORT_KEY", "old-report-key")
+    monkeypatch.delenv("GATEWAY_API_KEY", raising=False)
+    cfg = config(str(tmp_path / "admin-keys.sqlite3"))
+    cfg["security"]["admin_api_keys"] = [
+        {"id": "report-current", "api_key_env": "REPORT_KEY", "scopes": ["report"]},
+        {"id": "report-old", "api_key_env": "OLD_REPORT_KEY", "scopes": ["report"], "enabled": False},
+    ]
+    async with gateway_client(cfg, httpx.MockTransport(lambda request: success_response())) as client:
+        headers = {"Authorization": "Bearer report-key"}
+        assert (await client.get("/v1/admin/report", headers=headers)).status_code == 200
+        assert (await client.get("/v1/admin/budgets", headers=headers)).status_code == 403
+        old_headers = {"Authorization": "Bearer old-report-key"}
+        assert (await client.get("/v1/admin/report", headers=old_headers)).status_code == 401
 
 
 def test_provider_normalization_preserves_tool_calls_without_text():
@@ -389,27 +508,34 @@ async def test_streaming_endpoint_emits_sse_and_records_usage(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_streaming_uses_compatible_fallback_before_emitting_text(tmp_path, monkeypatch):
-    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
-    stream_body = ('data: {"choices":[{"delta":{"content":"backup"}}]}\n\n'
-                   'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"total_tokens":1}}\n\n'
-                   'data: [DONE]\n\n')
+async def test_anthropic_native_streaming_is_normalized(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    stream_body = ('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":2}}}\n\n'
+                   'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"native "}}\n\n'
+                   'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"stream"}}\n\n'
+                   'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}\n\n'
+                   'event: message_stop\ndata: {"type":"message_stop"}\n\n')
 
     def upstream(request: httpx.Request) -> httpx.Response:
-        assert request.url.host == "backup.test"
+        assert request.url.host == "primary.test"
+        assert request.url.path == "/v1/messages"
+        assert json.loads(request.content)["stream"] is True
         return httpx.Response(200, content=stream_body, headers={"content-type": "text/event-stream"})
 
     cfg = config(str(tmp_path / "stream-fallback.sqlite3"))
     cfg["providers"]["primary"]["kind"] = "anthropic"
+    cfg["providers"]["primary"]["base_url"] = "https://primary.test"
     async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
         response = await client.post("/v1/chat/completions", json={
             "model": "simple", "stream": True,
             "messages": [{"role": "user", "content": "hello"}],
         })
         assert response.status_code == 200
-        assert '"content": "backup"' in response.text
+        assert '"content": "native "' in response.text
+        assert '"content": "stream"' in response.text
         report = (await client.get("/v1/admin/report", params={"application": "default"})).json()
-        assert report["fallbacks"] == 1
+        assert report["fallbacks"] == 0
+        assert report["total_tokens"] == 5
 
 
 @pytest.mark.asyncio
