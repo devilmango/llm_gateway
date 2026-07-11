@@ -52,6 +52,11 @@ class PostgresUsageStore:
                 created_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS idx_webhook_outbox_due ON webhook_outbox(status, next_attempt_at)",
+            """CREATE TABLE IF NOT EXISTS admin_audit_events (
+                id BIGSERIAL PRIMARY KEY, occurred_at TEXT NOT NULL,
+                actor TEXT NOT NULL, action TEXT NOT NULL, status_code INTEGER NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_admin_audit_time ON admin_audit_events(occurred_at)",
         ]
         with self.pool.connection() as conn, conn.cursor() as cursor:
             for statement in statements:
@@ -163,6 +168,19 @@ class PostgresUsageStore:
                 cursor.execute("SELECT event_id,application,status,attempts,created_at,delivered_at,last_error FROM webhook_outbox WHERE status=%s ORDER BY created_at DESC LIMIT %s", (status, limit))
             else:
                 cursor.execute("SELECT event_id,application,status,attempts,created_at,delivered_at,last_error FROM webhook_outbox ORDER BY created_at DESC LIMIT %s", (limit,))
+            return cursor.fetchall()
+
+    def record_audit(self, actor: str, action: str, status_code: int,
+                     now: datetime | None = None) -> None:
+        now = now or datetime.now(UTC)
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (%s,%s,%s,%s)",
+                           (now.isoformat(), actor, action, status_code))
+
+    def audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT occurred_at,actor,action,status_code FROM admin_audit_events ORDER BY id DESC LIMIT %s",
+                           (limit,))
             return cursor.fetchall()
 
     @staticmethod

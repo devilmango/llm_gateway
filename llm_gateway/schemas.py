@@ -22,8 +22,8 @@ class ChatMessage(BaseModel):
             raise ValueError("tool_call_id is required for tool messages")
         if isinstance(self.content, list):
             for part in self.content:
-                if not isinstance(part, dict) or part.get("type") not in {"text", "image_url"}:
-                    raise ValueError("Multimodal content supports text and image_url parts")
+                if not isinstance(part, dict) or part.get("type") not in {"text", "image_url", "input_audio"}:
+                    raise ValueError("Multimodal content supports text, image_url, and input_audio parts")
                 if part["type"] == "text" and not isinstance(part.get("text"), str):
                     raise ValueError("Text content parts require a text value")
                 if part["type"] == "image_url":
@@ -32,6 +32,10 @@ class ChatMessage(BaseModel):
                         image_url = image_url.get("url")
                     if not isinstance(image_url, str) or not image_url.startswith(("https://", "http://", "data:image/")):
                         raise ValueError("image_url must be an HTTP(S) URL or image data URI")
+                if part["type"] == "input_audio":
+                    audio = part.get("input_audio")
+                    if not isinstance(audio, dict) or not isinstance(audio.get("data"), str) or audio.get("format") not in {"wav", "mp3", "flac", "ogg", "m4a"}:
+                        raise ValueError("input_audio requires base64 data and a supported format")
         return self
 
 
@@ -50,6 +54,8 @@ class ChatRequest(BaseModel):
     tool_choice: str | dict[str, Any] | None = None
     response_format: dict[str, Any] | None = None
     cost_center: str | None = Field(default=None, max_length=120)
+    modalities: list[Literal["text", "audio"]] | None = None
+    audio: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def validate_generation_options(self) -> ChatRequest:
@@ -72,8 +78,10 @@ class ChatRequest(BaseModel):
             names = {tool.get("function", {}).get("name") for tool in self.tools or []}
             if self.tool_choice.get("type") != "function" or function_name not in names:
                 raise ValueError("Named tool_choice must reference a function listed in tools")
-        if self.stream and self.tools:
-            raise ValueError("Streaming tool calls are not supported yet")
+        if self.modalities and "audio" in self.modalities and not self.audio:
+            raise ValueError("Audio output requires audio voice/format settings")
+        if self.audio is not None and (not self.audio.get("voice") or self.audio.get("format") not in {"wav", "mp3", "opus", "flac"}):
+            raise ValueError("Audio output requires a voice and supported format")
         if self.response_format is not None:
             kind = self.response_format.get("type")
             if kind not in {"json_object", "json_schema"}:

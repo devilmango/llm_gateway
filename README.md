@@ -36,7 +36,9 @@ The goal is a small, understandable infrastructure service: start with one proce
 
 | Capability | What it does |
 |---|---|
-| Provider-neutral chat API | Accepts a common chat-completions request and translates it for OpenAI-compatible APIs, Anthropic Messages, and Gemini `generateContent`. |
+| Provider-neutral chat API | Accepts a common chat-completions request and translates it for OpenAI-compatible APIs, Anthropic Messages, Gemini, Azure OpenAI, Vertex AI, and Amazon Bedrock Converse. |
+| Provider adapters | Supports OpenAI-compatible, Azure OpenAI, Anthropic, Gemini, Vertex AI, Amazon Bedrock Converse, and vLLM-native/OpenAI-compatible endpoints. |
+| Provider capability registry | Advertises and enforces streaming, streaming tools, tools, structured output, images, and audio input/output per provider, with optional provider-level capability overrides. |
 | Configurable model routes | Map a logical route to a provider and model in YAML. |
 | Retry and fallback | Retry timeouts, network errors, HTTP 429, and upstream 5xx responses with bounded exponential backoff; then try configured fallbacks in order. |
 | Traffic controls | Apply request timeouts, a maximum in-flight request count, and per-provider requests-per-minute limits. Use Redis to share request limits across replicas. |
@@ -47,16 +49,19 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Observability | Export Prometheus request, token, cost, fallback, cache, in-flight, end-to-end latency, provider outcome/latency, and retry metrics; emit nested OpenTelemetry request/provider-attempt spans and optionally export them over OTLP/HTTP. |
 | Provider health | Open a circuit after repeated transient failures, skip open providers, and allow a single half-open probe after the recovery period. |
 | Latency-aware routing | Optionally order a route's primary and fallback candidates using shared provider EWMA latency and failure-rate signals. |
-| Streaming | Stream OpenAI-compatible, Anthropic, and Gemini provider output as server-sent events, with usage accounting at completion and fallback only before text has been emitted. |
+| Streaming | Stream OpenAI-compatible, Azure, Anthropic, Gemini, and Vertex output as server-sent events, including tool-call and audio deltas where supported; account usage at completion. |
 | Tenant access controls | Configure per-tenant bearer credentials, route allowlists, application allowlists, and tenant-specific budget/limit policies. |
 | Tool calling and structured outputs | Pass OpenAI-style function definitions and JSON response schemas; adapters translate them for OpenAI-compatible, Anthropic, and Gemini providers. Tool execution stays in the calling application. |
 | Durable budget alert webhooks | Persist threshold events in an outbox, retry transient failures with backoff, optionally sign with HMAC-SHA256, and inspect or redrive dead letters. |
 | Response cache | Optionally cache a route's completion for a configured TTL. Cache hits have zero upstream usage and cost in the ledger. |
 | PII and secret redaction | Pattern-redact common email addresses, phone-like strings, and API-key forms in message text before sending upstream. |
-| Optional gateway authentication | Require a bearer key for route, completion, and report endpoints by setting `GATEWAY_API_KEY`. |
+| Optional gateway authentication | Require a bearer key for route, completion, and report endpoints by setting `GATEWAY_API_KEY`; support OIDC/JWT for admin and client access. |
 | Scoped admin keys | Configure multiple admin keys with report, budget, provider-health, or webhook scopes; overlap keys during rotation and disable old entries to revoke them. |
 | Cost-center reporting and exports | Tag requests with a cost center, view provider/model/route breakdowns, filter reports, and export request-level records as CSV. |
 | Multimodal image input | Accept OpenAI-style image content parts and translate data URIs or image URLs for supported providers. |
+| Audio input and output | Accept base64 audio input parts and request generated audio for providers whose capability registry enables it. |
+| OIDC/JWT and audit log | Validate admin JWTs against configured issuer/audience/JWKS, enforce scopes, and persist admin request records. |
+| Operations dashboard | Serve a responsive dashboard at `/admin` for cost, budgets, provider health, and webhook dead letters. |
 | Local model support | Connect to a local inference server that implements the OpenAI chat-completions API. |
 
 ## Architecture
@@ -78,7 +83,7 @@ The goal is a small, understandable infrastructure service: start with one proce
      OpenAI    Anthropic    Gemini / Local
 ```
 
-The current application is a FastAPI service. Provider translation and response normalization live in adapters; route, retry, and cache policy is read from `config.yaml`; usage metadata is stored in SQLite or PostgreSQL. Request and response bodies are not written to the usage ledger or application logs. When route caching is enabled, completion responses are held in local memory or Redis until their configured TTL expires.
+The current application is a FastAPI service. Provider translation, response normalization, and capability checks live in adapters; route, retry, and cache policy is read from `config.yaml`; usage and admin audit metadata are stored in SQLite or PostgreSQL. Request and response bodies are not written to the usage ledger or application logs. When route caching is enabled, completion responses are held in local memory or Redis until their configured TTL expires.
 
 ## Quick start
 
@@ -130,7 +135,13 @@ security:
   #     scopes: [report]
   #   - id: platform-operations
   #     api_key_env: GATEWAY_OPERATIONS_KEY
-  #     scopes: [budgets, providers, webhooks]
+  #     scopes: [budgets, providers, webhooks, audit]
+  # oidc:
+  #   enabled: true
+  #   issuer: https://identity.example.com/
+  #   audience: llm-gateway
+  #   jwks_url: https://identity.example.com/.well-known/jwks.json
+  #   algorithms: [RS256]
 
 providers:
   openai:
@@ -236,7 +247,7 @@ The response includes the normalized completion, usage, actual provider/model se
 }
 ```
 
-Supported request fields include `model`, `messages`, `application`, `cost_center`, `temperature`, `max_tokens`, `top_p`, `tools`, `tool_choice`, `response_format`, and `stream`. `user` and `metadata` are accepted for compatibility but are not forwarded or persisted.
+Supported request fields include `model`, `messages`, `application`, `cost_center`, `temperature`, `max_tokens`, `top_p`, `tools`, `tool_choice`, `response_format`, `modalities`, `audio`, and `stream`. `user` and `metadata` are accepted for compatibility but are not forwarded or persisted.
 
 For tool calling, send OpenAI-style function declarations. The gateway returns normalized assistant `tool_calls`; the application remains responsible for authorizing and executing the functions, then sending their results as `role: "tool"` messages in a follow-up request.
 
@@ -266,16 +277,18 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/health` | Public liveness response. |
 | `GET` | `/v1/routes` | Configured route names, providers, models, fallbacks, and cache policy. |
 | `POST` | `/v1/chat/completions` | Make a routed chat completion. |
+| `GET` | `/admin` | Operations dashboard shell; data loads through authenticated admin APIs. |
 | `GET` | `/v1/admin/report` | Aggregate token, cost, and reliability data. |
 | `GET` | `/v1/admin/report.csv` | Export filtered request-level usage and cost records as CSV (up to 100,000 rows). |
 | `GET` | `/v1/admin/budgets` | Current-month spend, limit, and utilization for configured applications. |
 | `GET` | `/v1/admin/providers` | Provider circuit state and consecutive failure counts. |
+| `GET` | `/v1/admin/audit` | Recent authenticated admin API access events. |
 | `GET` | `/v1/admin/webhooks` | Inspect pending, delivered, and dead-letter budget alert events. |
 | `POST` | `/v1/admin/webhooks/{event_id}/redrive` | Retry a dead-letter alert event. |
 | `GET` | `/metrics` | Prometheus metrics in exposition format. |
 | `GET` | `/docs` | FastAPI Swagger UI. |
 
-When tenant credentials are configured, `/v1/chat/completions` and `/v1/routes` require a tenant key, while `/v1/admin/*` requires a `GATEWAY_API_KEY` or scoped admin key. Without tenant configuration, `GATEWAY_API_KEY` optionally protects `/v1` endpoints.
+When tenant credentials are configured, `/v1/chat/completions` and `/v1/routes` require a tenant key, while `/v1/admin/*` requires a `GATEWAY_API_KEY`, scoped admin key, or configured OIDC bearer token. Without tenant configuration, `GATEWAY_API_KEY` optionally protects `/v1` endpoints.
 
 ## Cost and reliability reporting
 
@@ -326,6 +339,16 @@ Requests may include OpenAI-style `tools`, `tool_choice`, and `response_format`.
 
 For image input, use OpenAI-compatible content parts such as `{"type":"text","text":"Describe this"}` and `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`. OpenAI-compatible providers receive the parts unchanged; Anthropic and Gemini receive native image blocks. Remote image URLs are forwarded as provider URL references; Gemini deployments should use provider-supported file URIs or inline data URIs.
 
+For audio input, include `{"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}` in the message content. Audio output can be requested with `"modalities":["text","audio"]` and `"audio":{"voice":"alloy","format":"wav"}`. The provider capability registry rejects unsupported combinations before an upstream request and allows the route to try a compatible fallback. Provider-level `capabilities` mappings can override defaults.
+
+With `stream: true` and `tools`, tool-call chunks use OpenAI-compatible `delta.tool_calls` fragments. The application still owns tool authorization and execution. Audio-producing routes may emit provider-native audio deltas when streaming is enabled and supported.
+
+### Provider adapter configuration
+
+Use `kind: azure_openai` with an Azure resource `base_url`, deployment name as the route model, `api_key_env`, and optional `api_version`. Use `kind: bedrock` with `region`; requests are signed with AWS Signature Version 4 using `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optional `AWS_SESSION_TOKEN`. Use `kind: vertex` with `project_id`, `region`, and an access-token environment variable (default `GOOGLE_CLOUD_ACCESS_TOKEN`). Use `kind: vllm` for a vLLM OpenAI-compatible endpoint. Bedrock supports Converse requests but not streaming; capability checks allow compatible fallbacks to serve unsupported requests.
+
+Provider capabilities appear in `GET /v1/routes` and `GET /v1/admin/providers`. A provider-level override can capture a known limitation, for example `capabilities: {audio_output: false}`. Keep overrides conservative and verify them against the selected upstream model.
+
 Prometheus counters and histograms are exposed at `/metrics`. OpenTelemetry request and provider-attempt spans are created; set `OTEL_EXPORTER_OTLP_ENDPOINT` to export traces with OTLP over HTTP. Keep `/metrics` on a private network or protect it at the ingress if metrics are sensitive in your environment.
 
 ## Multi-replica deployment
@@ -339,7 +362,9 @@ Provider circuit breakers remain process-local. Each replica independently skips
 ## Security and privacy
 
 - Set `GATEWAY_API_KEY` to protect all `/v1` endpoints with bearer authentication.
-- Configure `security.admin_api_keys` for scoped admin access. Supported scopes are `report`, `budgets`, `providers`, and `webhooks`. Rotate by enabling a replacement key before disabling the old entry; entries take effect on process restart.
+- Configure `security.admin_api_keys` for scoped admin access. Supported scopes are `report`, `budgets`, `providers`, `webhooks`, and `audit`. Rotate by enabling a replacement key before disabling the old entry; entries take effect on process restart.
+- Configure `security.oidc` with issuer, audience, and JWKS URL to validate signed JWTs. Admin tokens need `llm-gateway:<scope>` or `admin:*`; client access uses the `client` scope when OIDC is enabled without tenant keys. Access tokens are validated offline, so revocation takes effect when the token expires unless the identity provider issues a replacement or rejection is reflected by a new JWKS key set.
+- Authenticated admin calls are recorded in the audit table and exposed at `/v1/admin/audit`. The audit log stores actor, path, status, and time; it omits tokens, prompts, and request bodies.
 - When using tenant credentials, configure separate admin credentials; tenant keys are restricted to allowed routes and applications.
 - Keep provider credentials in environment variables or a secrets manager. Do not commit credentials or `.env` files.
 - With `security.redact_pii: true`, the gateway pattern-redacts common email, phone-like, and API-key strings in message text **before forwarding it to the model**.
@@ -365,11 +390,11 @@ For persistent data, mount a durable volume at the configured database directory
 
 ## Current limits
 
-- Streaming tool calls are not supported yet. Gemini image URL inputs must use provider-supported file URIs or inline data URIs.
+- Bedrock streaming is not implemented. Gemini image URL inputs must use provider-supported file URIs or inline data URIs.
 - Without Redis, rate limits, cache, and provider performance signals are process-local. Concurrency limits and circuit-breaker health remain process-local even when Redis is configured.
 - PostgreSQL supports shared usage storage and monthly budget reservations across replicas. SQLite remains intended for a single instance and modest event volume.
-- The gateway accepts text and image messages, but not audio or video payloads. It returns tool calls for the application to execute and does not run them itself.
-- OIDC/JWT authentication and an admin UI are not implemented; configured admin key changes require a process restart.
+- The gateway accepts text, image, and supported audio messages, but not video payloads. It returns tool calls for the application to execute and does not run them itself.
+- Scoped admin key changes require a process restart. The dashboard shell is public; data APIs retain configured authentication and should be served behind TLS.
 - Pricing uses configured per-token rates and provider-reported token counts; it is an estimate and depends on maintaining the model price map.
 - PII redaction covers common patterns only and can miss sensitive information or alter phone-like text.
 
@@ -390,9 +415,9 @@ Suggested next milestones, ordered by production value:
 - [x] Add cost-center tags, provider/model/route report breakdowns, filters, and CSV usage exports.
 - [x] Add native Anthropic and Gemini streaming and multimodal image input.
 - [x] Add configurable scoped admin keys with rotation overlap and revocation.
-- [ ] Add more adapters: Azure OpenAI, AWS Bedrock, Vertex AI, and vLLM-native endpoints.
-- [ ] Add OIDC/JWT integration and an admin dashboard for finance and operations workflows.
-- [ ] Add audio input/output and streaming tool-call support.
+- [x] Add Azure OpenAI, AWS Bedrock Converse, Vertex AI, and vLLM adapters with a capability registry.
+- [x] Add OIDC/JWT validation, scoped admin access, and audit logs.
+- [x] Add an operations dashboard, audio input/output, and streaming tool-call chunks.
 
 ## Contributing
 

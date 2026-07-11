@@ -26,8 +26,15 @@ security:
   #     scopes: [report]
   #   - id: platform-operations
   #     api_key_env: GATEWAY_OPERATIONS_KEY
-  #     scopes: [budgets, providers, webhooks]
+  #     scopes: [budgets, providers, webhooks, audit]
   #     enabled: true
+  # OIDC/JWT admin and client authentication (requires issuer, audience and JWKS URL).
+  # oidc:
+  #   enabled: true
+  #   issuer: https://identity.example.com/
+  #   audience: llm-gateway
+  #   jwks_url: https://identity.example.com/.well-known/jwks.json
+  #   algorithms: [RS256]
 
 # Optional tenant credentials scope logical routes and application-level policies.
 # Each api_key_env must name a secret supplied to the gateway process.
@@ -103,6 +110,28 @@ providers:
       llama3.1:8b:
         input_cost_per_1m: 0
         output_cost_per_1m: 0
+  # Additional adapter examples. Add entries here and reference them from routes.
+  # azure:
+  #   kind: azure_openai
+  #   base_url: https://my-resource.openai.azure.com
+  #   api_version: 2024-10-21
+  #   api_key_env: AZURE_OPENAI_API_KEY
+  #   models: {deployment-name: {input_cost_per_1m: 1, output_cost_per_1m: 2}}
+  # bedrock:
+  #   kind: bedrock
+  #   region: us-east-1
+  #   models: {anthropic.claude-3-5-sonnet: {input_cost_per_1m: 3, output_cost_per_1m: 15}}
+  # vertex:
+  #   kind: vertex
+  #   project_id: my-project
+  #   region: us-central1
+  #   access_token_env: GOOGLE_CLOUD_ACCESS_TOKEN
+  #   models: {gemini-2.5-flash: {input_cost_per_1m: 0.3, output_cost_per_1m: 2.5}}
+  # vllm:
+  #   kind: vllm
+  #   base_url: http://localhost:8000/v1
+  #   api_key_optional: true
+  #   models: {Qwen/Qwen3-8B: {input_cost_per_1m: 0, output_cost_per_1m: 0}}
 
 routes:
   simple:

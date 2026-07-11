@@ -12,7 +12,7 @@ from .distributed import RateLimitBackendUnavailable, RedisSlidingWindowLimiter
 from .limiting import RateLimitExceeded, SlidingWindowLimiter
 from .observability import PROVIDER_RETRIES
 from .provider_health import ProviderHealth
-from .providers import ProviderClient, ProviderError
+from .providers import ProviderCapabilityError, ProviderClient, ProviderError
 
 
 class GatewayService:
@@ -75,6 +75,18 @@ class GatewayService:
     async def health_snapshot(self) -> dict[str, dict[str, float | int]]:
         return await self.provider_health.snapshot(list(self.providers))
 
+    @staticmethod
+    def cache_safe_payload(payload: dict[str, Any]) -> bool:
+        if payload.get("tools") or payload.get("modalities") or payload.get("audio"):
+            return False
+        for message in payload.get("messages", []):
+            if message.get("tool_calls"):
+                return False
+            content = message.get("content")
+            if isinstance(content, list) and any(part.get("type") in {"image_url", "input_audio"} for part in content):
+                return False
+        return True
+
     async def _order_candidates(self, candidates: list[dict[str, str]]) -> list[dict[str, str]]:
         if self.config.get("routing", {}).get("strategy") != "latency_aware" or len(candidates) < 2:
             return candidates
@@ -97,7 +109,7 @@ class GatewayService:
         candidates = await self._order_candidates(self.route_candidates(route_name))
         cache_cfg = route.get("cache", {})
         cache_key = self.cache.key(payload, preferred[0], preferred[1])
-        cache_safe = not payload.get("tools") and not any(message.get("tool_calls") for message in payload["messages"])
+        cache_safe = self.cache_safe_payload(payload)
         if cache_cfg.get("enabled") and cache_safe:
             cached = await self.cache.get(cache_key)
             if cached:
@@ -140,7 +152,7 @@ class GatewayService:
                             errors.append(f"{name}: rate limited")
                             break
                         except ProviderError as exc:
-                            if started is not None:
+                            if started is not None and not isinstance(exc, ProviderCapabilityError):
                                 await self.provider_health.record(name, (asyncio.get_running_loop().time() - started) * 1000, False)
                             span.set_attribute("error.type", type(exc).__name__)
                             span.set_attribute("llm.gateway.retryable", exc.retryable)
@@ -165,7 +177,7 @@ class GatewayService:
         candidates = await self._order_candidates(self.route_candidates(route_name))
         cache_cfg = route.get("cache", {})
         cache_key = self.cache.key(payload, preferred[0], preferred[1])
-        cache_safe = not payload.get("tools") and not any(message.get("tool_calls") for message in payload["messages"])
+        cache_safe = self.cache_safe_payload(payload)
         if cache_cfg.get("enabled") and cache_safe:
             cached = await self.cache.get(cache_key)
             if cached:
@@ -198,6 +210,9 @@ class GatewayService:
                                 emitted = True
                                 text_parts.append(item["delta"])
                                 yield {"delta": item["delta"]}
+                            elif "tool_call_delta" in item or "audio_delta" in item:
+                                emitted = True
+                                yield item
                             else:
                                 final = item
                         elapsed_ms = (asyncio.get_running_loop().time() - started) * 1000
@@ -216,15 +231,15 @@ class GatewayService:
                         errors.append(f"{name}: rate limited")
                         break
                     except ProviderError as exc:
-                        unsupported_streaming = "Streaming is currently supported" in str(exc)
-                        if started is not None and not unsupported_streaming:
+                        unsupported_capability = isinstance(exc, ProviderCapabilityError)
+                        if started is not None and not unsupported_capability:
                             await self.provider_health.record(name, (asyncio.get_running_loop().time() - started) * 1000, False)
                         errors.append(f"{name}: {exc}")
                         if exc.retryable:
                             await self.breaker.failure(name)
                         else:
                             await self.breaker.abandon(name)
-                        if unsupported_streaming and not emitted:
+                        if unsupported_capability and not emitted:
                             break
                         # Once a delta is visible to the caller, retrying could duplicate text.
                         if emitted or not exc.retryable or attempt >= max_retries:

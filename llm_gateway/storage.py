@@ -51,6 +51,11 @@ class UsageStore:
                 created_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_webhook_outbox_due ON webhook_outbox(status, next_attempt_at)")
+            db.execute("""CREATE TABLE IF NOT EXISTS admin_audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL,
+                actor TEXT NOT NULL, action TEXT NOT NULL, status_code INTEGER NOT NULL
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_admin_audit_time ON admin_audit_events(occurred_at)")
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.database, timeout=10)
@@ -160,6 +165,19 @@ class UsageStore:
             else:
                 rows = db.execute("SELECT event_id, application, status, attempts, created_at, delivered_at, last_error FROM webhook_outbox ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
             return [dict(row) for row in rows]
+
+    def record_audit(self, actor: str, action: str, status_code: int,
+                     now: datetime | None = None) -> None:
+        now = now or datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            db.execute("INSERT INTO admin_audit_events (occurred_at, actor, action, status_code) VALUES (?,?,?,?)",
+                       (now.isoformat(), actor, action, status_code))
+
+    def audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT occurred_at, actor, action, status_code FROM admin_audit_events ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()]
 
     @staticmethod
     def _filters(start: str | None, end: str | None, application: str | None,

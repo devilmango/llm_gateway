@@ -7,6 +7,8 @@ from typing import Any
 
 import yaml
 
+from .capabilities import provider_capabilities
+
 _ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::-([^}]*))?\}")
 
 
@@ -29,4 +31,9 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
             raise ValueError(f"Missing required configuration section: {key}")
     if not config["providers"] or not config["routes"]:
         raise ValueError("At least one provider and route must be configured")
+    for provider in config["providers"].values():
+        provider_capabilities(provider)
+    oidc = config.get("security", {}).get("oidc", {})
+    if oidc.get("enabled") and not all(oidc.get(field) for field in ("issuer", "audience", "jwks_url")):
+        raise ValueError("Enabled OIDC authentication requires issuer, audience, and jwks_url")
     return config

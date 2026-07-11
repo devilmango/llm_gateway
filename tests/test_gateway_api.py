@@ -5,9 +5,10 @@ import hashlib
 import hmac
 import json
 import os
+import sys
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import fakeredis.aioredis
 import httpx
@@ -329,6 +330,20 @@ def test_image_content_is_translated_for_anthropic_and_gemini():
         "mimeType": "image/png", "data": "aGVsbG8="}
 
 
+def test_gemini_audio_input_translation_and_capability_registry():
+    from llm_gateway.capabilities import provider_capabilities
+
+    payload = {"messages": [{"role": "user", "content": [
+        {"type": "input_audio", "input_audio": {"data": "aGVsbG8=", "format": "wav"}},
+    ]}]}
+    converted = ProviderClient._gemini_payload(payload)
+    assert converted["contents"][0]["parts"][0]["inlineData"] == {
+        "mimeType": "audio/wav", "data": "aGVsbG8="}
+    assert provider_capabilities({"kind": "azure_openai"})["audio_output"] is True
+    assert provider_capabilities({"kind": "bedrock"})["streaming"] is False
+    assert provider_capabilities({"kind": "vllm"})["tools"] is True
+
+
 @pytest.mark.asyncio
 async def test_gemini_native_streaming_and_image_payload(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
@@ -356,6 +371,175 @@ async def test_gemini_native_streaming_and_image_payload(tmp_path, monkeypatch):
         assert '"content": "gemini"' in response.text
         report = (await client.get("/v1/admin/report")).json()
         assert report["total_tokens"] == 4
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_call_deltas_are_normalized(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    stream_body = (
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function",'
+        '"function":{"name":"lookup_order","arguments":""}}]}}]}\n\n'
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"id\\":\\"A-7\\"}"}}]}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":3,"total_tokens":7}}\n\n'
+        'data: [DONE]\n\n')
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["stream"] is True
+        return httpx.Response(200, content=stream_body, headers={"content-type": "text/event-stream"})
+
+    async with gateway_client(config(str(tmp_path / "stream-tools.sqlite3")), httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "simple", "stream": True,
+            "messages": [{"role": "user", "content": "Look up A-7"}],
+            "tools": [{"type": "function", "function": {"name": "lookup_order",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}}}}],
+        })
+        assert response.status_code == 200
+        assert '"tool_calls"' in response.text
+        assert '"name": "lookup_order"' in response.text
+        assert '"arguments": "{\\"id\\":\\"A-7\\"}"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_audio_input_and_output_api_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    received = {}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        received.update(json.loads(request.content))
+        return httpx.Response(200, json={"model": "primary-model", "choices": [{
+            "message": {"role": "assistant", "content": "spoken", "audio": {
+                "id": "audio-1", "data": "YXVkaW8=", "transcript": "spoken"}},
+            "finish_reason": "stop"}], "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}})
+
+    async with gateway_client(config(str(tmp_path / "audio.sqlite3")), httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "simple", "modalities": ["text", "audio"],
+            "audio": {"voice": "alloy", "format": "wav"},
+            "messages": [{"role": "user", "content": [
+                {"type": "input_audio", "input_audio": {"data": "aGVsbG8=", "format": "wav"}},
+            ]}],
+        })
+        assert response.status_code == 200
+        assert received["modalities"] == ["text", "audio"]
+        assert received["audio"]["voice"] == "alloy"
+        assert response.json()["choices"][0]["message"]["audio"]["id"] == "audio-1"
+
+
+@pytest.mark.asyncio
+async def test_capability_registry_skips_provider_without_audio_support(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    requests = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return success_response()
+
+    cfg = config(str(tmp_path / "audio-fallback.sqlite3"))
+    cfg["providers"]["primary"]["kind"] = "anthropic"
+    cfg["providers"]["primary"]["base_url"] = "https://primary.test"
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "simple", "messages": [{"role": "user", "content": [
+                {"type": "input_audio", "input_audio": {"data": "aGVsbG8=", "format": "wav"}},
+            ]}],
+        })
+        assert response.status_code == 200
+        assert response.json()["gateway"]["provider"] == "backup"
+        assert len(requests) == 1
+        route = (await client.get("/v1/routes")).json()["simple"]
+        assert route["capabilities"]["audio_input"] is False
+        assert route["fallbacks"][0]["capabilities"]["audio_input"] is True
+
+
+@pytest.mark.asyncio
+async def test_azure_bedrock_vertex_and_vllm_provider_adapters(monkeypatch):
+    monkeypatch.setenv("AZURE_TEST_KEY", "azure-secret")
+    monkeypatch.setenv("GOOGLE_CLOUD_ACCESS_TOKEN", "vertex-token")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "access-id")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-key")
+    requests = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "bedrock.test":
+            return httpx.Response(200, json={"output": {"message": {"content": [{"text": "bedrock"}]}},
+                "stopReason": "end_turn", "usage": {"inputTokens": 2, "outputTokens": 1}})
+        if request.url.host == "vertex.test":
+            return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": "vertex"}]}}],
+                "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 1, "totalTokenCount": 3}})
+        return httpx.Response(200, json={"model": "served", "choices": [{"message": {
+            "role": "assistant", "content": request.url.host}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}})
+
+    providers = {
+        "azure": {"kind": "azure_openai", "base_url": "https://azure.test", "api_key_env": "AZURE_TEST_KEY",
+                  "api_version": "2025-01-01", "models": {}},
+        "bedrock": {"kind": "bedrock", "base_url": "https://bedrock.test", "region": "us-east-1", "models": {}},
+        "vertex": {"kind": "vertex", "base_url": "https://vertex.test/v1", "region": "us-central1",
+                   "project_id": "demo-project", "models": {}},
+        "vllm": {"kind": "vllm", "base_url": "https://vllm.test/v1", "api_key_optional": True, "models": {}},
+    }
+    http = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    provider = ProviderClient(http, providers, 2)
+    payload = {"messages": [{"role": "user", "content": "hello"}]}
+    try:
+        for name, model in (("azure", "deployment-a"), ("bedrock", "anthropic.claude-v3"),
+                            ("vertex", "gemini-pro"), ("vllm", "local-model")):
+            result = await provider.complete(name, model, payload)
+            assert result["usage"]["total_tokens"] == 3
+        azure_request, bedrock_request, vertex_request, vllm_request = requests
+        assert azure_request.url.path == "/openai/deployments/deployment-a/chat/completions"
+        assert azure_request.url.params["api-version"] == "2025-01-01"
+        assert azure_request.headers["api-key"] == "azure-secret"
+        assert bedrock_request.url.path == "/model/anthropic.claude-v3/converse"
+        assert bedrock_request.headers["Authorization"].startswith("AWS4-HMAC-SHA256")
+        assert vertex_request.url.path.endswith("/publishers/google/models/gemini-pro:generateContent")
+        assert vertex_request.headers["Authorization"] == "Bearer vertex-token"
+        assert vllm_request.url.path == "/v1/chat/completions"
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_oidc_scopes_audit_log_and_dashboard(tmp_path, monkeypatch):
+    fake_jwt = ModuleType("jwt")
+
+    class FakeJwkClient:
+        def __init__(self, jwks_url, cache_jwk_set=True):
+            assert jwks_url == "https://identity.test/jwks"
+
+        def get_signing_key_from_jwt(self, token):
+            assert token in {"signed-token", "audit-token"}
+            return SimpleNamespace(key="public-key")
+
+    def decode(token, key, algorithms, issuer, audience, options):
+        assert key == "public-key"
+        assert algorithms == ["RS256"]
+        assert issuer == "https://identity.test/"
+        assert audience == "llm-gateway"
+        assert options["require"] == ["exp", "sub"]
+        if token == "audit-token":
+            return {"sub": "auditor", "scope": "llm-gateway:audit"}
+        return {"sub": "finance-user", "scope": "llm-gateway:report"}
+
+    fake_jwt.PyJWKClient = FakeJwkClient
+    fake_jwt.decode = decode
+    monkeypatch.setitem(sys.modules, "jwt", fake_jwt)
+    cfg = config(str(tmp_path / "oidc.sqlite3"))
+    cfg["security"]["oidc"] = {"enabled": True, "issuer": "https://identity.test/",
+        "audience": "llm-gateway", "jwks_url": "https://identity.test/jwks"}
+    async with gateway_client(cfg, httpx.MockTransport(lambda request: success_response())) as client:
+        headers = {"Authorization": "Bearer signed-token"}
+        assert (await client.get("/v1/admin/report", headers=headers)).status_code == 200
+        assert (await client.get("/v1/admin/budgets", headers=headers)).status_code == 403
+        dashboard = await client.get("/admin")
+        assert dashboard.status_code == 200
+        assert "Spend by cost center" in dashboard.text
+        audit = await client.get("/v1/admin/audit", headers={"Authorization": "Bearer audit-token"})
+        assert audit.status_code == 200
+        assert audit.json()["events"][0]["actor"] == "finance-user"
 
 
 @pytest.mark.asyncio

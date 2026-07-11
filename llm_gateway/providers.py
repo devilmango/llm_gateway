@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
 import time
+from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
 
+from .capabilities import provider_capabilities
 from .observability import PROVIDER_LATENCY, PROVIDER_REQUESTS
 
 
@@ -18,14 +23,21 @@ class ProviderError(Exception):
         self.status_code = status_code
 
 
+class ProviderCapabilityError(ProviderError):
+    """The adapter cannot serve this request shape; it is not an upstream failure."""
+
+
 def _token_usage(body: dict[str, Any], kind: str) -> dict[str, int]:
-    usage = body.get("usageMetadata", {}) if kind == "gemini" else body.get("usage", {})
+    usage = body.get("usageMetadata", {}) if kind in {"gemini", "vertex"} else body.get("usage", {})
     if kind == "anthropic":
         prompt = int(usage.get("input_tokens", 0) or 0)
         completion = int(usage.get("output_tokens", 0) or 0)
-    elif kind == "gemini":
+    elif kind in {"gemini", "vertex"}:
         prompt = int(usage.get("promptTokenCount", 0) or 0)
         completion = int(usage.get("candidatesTokenCount", 0) or 0)
+    elif kind == "bedrock":
+        prompt = int(usage.get("inputTokens", 0) or 0)
+        completion = int(usage.get("outputTokens", 0) or 0)
     else:
         prompt = int(usage.get("prompt_tokens", 0) or 0)
         completion = int(usage.get("completion_tokens", 0) or 0)
@@ -39,36 +51,93 @@ class ProviderClient:
         self.providers = providers
         self.timeout = timeout
 
+    def validate_capabilities(self, provider_name: str, payload: dict[str, Any], streaming: bool = False) -> None:
+        cfg = self.providers[provider_name]
+        capabilities = provider_capabilities(cfg)
+        if streaming and not capabilities.get("streaming", False):
+            raise ProviderCapabilityError(f"Provider {provider_name!r} does not support streaming")
+        if streaming and payload.get("tools") and not capabilities.get("streaming_tools", False):
+            raise ProviderCapabilityError(f"Provider {provider_name!r} does not support streaming tool calls")
+        if payload.get("tools") and not capabilities.get("tools", False):
+            raise ProviderCapabilityError(f"Provider {provider_name!r} does not support tool calling")
+        if payload.get("response_format") and not capabilities.get("structured_output", False):
+            raise ProviderCapabilityError(f"Provider {provider_name!r} does not support structured outputs")
+        parts = [part for message in payload.get("messages", [])
+                 for part in (message.get("content") if isinstance(message.get("content"), list) else [])]
+        if any(part.get("type") == "image_url" for part in parts) and not capabilities.get("images", False):
+            raise ProviderCapabilityError(f"Provider {provider_name!r} does not support image inputs")
+        audio_input = any(part.get("type") == "input_audio" for part in parts)
+        if audio_input and not capabilities.get("audio_input", False):
+            raise ProviderCapabilityError(f"Provider {provider_name!r} does not support audio input")
+        if payload.get("modalities") and "audio" in payload["modalities"] and not capabilities.get("audio_output", False):
+            raise ProviderCapabilityError(f"Provider {provider_name!r} does not support audio output")
+
     async def complete(self, provider_name: str, model: str, payload: dict[str, Any]) -> dict[str, Any]:
         cfg = self.providers[provider_name]
         kind = cfg["kind"]
         key = os.getenv(cfg.get("api_key_env", "")) if cfg.get("api_key_env") else None
-        if not key and not cfg.get("api_key_optional", False):
+        if kind not in {"bedrock"} and not key and kind != "vertex" and not cfg.get("api_key_optional", False):
             raise ProviderError(f"Provider {provider_name!r} has no API key configured")
-        base = cfg["base_url"].rstrip("/")
+        base = (cfg.get("base_url") or "").rstrip("/")
         headers = {"Content-Type": "application/json"}
         params = None
-        if kind == "anthropic":
+        self.validate_capabilities(provider_name, payload)
+        if kind in {"openai", "vllm"}:
+            url = f"{base}/chat/completions"
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            provider_payload = {**payload, "model": model}
+            normalize_kind = "openai"
+        elif kind == "azure_openai":
+            url = f"{base}/openai/deployments/{model}/chat/completions"
+            params = {"api-version": cfg.get("api_version", "2024-10-21")}
+            if key:
+                headers["api-key"] = key
+            provider_payload = {k: v for k, v in payload.items() if k != "model"}
+            normalize_kind = "openai"
+        elif kind == "anthropic":
             url = f"{base}/v1/messages"
             headers.update({"anthropic-version": "2023-06-01"})
             if key:
                 headers["x-api-key"] = key
             provider_payload = self._anthropic_payload(model, payload)
+            normalize_kind = kind
         elif kind == "gemini":
             url = f"{base}/models/{model}:generateContent"
             params = {"key": key} if key else None
             provider_payload = self._gemini_payload(payload)
-        elif kind == "openai":
-            url = f"{base}/chat/completions"
-            if key:
-                headers["Authorization"] = f"Bearer {key}"
-            provider_payload = {**payload, "model": model}
+            normalize_kind = kind
+        elif kind == "vertex":
+            region = cfg.get("region", "us-central1")
+            project = cfg.get("project_id", "")
+            if not project:
+                raise ProviderError("Vertex provider requires project_id")
+            root = base or f"https://{region}-aiplatform.googleapis.com/v1"
+            url = f"{root}/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent"
+            token_env = cfg.get("access_token_env", "GOOGLE_CLOUD_ACCESS_TOKEN")
+            token = os.getenv(token_env, "")
+            if not token:
+                raise ProviderError(f"Vertex provider requires an access token in {token_env}")
+            headers["Authorization"] = f"Bearer {token}"
+            provider_payload = self._gemini_payload(payload)
+            normalize_kind = "gemini"
+        elif kind == "bedrock":
+            region = cfg.get("region") or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+            if not region:
+                raise ProviderError("Bedrock provider requires region or AWS_REGION")
+            url = f"{base or f'https://bedrock-runtime.{region}.amazonaws.com'}/model/{quote(model, safe='-_.~')}/converse"
+            provider_payload = self._bedrock_payload(payload)
+            self._sign_aws_request(url, provider_payload, headers, region)
+            normalize_kind = "bedrock"
         else:
             raise ProviderError(f"Unsupported provider kind {kind!r}")
         started = time.perf_counter()
         outcome = "network_error"
         try:
-            response = await self.http.post(url, json=provider_payload, headers=headers, params=params, timeout=self.timeout)
+            body = (json.dumps(provider_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                    if kind == "bedrock" else None)
+            response = await self.http.post(url, content=body, json=None if body is not None else provider_payload,
+                                            headers=headers, params=params, timeout=self.timeout)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
             PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
@@ -88,7 +157,7 @@ class ProviderClient:
             PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
             raise ProviderError("Provider returned invalid JSON", retryable=True) from exc
         try:
-            result = self._normalize(body, kind, model)
+            result = self._normalize(body, normalize_kind, model)
         except ProviderError:
             outcome = "invalid_response"
             PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
@@ -102,17 +171,27 @@ class ProviderClient:
         """Yield text deltas normalized from each supported provider's native SSE API."""
         cfg = self.providers[provider_name]
         kind = cfg["kind"]
+        self.validate_capabilities(provider_name, payload, streaming=True)
+        if kind == "bedrock":
+            raise ProviderError("Bedrock streaming is not available for this adapter", retryable=False)
         key = os.getenv(cfg.get("api_key_env", "")) if cfg.get("api_key_env") else None
-        if not key and not cfg.get("api_key_optional", False):
+        if kind not in {"bedrock", "vertex"} and not key and not cfg.get("api_key_optional", False):
             raise ProviderError(f"Provider {provider_name!r} has no API key configured")
         headers = {"Content-Type": "application/json"}
         params = None
-        base = cfg["base_url"].rstrip("/")
-        if kind == "openai":
+        base = (cfg.get("base_url") or "").rstrip("/")
+        if kind in {"openai", "vllm"}:
             url = f"{base}/chat/completions"
             if key:
                 headers["Authorization"] = f"Bearer {key}"
             request_payload = {**payload, "model": model, "stream": True, "stream_options": {"include_usage": True}}
+        elif kind == "azure_openai":
+            url = f"{base}/openai/deployments/{model}/chat/completions"
+            params = {"api-version": cfg.get("api_version", "2024-10-21")}
+            if key:
+                headers["api-key"] = key
+            request_payload = {k: v for k, v in payload.items() if k != "model"}
+            request_payload.update({"stream": True, "stream_options": {"include_usage": True}})
         elif kind == "anthropic":
             url = f"{base}/v1/messages"
             headers["anthropic-version"] = "2023-06-01"
@@ -125,6 +204,18 @@ class ProviderClient:
             params = {"alt": "sse"}
             if key:
                 params["key"] = key
+            request_payload = self._gemini_payload(payload)
+        elif kind == "vertex":
+            region = cfg.get("region", "us-central1")
+            project = cfg.get("project_id", "")
+            token_env = cfg.get("access_token_env", "GOOGLE_CLOUD_ACCESS_TOKEN")
+            token = os.getenv(token_env, "")
+            if not project or not token:
+                raise ProviderError("Vertex streaming requires project_id and an access token")
+            root = base or f"https://{region}-aiplatform.googleapis.com/v1"
+            url = f"{root}/projects/{project}/locations/{region}/publishers/google/models/{model}:streamGenerateContent"
+            params = {"alt": "sse"}
+            headers["Authorization"] = f"Bearer {token}"
             request_payload = self._gemini_payload(payload)
         else:
             raise ProviderError(f"Unsupported provider kind {kind!r}")
@@ -141,6 +232,9 @@ class ProviderClient:
                 saw_delta = False
                 usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 finish_reason = None
+                anthropic_tool_indices: dict[int, int] = {}
+                next_tool_index = 0
+                next_gemini_tool_index = 0
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
                         continue
@@ -152,7 +246,7 @@ class ProviderClient:
                     except ValueError as exc:
                         raise ProviderError("Provider returned invalid stream data", retryable=True) from exc
                     delta = None
-                    if kind == "openai":
+                    if kind in {"openai", "vllm", "azure_openai"}:
                         event_usage = event.get("usage")
                         choices = event.get("choices", [])
                         choice = choices[0] if choices else {}
@@ -162,22 +256,63 @@ class ProviderClient:
                             usage = {"prompt_tokens": int(event_usage.get("prompt_tokens", 0) or 0),
                                      "completion_tokens": int(event_usage.get("completion_tokens", 0) or 0),
                                      "total_tokens": int(event_usage.get("total_tokens", 0) or 0)}
+                        for call in choice.get("delta", {}).get("tool_calls", []) or []:
+                            saw_delta = True
+                            yield {"tool_call_delta": {"index": call.get("index", 0),
+                                **({"id": call["id"]} if call.get("id") else {}),
+                                "type": call.get("type", "function"), "function": call.get("function", {})}}
+                        audio_delta = choice.get("delta", {}).get("audio")
+                        if audio_delta:
+                            saw_delta = True
+                            yield {"audio_delta": audio_delta}
                     elif kind == "anthropic":
                         event_type = event.get("type")
                         event_usage = event.get("message", {}).get("usage") if event_type == "message_start" else event.get("usage")
                         if event_type == "content_block_delta":
-                            delta = event.get("delta", {}).get("text")
+                            stream_delta = event.get("delta", {})
+                            if stream_delta.get("type") == "text_delta":
+                                delta = stream_delta.get("text")
+                            elif stream_delta.get("type") == "input_json_delta":
+                                saw_delta = True
+                                block_index = int(event.get("index", 0))
+                                yield {"tool_call_delta": {"index": anthropic_tool_indices.get(block_index, block_index),
+                                    "type": "function", "function": {"arguments": stream_delta.get("partial_json", "")}}}
+                        elif event_type == "content_block_start":
+                            block = event.get("content_block", {})
+                            if block.get("type") == "tool_use":
+                                saw_delta = True
+                                block_index = int(event.get("index", 0))
+                                anthropic_tool_indices[block_index] = next_tool_index
+                                next_tool_index += 1
+                                yield {"tool_call_delta": {"index": anthropic_tool_indices[block_index],
+                                    "id": block.get("id"), "type": "function",
+                                    "function": {"name": block.get("name", ""),
+                                                 "arguments": json.dumps(block.get("input", {}), separators=(",", ":")) if block.get("input") else ""}}}
                         elif event_type == "message_delta":
                             finish_reason = event.get("delta", {}).get("stop_reason") or finish_reason
                         if event_usage:
                             usage["prompt_tokens"] = int(event_usage.get("input_tokens", usage["prompt_tokens"]) or 0)
                             usage["completion_tokens"] = int(event_usage.get("output_tokens", usage["completion_tokens"]) or 0)
                             usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-                    else:
+                    elif kind in {"gemini", "vertex"}:
                         candidates = event.get("candidates", [])
                         candidate = candidates[0] if candidates else {}
                         parts = candidate.get("content", {}).get("parts", [])
                         delta = "".join(part.get("text", "") for part in parts if isinstance(part.get("text"), str))
+                        for part in parts:
+                            function_call = part.get("functionCall")
+                            if function_call:
+                                saw_delta = True
+                                yield {"tool_call_delta": {"index": next_gemini_tool_index,
+                                    **({"id": function_call["id"]} if function_call.get("id") else {}),
+                                    "type": "function", "function": {"name": function_call.get("name", ""),
+                                    "arguments": json.dumps(function_call.get("args", {}), separators=(",", ":"))}}}
+                                next_gemini_tool_index += 1
+                            audio_part = part.get("inlineData")
+                            if audio_part and audio_part.get("mimeType", "").startswith("audio/"):
+                                saw_delta = True
+                                yield {"audio_delta": {"data": audio_part.get("data", ""),
+                                                       "mime_type": audio_part.get("mimeType")}}
                         finish_reason = candidate.get("finishReason") or finish_reason
                         event_usage = event.get("usageMetadata")
                         if event_usage:
@@ -214,6 +349,110 @@ class ProviderClient:
         if isinstance(content, list):
             return " ".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text")
         return ""
+
+    @staticmethod
+    def _bedrock_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        messages = []
+        system = []
+        tool_ids: dict[str, str] = {}
+        for message in payload["messages"]:
+            if message["role"] == "assistant":
+                for call in message.get("tool_calls", []):
+                    tool_ids[call.get("id", "")] = call.get("function", {}).get("name", "")
+        for message in payload["messages"]:
+            role = message["role"]
+            content = message.get("content")
+            if role in {"system", "developer"}:
+                text = ProviderClient._content_text(content)
+                if text:
+                    system.append({"text": text})
+                continue
+            blocks: list[dict[str, Any]] = []
+            if role == "tool":
+                blocks.append({"toolResult": {"toolUseId": message["tool_call_id"],
+                    "content": [{"text": content if isinstance(content, str) else json.dumps(content)}]}})
+            else:
+                if isinstance(content, str) and content:
+                    blocks.append({"text": content})
+                elif isinstance(content, list):
+                    for part in content:
+                        if part.get("type") == "text":
+                            blocks.append({"text": part["text"]})
+                        elif part.get("type") == "image_url":
+                            url = ProviderClient._image_url(part)
+                            match = re.fullmatch(r"data:image/(png|jpeg|gif|webp);base64,(.+)", url, re.DOTALL)
+                            if not match:
+                                raise ProviderError("Bedrock image input requires a PNG/JPEG/GIF/WebP data URI")
+                            blocks.append({"image": {"format": match.group(1),
+                                "source": {"bytes": match.group(2)}}})
+                if role == "assistant":
+                    for call in message.get("tool_calls", []):
+                        function = call.get("function", {})
+                        try:
+                            arguments = json.loads(function.get("arguments", "{}"))
+                        except (TypeError, ValueError):
+                            arguments = {}
+                        blocks.append({"toolUse": {"toolUseId": call.get("id", ""),
+                            "name": function.get("name", ""), "input": arguments}})
+            if blocks:
+                messages.append({"role": "assistant" if role == "assistant" else "user", "content": blocks})
+        result: dict[str, Any] = {"messages": messages}
+        if system:
+            result["system"] = system
+        inference = {}
+        for source, destination in (("temperature", "temperature"), ("top_p", "topP"), ("max_tokens", "maxTokens")):
+            if payload.get(source) is not None:
+                inference[destination] = payload[source]
+        if inference:
+            result["inferenceConfig"] = inference
+        if payload.get("tools") and payload.get("tool_choice") != "none":
+            tools = []
+            for tool in payload["tools"]:
+                function = tool["function"]
+                tools.append({"toolSpec": {"name": function["name"],
+                    "description": function.get("description", ""),
+                    "inputSchema": {"json": function.get("parameters", {"type": "object"})}}})
+            tool_config: dict[str, Any] = {"tools": tools}
+            choice = payload.get("tool_choice")
+            if choice == "required":
+                tool_config["toolChoice"] = {"any": {}}
+            elif isinstance(choice, dict):
+                tool_config["toolChoice"] = {"tool": {"name": choice["function"]["name"]}}
+            result["toolConfig"] = tool_config
+        return result
+
+    @staticmethod
+    def _sign_aws_request(url: str, payload: dict[str, Any], headers: dict[str, str], region: str) -> None:
+        access_key = os.getenv("AWS_ACCESS_KEY_ID", "")
+        secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+        token = os.getenv("AWS_SESSION_TOKEN", "")
+        if not access_key or not secret_key:
+            raise ProviderError("Bedrock requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        parsed = urlsplit(url)
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        date = timestamp[:8]
+        headers["Host"] = parsed.netloc
+        headers["X-Amz-Date"] = timestamp
+        if token:
+            headers["X-Amz-Security-Token"] = token
+        canonical_headers = "content-type:application/json\n" + f"host:{parsed.netloc}\n" + f"x-amz-date:{timestamp}\n"
+        signed_headers = "content-type;host;x-amz-date"
+        if token:
+            canonical_headers += f"x-amz-security-token:{token}\n"
+            signed_headers += ";x-amz-security-token"
+        canonical_query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
+        canonical_request = "\n".join(("POST", parsed.path or "/", canonical_query,
+            canonical_headers, signed_headers, hashlib.sha256(body).hexdigest()))
+        scope = f"{date}/{region}/bedrock/aws4_request"
+        string_to_sign = "\n".join(("AWS4-HMAC-SHA256", timestamp, scope,
+                                     hashlib.sha256(canonical_request.encode()).hexdigest()))
+        def sign(key: bytes, value: str) -> bytes:
+            return hmac.new(key, value.encode(), hashlib.sha256).digest()
+        signing_key = sign(sign(sign(sign(("AWS4" + secret_key).encode(), date), region), "bedrock"), "aws4_request")
+        signature = hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+        headers["Authorization"] = (f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+                                     f"SignedHeaders={signed_headers}, Signature={signature}")
 
     @staticmethod
     def _image_url(part: dict[str, Any]) -> str:
@@ -333,6 +572,11 @@ class ProviderClient:
                                 parts.append({"inlineData": {"mimeType": match.group(1), "data": match.group(2)}})
                             else:
                                 parts.append({"fileData": {"mimeType": "image/jpeg", "fileUri": url}})
+                        elif part.get("type") == "input_audio":
+                            audio = part["input_audio"]
+                            mime = {"wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac",
+                                    "ogg": "audio/ogg", "m4a": "audio/mp4"}[audio["format"]]
+                            parts.append({"inlineData": {"mimeType": mime, "data": audio["data"]}})
                 for call in message.get("tool_calls", []):
                     function = call.get("function", {})
                     try:
@@ -375,11 +619,18 @@ class ProviderClient:
             generation["responseMimeType"] = "application/json"
             if response_format["type"] == "json_schema":
                 generation["responseSchema"] = response_format["json_schema"]["schema"]
+        if payload.get("modalities") and "audio" in payload["modalities"]:
+            generation = result.setdefault("generationConfig", {})
+            generation["responseModalities"] = ["TEXT", "AUDIO"]
+            if payload.get("audio", {}).get("voice"):
+                generation["speechConfig"] = {"voiceConfig": {"prebuiltVoiceConfig": {
+                    "voiceName": payload["audio"]["voice"]}}}
         return result
 
     @staticmethod
     def _normalize(body: dict[str, Any], kind: str, model: str) -> dict[str, Any]:
         tool_calls: list[dict[str, Any]] = []
+        audio_parts: list[dict[str, Any]] = []
         if kind == "anthropic":
             text_parts = []
             for block in body.get("content", []):
@@ -392,7 +643,7 @@ class ProviderClient:
             text = "".join(text_parts)
             finish = body.get("stop_reason")
             response_id = body.get("id")
-        elif kind == "gemini":
+        elif kind in {"gemini", "vertex"}:
             candidates = body.get("candidates", [])
             parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
             text_parts = []
@@ -404,8 +655,25 @@ class ProviderClient:
                     tool_calls.append({"id": call.get("id") or f"call_{len(tool_calls)}", "type": "function",
                         "function": {"name": call.get("name", ""),
                                      "arguments": json.dumps(call.get("args", {}), separators=(",", ":"))}})
+                if part.get("inlineData", {}).get("mimeType", "").startswith("audio/"):
+                    audio_parts.append({"data": part["inlineData"].get("data", ""),
+                                        "mime_type": part["inlineData"].get("mimeType")})
             text = "".join(text_parts)
             finish = candidates[0].get("finishReason") if candidates else None
+            response_id = None
+        elif kind == "bedrock":
+            output = body.get("output", {}).get("message", {})
+            text_parts = []
+            for block in output.get("content", []):
+                if block.get("text"):
+                    text_parts.append(block["text"])
+                if block.get("toolUse"):
+                    tool = block["toolUse"]
+                    tool_calls.append({"id": tool.get("toolUseId"), "type": "function",
+                        "function": {"name": tool.get("name", ""),
+                                     "arguments": json.dumps(tool.get("input", {}), separators=(",", ":"))}})
+            text = "".join(text_parts)
+            finish = body.get("stopReason")
             response_id = None
         else:
             choices = body.get("choices", [])
@@ -414,10 +682,15 @@ class ProviderClient:
             tool_calls = message.get("tool_calls", []) or []
             finish = choices[0].get("finish_reason") if choices else None
             response_id = body.get("id")
-        if not text and not tool_calls:
+            audio = message.get("audio")
+            audio_parts = [audio] if audio else []
+        if not text and not tool_calls and not audio_parts:
             raise ProviderError("Provider returned no text completion", retryable=False)
-        result = {"text": text, "finish_reason": finish, "usage": _token_usage(body, kind),
+        usage_kind = "gemini" if kind == "vertex" else kind
+        result = {"text": text, "finish_reason": finish, "usage": _token_usage(body, usage_kind),
                   "provider_response_id": response_id, "model": body.get("model", model)}
         if tool_calls:
             result["tool_calls"] = tool_calls
+        if audio_parts:
+            result["audio"] = audio_parts[0] if len(audio_parts) == 1 else audio_parts
         return result

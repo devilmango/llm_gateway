@@ -16,10 +16,12 @@ from typing import Any
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from opentelemetry import trace
 
+from .capabilities import provider_capabilities
 from .config import load_config
+from .dashboard import OPERATIONS_DASHBOARD
 from .distributed import RateLimitBackendUnavailable
 from .limiting import RateLimitExceeded
 from .observability import (
@@ -140,8 +142,31 @@ def create_app(config: dict[str, Any] | None = None,
     def configured_tenants() -> dict[str, Any]:
         return cfg.get("tenants", cfg.get("security", {}).get("tenants", {}))
 
-    async def validate_admin(authorization: str | None, scope: str = "") -> None:
+    async def validate_admin(authorization: str | None, scope: str = "") -> str:
         provided = authorization.removeprefix("Bearer ") if authorization else ""
+        oidc = cfg.get("security", {}).get("oidc", {})
+        if oidc.get("enabled"):
+            if not provided:
+                raise HTTPException(status_code=401, detail="Bearer token required")
+            try:
+                import jwt
+                jwks = jwt.PyJWKClient(oidc["jwks_url"], cache_jwk_set=True)
+                signing_key = jwks.get_signing_key_from_jwt(provided)
+                claims = jwt.decode(provided, signing_key.key,
+                    algorithms=oidc.get("algorithms", ["RS256"]),
+                    issuer=oidc["issuer"], audience=oidc["audience"],
+                    options={"require": ["exp", "sub"]})
+            except ImportError as exc:
+                raise HTTPException(status_code=503, detail="OIDC support dependency is unavailable") from exc
+            except Exception as exc:
+                raise HTTPException(status_code=401, detail="Invalid OIDC token") from exc
+            role_claim = claims.get("roles", [])
+            if isinstance(role_claim, str):
+                role_claim = [role_claim]
+            scopes = set(str(claims.get("scope", "")).split()) | set(role_claim)
+            if scope and not ({scope, f"llm-gateway:{scope}", "admin:*"} & scopes):
+                raise HTTPException(status_code=403, detail="OIDC principal lacks required scope")
+            return str(claims.get("sub", "oidc-principal"))
         key_records = cfg.get("security", {}).get("admin_api_keys", [])
         if key_records:
             for record in key_records:
@@ -150,17 +175,18 @@ def create_app(config: dict[str, Any] | None = None,
                     scopes = set(record.get("scopes", []))
                     if "*" not in scopes and scope not in scopes:
                         raise HTTPException(status_code=403, detail="Admin key lacks required scope")
-                    return
+                    return str(record.get("id", "scoped-admin-key"))
             raise HTTPException(status_code=401, detail="Invalid gateway credentials")
         expected = os.getenv("GATEWAY_API_KEY")
         if configured_tenants() and not expected:
             raise HTTPException(status_code=503, detail="Admin API key is not configured")
         if expected and not hmac.compare_digest(provided, expected):
             raise HTTPException(status_code=401, detail="Invalid gateway credentials")
+        return "gateway-api-key" if expected else "anonymous-admin"
 
     def admin_dependency(scope: str):
-        async def dependency(authorization: str | None = Header(default=None)) -> None:
-            await validate_admin(authorization, scope)
+        async def dependency(request: Request, authorization: str | None = Header(default=None)) -> None:
+            request.state.admin_actor = await validate_admin(authorization, scope)
         return dependency
 
     async def authenticate_client(authorization: str | None = Header(default=None)) -> dict[str, Any] | None:
@@ -173,7 +199,7 @@ def create_app(config: dict[str, Any] | None = None,
                 if expected and hmac.compare_digest(provided, expected):
                     return {"id": tenant_id, "config": tenant}
             raise HTTPException(status_code=401, detail="Invalid tenant credentials")
-        await validate_admin(authorization)
+        await validate_admin(authorization, "client")
         return None
 
     async def publish_budget_alerts(request: Request, alerts: list[dict[str, Any]], policy: dict[str, Any],
@@ -199,6 +225,22 @@ def create_app(config: dict[str, Any] | None = None,
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
+    async def operations_dashboard() -> HTMLResponse:
+        return HTMLResponse(OPERATIONS_DASHBOARD)
+
+    @app.middleware("http")
+    async def audit_admin_requests(request: Request, call_next):
+        response = await call_next(request)
+        actor = getattr(request.state, "admin_actor", None)
+        if actor and request.url.path.startswith("/v1/admin/") and request.app.state.store:
+            try:
+                await asyncio.to_thread(request.app.state.store.record_audit, actor,
+                    f"{request.method} {request.url.path}", response.status_code)
+            except Exception:
+                logger.exception("admin_audit_record_failed")
+        return response
+
     @app.get("/metrics", include_in_schema=False)
     async def metrics() -> Response:
         body, content_type = metrics_response()
@@ -208,7 +250,10 @@ def create_app(config: dict[str, Any] | None = None,
     async def routes(tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
         allowed_routes = set(tenant["config"].get("allowed_routes", [])) if tenant else set(cfg["routes"])
         return {name: {"provider": route["provider"], "model": route["model"],
-                       "fallbacks": route.get("fallbacks", []), "cache": route.get("cache", {})}
+                       "capabilities": provider_capabilities(cfg["providers"][route["provider"]]),
+                       "fallbacks": [{**candidate, "capabilities": provider_capabilities(cfg["providers"][candidate["provider"]])}
+                                     for candidate in route.get("fallbacks", [])],
+                       "cache": route.get("cache", {})}
                 for name, route in cfg["routes"].items() if name in allowed_routes}
 
     @app.post("/v1/chat/completions", response_model=None)
@@ -230,7 +275,7 @@ def create_app(config: dict[str, Any] | None = None,
             value = getattr(body, source)
             if value is not None:
                 upstream_payload[destination] = value
-        for field in ("tools", "tool_choice", "response_format"):
+        for field in ("tools", "tool_choice", "response_format", "modalities", "audio"):
             value = getattr(body, field)
             if value is not None:
                 upstream_payload[field] = value
@@ -288,10 +333,16 @@ def create_app(config: dict[str, Any] | None = None,
                                         "usage": usage}) + "\n\n"
                                     continue
                                 delta = item.get("delta", "")
-                                text_delta += len(delta)
+                                if "tool_call_delta" in item:
+                                    chunk_delta = {"tool_calls": [item["tool_call_delta"]]}
+                                elif "audio_delta" in item:
+                                    chunk_delta = {"audio": item["audio_delta"]}
+                                else:
+                                    chunk_delta = {"content": delta}
+                                    text_delta += len(delta)
                                 yield "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk",
                                     "created": int(time.time()), "model": route_name,
-                                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}) + "\n\n"
+                                    "choices": [{"index": 0, "delta": chunk_delta, "finish_reason": None}]}) + "\n\n"
                         yield "data: [DONE]\n\n"
                     except ProviderError:
                         status, stream_error = "failure", "upstream_error"
@@ -366,7 +417,8 @@ def create_app(config: dict[str, Any] | None = None,
             span.set_attribute("llm.cost.usd", cost)
             output = ChatResponse(id=request_id, created=int(time.time()), model=route_name,
                 choices=[ChatChoice(message={"role": "assistant", "content": result.get("text") or None,
-                    **({"tool_calls": result["tool_calls"]} if result.get("tool_calls") else {})},
+                    **({"tool_calls": result["tool_calls"]} if result.get("tool_calls") else {}),
+                    **({"audio": result["audio"]} if result.get("audio") else {})},
                     finish_reason=result.get("finish_reason"))],
                 usage=Usage(**usage), gateway={"provider": provider, "upstream_model": model,
                     "fallback_used": result["fallback_used"], "cached": result["cached"], "cost_usd": round(cost, 8)})
@@ -513,9 +565,15 @@ def create_app(config: dict[str, Any] | None = None,
     async def provider_health(request: Request) -> dict[str, Any]:
         states = await request.app.state.gateway.breaker.snapshot()
         performance = await request.app.state.gateway.health_snapshot()
-        return {"providers": {name: {"kind": provider["kind"], **states.get(name, {"state": "closed", "failures": 0})}
+        return {"providers": {name: {"kind": provider["kind"], "capabilities": provider_capabilities(provider),
+                                    **states.get(name, {"state": "closed", "failures": 0})}
                               | performance.get(name, {})
                               for name, provider in cfg["providers"].items()}}
+
+    @app.get("/v1/admin/audit", dependencies=[Depends(admin_dependency("audit"))])
+    async def audit_events(request: Request, limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
+        events = await asyncio.to_thread(request.app.state.store.audit_events, limit)
+        return {"events": events}
 
     @app.get("/v1/admin/webhooks", dependencies=[Depends(admin_dependency("webhooks"))])
     async def webhook_events(request: Request, status: str | None = Query(default=None),
