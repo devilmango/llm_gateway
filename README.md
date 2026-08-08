@@ -41,14 +41,15 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Provider capability registry | Advertises and enforces streaming, streaming tools, tools, structured output, images, and audio input/output per provider, with optional provider-level capability overrides. |
 | Configurable model routes | Map a logical route to a provider and model in YAML. |
 | Retry and fallback | Retry timeouts, network errors, HTTP 429, and upstream 5xx responses with bounded exponential backoff; then try configured fallbacks in order. |
-| Traffic controls | Apply request timeouts, a maximum in-flight request count, and per-provider requests-per-minute limits. Use Redis to share request limits across replicas. |
-| Usage and cost ledger | Persist provider, route, model, token usage, estimated USD cost, status, latency, fallback, and cache-hit metadata in SQLite or PostgreSQL. |
+| Traffic controls | Apply request timeouts, a maximum in-flight request count, and per-provider requests-per-minute limits. Use Redis to share rate limits and renewable concurrency leases across replicas. |
+| Usage and cost ledger | Persist provider, route, model, token usage, estimated USD cost, status, latency, fallback, cache-hit, and canary metadata in SQLite or PostgreSQL. |
 | Application reporting | Group usage and reliability totals by application, provider, model, route, and cost center. |
 | Application budgets and quotas | Enforce UTC calendar-month spend caps, per-application request rates, and request size/output bounds. Reserve estimated maximum cost before provider calls to limit concurrent overspend. |
 | Budget alerts | Emit structured warning logs and optional signed webhook events when configured spend thresholds (80% and 100% by default) are crossed. |
 | Observability | Export Prometheus request, token, cost, fallback, cache, in-flight, end-to-end latency, provider outcome/latency, and retry metrics; emit nested OpenTelemetry request/provider-attempt spans and optionally export them over OTLP/HTTP. |
-| Provider health | Open a circuit after repeated transient failures, skip open providers, and allow a single half-open probe after the recovery period. |
+| Provider health | Open a circuit after repeated transient failures, skip open providers, and allow a single half-open probe after the recovery period. Redis shares circuit state across replicas. |
 | Latency-aware routing | Optionally order a route's primary and fallback candidates using shared provider EWMA latency and failure-rate signals. |
+| Canary routing and evaluation | Deterministically send a configured share of requests to a candidate provider/model; evaluate JSONL prompt sets by pass rate, latency, and estimated cost using `llm-gateway-eval`. |
 | Streaming | Stream OpenAI-compatible, Azure, Anthropic, Gemini, and Vertex output as server-sent events, including tool-call and audio deltas where supported; account usage at completion. |
 | Tenant access controls | Configure per-tenant bearer credentials, route allowlists, application allowlists, and tenant-specific budget/limit policies. |
 | Tool calling and structured outputs | Pass OpenAI-style function definitions and JSON response schemas; adapters translate them for OpenAI-compatible, Anthropic, and Gemini providers. Tool execution stays in the calling application. |
@@ -58,6 +59,7 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Optional gateway authentication | Require a bearer key for route, completion, and report endpoints by setting `GATEWAY_API_KEY`; support OIDC/JWT for admin and client access. |
 | Scoped admin keys | Configure multiple admin keys with report, budget, provider-health, or webhook scopes; overlap keys during rotation and disable old entries to revoke them. |
 | Cost-center reporting and exports | Tag requests with a cost center, view provider/model/route breakdowns, filter reports, and export request-level records as CSV. |
+| Cost reconciliation | Import actual provider charges by gateway request ID and compare totals and variance with the original per-request estimates. |
 | Multimodal image input | Accept OpenAI-style image content parts and translate data URIs or image URLs for supported providers. |
 | Audio input and output | Accept base64 audio input parts and request generated audio for providers whose capability registry enables it. |
 | OIDC/JWT and audit log | Validate admin JWTs against configured issuer/audience/JWKS, enforce scopes, and persist admin request records. |
@@ -183,7 +185,7 @@ tenants:
         max_input_bytes: 32768
 ```
 
-Each route has a primary `provider` and `model`, an ordered optional `fallbacks` list, and optional cache settings. Each provider's `kind` must be `openai`, `anthropic`, or `gemini`. The local example uses `kind: openai` with an OpenAI-compatible base URL and an optional key.
+Each route has a primary `provider` and `model`, an ordered optional `fallbacks` list, and optional cache settings. A route can also define a `canary` with `provider`, `model`, and `traffic_percent` from 0 to 100. A request ID hash makes sampling stable for that request; selected canary traffic bypasses route caching and falls back to the configured primary/fallback candidates if needed. Provider `kind` values include `openai`, `azure_openai`, `vllm`, `anthropic`, `gemini`, `vertex`, and `bedrock`.
 
 ### Pricing configuration
 
@@ -280,6 +282,7 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/admin` | Operations dashboard shell; data loads through authenticated admin APIs. |
 | `GET` | `/v1/admin/report` | Aggregate token, cost, and reliability data. |
 | `GET` | `/v1/admin/report.csv` | Export filtered request-level usage and cost records as CSV (up to 100,000 rows). |
+| `POST` | `/v1/admin/cost-reconciliation` | Atomically import actual costs keyed by gateway request ID. |
 | `GET` | `/v1/admin/budgets` | Current-month spend, limit, and utilization for configured applications. |
 | `GET` | `/v1/admin/providers` | Provider circuit state and consecutive failure counts. |
 | `GET` | `/v1/admin/audit` | Recent authenticated admin API access events. |
@@ -299,7 +302,28 @@ curl -H 'Authorization: Bearer gateway-secret' \
   'http://localhost:8000/v1/admin/report?start=2026-10-01T00:00:00Z&end=2026-11-01T00:00:00Z&application=support-router'
 ```
 
-`start` is inclusive, `end` is exclusive, and both accept ISO-8601 timestamps. The response includes aggregate requests, input/output/total tokens, total and average cost per request, failure and fallback rates, average latency, cache hits, and breakdowns by application, provider, model, route, and cost center. Optional `cost_center`, `provider`, and `route` filters can be combined with time and application filters. `GET /v1/admin/report.csv` accepts the same filters and exports at most 100,000 request rows.
+`start` is inclusive, `end` is exclusive, and both accept ISO-8601 timestamps. The response includes aggregate requests, input/output/total tokens, estimated and reconciled cost totals, cost variance, failure and fallback rates, canary request counts, average latency, cache hits, and breakdowns by application, provider, model, route, and cost center. Optional `cost_center`, `provider`, and `route` filters can be combined with time and application filters. `GET /v1/admin/report.csv` accepts the same filters and exports at most 100,000 request rows. `cost_usd` remains the estimate used for budgets; actual charges are stored separately.
+
+Import provider invoice rows as an atomic batch. Every request ID must exist in the ledger; unknown IDs reject the full batch. Re-importing a request replaces its prior actual cost and records the reconciliation source.
+
+```bash
+curl -X POST http://localhost:8000/v1/admin/cost-reconciliation \
+  -H 'Authorization: Bearer gateway-secret' -H 'Content-Type: application/json' \
+  -d '{"source":"invoice-2026-10","records":[{"request_id":"chatcmpl-123","actual_cost_usd":0.0047}]}'
+```
+
+Run an evaluation set against named logical routes to compare response checks, latency, and estimated spend. Cases without an expected text check contribute to latency/cost but not pass rate.
+
+```jsonl
+{"id":"refund-policy","route":"simple","messages":[{"role":"user","content":"When can I request a refund?"}],"expected_contains":["30 days"]}
+{"id":"refund-reasoning","route":"reasoning","messages":[{"role":"user","content":"When can I request a refund?"}],"expected_contains":["30 days"]}
+```
+
+```bash
+llm-gateway-eval prompts.jsonl --url http://localhost:8000 --output eval-report.json
+```
+
+The runner prints per-route pass rate, average and p95 latency, failures, and estimated cost. Expected-text checks are a simple deterministic baseline; use a curated dataset or external judge for semantic quality evaluation.
 
 ```json
 {
@@ -353,11 +377,11 @@ Prometheus counters and histograms are exposed at `/metrics`. OpenTelemetry requ
 
 ## Multi-replica deployment
 
-Set `REDIS_URL` to enable shared Redis response caching, atomic per-provider/per-application sliding-window quotas, and provider health/latency signals used by latency-aware routing. Redis must be available when the service starts; the gateway verifies the connection and fails startup if the configured backend is unavailable. Cache reads/writes and provider health writes fail open; quota checks fail closed with HTTP 503 if Redis becomes unavailable, so traffic is not sent without enforcing configured limits. Use a private Redis network and `rediss://` when TLS is required; cached completions remain readable to Redis operators until their TTL expires.
+Set `REDIS_URL` to enable shared Redis response caching, atomic per-provider/per-application sliding-window quotas, global in-flight concurrency leases, shared circuit-breaker state, and provider health/latency signals for routing. Redis must be available when the service starts; the gateway verifies the connection and fails startup if the configured backend is unavailable. Cache reads/writes and provider health writes fail open; quota and concurrency acquisition fail closed with HTTP 503 if Redis becomes unavailable. Concurrency leases renew while requests run and expire automatically after a process crash. Use a private Redis network and `rediss://` when TLS is required; cached completions remain readable to Redis operators until their TTL expires.
 
 Set `GATEWAY_DATABASE` to a PostgreSQL DSN such as `postgresql://gateway:password@db:5432/llm_gateway` to use the PostgreSQL ledger and coordinate concurrent budget reservations across replicas. The service creates the required tables and indexes at startup. Use SQLite for single-instance local development.
 
-Provider circuit breakers remain process-local. Each replica independently skips providers that have crossed its failure threshold; recovery probes are limited to one per provider per process. Latency and success/failure summaries are shared in Redis when configured. Set `routing.strategy: latency_aware` to order configured route candidates by their shared EWMA latency, penalized by failure rate. Use `/v1/admin/providers` to inspect circuit and performance signals. Deploy behind TLS, keep Redis and PostgreSQL private, and protect admin and metrics endpoints at the network edge.
+When Redis is configured, circuit states and the single half-open recovery probe are shared across replicas. Latency and success/failure summaries are also shared. Set `routing.strategy: latency_aware` to order configured route candidates by their shared EWMA latency, penalized by failure rate. Use `/v1/admin/providers` to inspect circuit and performance signals. Deploy behind TLS, keep Redis and PostgreSQL private, and protect admin and metrics endpoints at the network edge.
 
 ## Security and privacy
 
@@ -391,7 +415,7 @@ For persistent data, mount a durable volume at the configured database directory
 ## Current limits
 
 - Bedrock streaming is not implemented. Gemini image URL inputs must use provider-supported file URIs or inline data URIs.
-- Without Redis, rate limits, cache, and provider performance signals are process-local. Concurrency limits and circuit-breaker health remain process-local even when Redis is configured.
+- Without Redis, rate limits, cache, concurrency limits, and circuit-breaker health are process-local.
 - PostgreSQL supports shared usage storage and monthly budget reservations across replicas. SQLite remains intended for a single instance and modest event volume.
 - The gateway accepts text, image, and supported audio messages, but not video payloads. It returns tool calls for the application to execute and does not run them itself.
 - Scoped admin key changes require a process restart. The dashboard shell is public; data APIs retain configured authentication and should be served behind TLS.
@@ -418,6 +442,9 @@ Suggested next milestones, ordered by production value:
 - [x] Add Azure OpenAI, AWS Bedrock Converse, Vertex AI, and vLLM adapters with a capability registry.
 - [x] Add OIDC/JWT validation, scoped admin access, and audit logs.
 - [x] Add an operations dashboard, audio input/output, and streaming tool-call chunks.
+- [x] Share concurrency leases and circuit-breaker state through Redis.
+- [x] Add deterministic canary routing and a JSONL route evaluation CLI.
+- [x] Import actual provider charges and report reconciled cost variance.
 
 ## Contributing
 

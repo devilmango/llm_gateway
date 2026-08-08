@@ -14,6 +14,7 @@ import fakeredis.aioredis
 import httpx
 import pytest
 
+from llm_gateway.evaluation import evaluate_cases
 from llm_gateway.main import _deliver_webhook_batch, create_app
 from llm_gateway.providers import ProviderClient
 from llm_gateway.storage import create_usage_store
@@ -960,3 +961,113 @@ async def test_exhausted_upstream_failures_are_reported(tmp_path, monkeypatch):
         assert report["requests"] == 1
         assert report["failures"] == 1
         assert report["total_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_canary_route_is_sampled_and_reported_without_fallback_accounting(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    cfg = config(str(tmp_path / "canary.sqlite3"))
+    cfg["routes"]["simple"]["canary"] = {"provider": "backup", "model": "backup-model", "traffic_percent": 100}
+    cfg["routes"]["simple"]["cache"] = {"enabled": True, "ttl_seconds": 30}
+    hosts = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        body = success_response().json()
+        body["model"] = "backup-model" if request.url.host == "backup.test" else "primary-model"
+        return httpx.Response(200, json=body)
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={"model": "simple", "messages": [{"role": "user", "content": "hello"}]})
+        assert response.status_code == 200
+        assert response.json()["gateway"]["canary_used"] is True
+        assert response.json()["gateway"]["fallback_used"] is False
+        assert hosts == ["backup.test"]
+        report = (await client.get("/v1/admin/report")).json()
+        assert report["canary_requests"] == 1
+
+
+@pytest.mark.asyncio
+async def test_cost_reconciliation_preserves_estimates_and_reports_actual_cost(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    async with gateway_client(config(str(tmp_path / "reconcile.sqlite3")),
+                              httpx.MockTransport(lambda request: success_response())) as client:
+        created = await client.post("/v1/chat/completions", json={"model": "simple", "messages": [{"role": "user", "content": "hello"}]})
+        request_id = created.json()["id"]
+        estimate = created.json()["gateway"]["cost_usd"]
+        imported = await client.post("/v1/admin/cost-reconciliation", json={"source": "invoice-2026-10", "records": [
+            {"request_id": request_id, "actual_cost_usd": 0.0005}]})
+        assert imported.status_code == 200
+        report = (await client.get("/v1/admin/report")).json()
+        assert report["cost_usd"] == estimate
+        assert report["actual_cost_usd"] == 0.0005
+        assert report["cost_variance_usd"] == pytest.approx(0.0005 - estimate)
+        assert report["reconciled_requests"] == 1
+        unknown = await client.post("/v1/admin/cost-reconciliation", json={"source": "bad-batch", "records": [
+            {"request_id": request_id, "actual_cost_usd": 0.0003},
+            {"request_id": "missing", "actual_cost_usd": 0.0002}]})
+        assert unknown.status_code == 400
+        report = (await client.get("/v1/admin/report")).json()
+        assert report["actual_cost_usd"] == 0.0005
+
+
+@pytest.mark.asyncio
+async def test_eval_runner_reports_quality_cost_and_latency():
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "eval-id", "model": "test-model",
+            "choices": [{"message": {"role": "assistant", "content": "The result is 42."}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            "gateway": {"provider": "primary", "upstream_model": "test-model", "cost_usd": 0.0001}})
+
+    report = await evaluate_cases([{"id": "math", "route": "simple", "messages": [{"role": "user", "content": "compute"}],
+                                   "expected_contains": "42"}], "http://gateway", transport=httpx.MockTransport(upstream))
+    summary = report["routes"]["simple"]
+    assert summary["pass_rate"] == 1
+    assert summary["estimated_cost_usd"] == 0.0001
+    assert summary["graded_cases"] == 1
+
+
+@pytest.mark.asyncio
+async def test_redis_concurrency_leases_are_shared_across_instances():
+    from llm_gateway.distributed import RedisConcurrencyLimiter
+
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    first = RedisConcurrencyLimiter(redis, 1)
+    second = RedisConcurrencyLimiter(redis, 1)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_slot():
+        async with first:
+            entered.set()
+            await release.wait()
+
+    async def wait_for_slot():
+        await entered.wait()
+        async with second:
+            return True
+
+    holder = asyncio.create_task(hold_slot())
+    waiter = asyncio.create_task(wait_for_slot())
+    await entered.wait()
+    await asyncio.sleep(0.05)
+    assert not waiter.done()
+    release.set()
+    assert await waiter is True
+    await holder
+    await redis.aclose()
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_state_is_shared_in_redis():
+    from llm_gateway.circuit import ProviderCircuitBreaker
+
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    first = ProviderCircuitBreaker(["provider"], failure_threshold=1, recovery_seconds=10, redis=redis)
+    second = ProviderCircuitBreaker(["provider"], failure_threshold=1, recovery_seconds=10, redis=redis)
+    assert await first.allow("provider")
+    await first.failure("provider")
+    assert not await second.allow("provider")
+    assert (await second.snapshot())["provider"]["state"] == "open"
+    await redis.aclose()

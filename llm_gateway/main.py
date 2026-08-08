@@ -37,7 +37,13 @@ from .observability import (
 )
 from .providers import ProviderError
 from .redaction import redact
-from .schemas import ChatChoice, ChatRequest, ChatResponse, Usage
+from .schemas import (
+    ChatChoice,
+    ChatRequest,
+    ChatResponse,
+    CostReconciliationRequest,
+    Usage,
+)
 from .service import GatewayService
 from .storage import BudgetExceeded, create_usage_store
 
@@ -323,7 +329,7 @@ def create_app(config: dict[str, Any] | None = None,
                             "created": int(time.time()), "model": route_name,
                             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}) + "\n\n"
                         with trace.use_span(span, end_on_exit=False):
-                            async for item in request.app.state.gateway.stream_complete(route_name, upstream_payload):
+                            async for item in request.app.state.gateway.stream_complete(route_name, upstream_payload, request_id):
                                 if item.get("final"):
                                     stream_result = item
                                     usage = item.get("usage", {})
@@ -370,7 +376,9 @@ def create_app(config: dict[str, Any] | None = None,
                             "total_tokens": usage_data.get("total_tokens", 0), "cost_usd": cost_value,
                             "status": status, "latency_ms": elapsed_ms,
                             "fallback_used": int(bool(stream_result and stream_result.get("fallback_used"))),
-                            "cached": int(bool(stream_result and stream_result.get("cached"))), "error_type": stream_error}
+                            "cached": int(bool(stream_result and stream_result.get("cached"))),
+                            "canary_used": int(bool(stream_result and stream_result.get("canary_used"))),
+                            "error_type": stream_error}
                         await asyncio.to_thread(request.app.state.store.record, record)
                         metric_route = route_name if route_name in cfg["routes"] else "unknown"
                         REQUESTS.labels(route=metric_route, status=status).inc()
@@ -401,7 +409,7 @@ def create_app(config: dict[str, Any] | None = None,
                 return StreamingResponse(event_stream(), media_type="text/event-stream",
                                          headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
             with trace.use_span(span, end_on_exit=False):
-                result = await request.app.state.gateway.complete(route_name, upstream_payload)
+                result = await request.app.state.gateway.complete(route_name, upstream_payload, request_id)
             usage = result["usage"]
             provider = result["provider"]
             model = result["model"]
@@ -421,7 +429,8 @@ def create_app(config: dict[str, Any] | None = None,
                     **({"audio": result["audio"]} if result.get("audio") else {})},
                     finish_reason=result.get("finish_reason"))],
                 usage=Usage(**usage), gateway={"provider": provider, "upstream_model": model,
-                    "fallback_used": result["fallback_used"], "cached": result["cached"], "cost_usd": round(cost, 8)})
+                    "fallback_used": result["fallback_used"], "cached": result["cached"],
+                    "canary_used": result.get("canary_used", False), "cost_usd": round(cost, 8)})
             return output
         except KeyError:
             status, error_type = "failure", "unknown_route"
@@ -462,7 +471,8 @@ def create_app(config: dict[str, Any] | None = None,
                     "total_tokens": usage_data.get("total_tokens", 0), "cost_usd": cost_value,
                     "status": locals().get("status", "failure"), "latency_ms": elapsed_ms,
                     "fallback_used": int(bool(result and result.get("fallback_used"))),
-                    "cached": int(bool(result and result.get("cached"))), "error_type": error_type}
+                    "cached": int(bool(result and result.get("cached"))),
+                    "canary_used": int(bool(result and result.get("canary_used"))), "error_type": error_type}
                 await asyncio.to_thread(request.app.state.store.record, record)
                 metric_route = route_name if route_name in cfg["routes"] else "unknown"
                 REQUESTS.labels(route=metric_route, status=record["status"]).inc()
@@ -499,6 +509,15 @@ def create_app(config: dict[str, Any] | None = None,
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Invalid report filters") from exc
 
+    @app.post("/v1/admin/cost-reconciliation", dependencies=[Depends(admin_dependency("report"))])
+    async def reconcile_costs(body: CostReconciliationRequest, request: Request) -> dict[str, Any]:
+        """Import actual provider charges keyed by gateway request id; batches are atomic."""
+        try:
+            records = [item.model_dump() for item in body.records]
+            return await asyncio.to_thread(request.app.state.store.reconcile_costs, records, body.source)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/v1/admin/report.csv", dependencies=[Depends(admin_dependency("report"))])
     async def report_csv(request: Request, start: str | None = Query(default=None), end: str | None = Query(default=None),
                          application: str | None = Query(default=None), cost_center: str | None = Query(default=None),
@@ -509,7 +528,8 @@ def create_app(config: dict[str, Any] | None = None,
         output = StringIO()
         fields = ["request_id", "occurred_at", "application", "cost_center", "route", "provider", "model",
                   "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status", "latency_ms",
-                  "fallback_used", "cached", "error_type"]
+                  "fallback_used", "cached", "canary_used", "actual_cost_usd",
+                  "cost_reconciliation_id", "cost_reconciled_at", "error_type"]
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         for row in rows:

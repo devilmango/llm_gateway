@@ -34,6 +34,7 @@ dev = [
 
 [project.scripts]
 llm-gateway = "llm_gateway.main:run"
+llm-gateway-eval = "llm_gateway.evaluation:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

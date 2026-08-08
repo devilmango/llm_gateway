@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from typing import Any
 
@@ -8,7 +9,11 @@ from opentelemetry import trace
 
 from .cache import RedisResponseCache, ResponseCache
 from .circuit import ProviderCircuitBreaker
-from .distributed import RateLimitBackendUnavailable, RedisSlidingWindowLimiter
+from .distributed import (
+    RateLimitBackendUnavailable,
+    RedisConcurrencyLimiter,
+    RedisSlidingWindowLimiter,
+)
 from .limiting import RateLimitExceeded, SlidingWindowLimiter
 from .observability import PROVIDER_RETRIES
 from .provider_health import ProviderHealth
@@ -23,13 +28,16 @@ class GatewayService:
         self.client = ProviderClient(http, self.providers, float(config["server"].get("request_timeout_seconds", 45)))
         self.limiter = RedisSlidingWindowLimiter(shared_redis) if shared_redis else SlidingWindowLimiter()
         self.cache = RedisResponseCache(shared_redis) if shared_redis else ResponseCache()
-        self.semaphore = asyncio.Semaphore(int(config["server"].get("max_concurrent_requests", 100)))
+        self.max_concurrent_requests = int(config["server"].get("max_concurrent_requests", 100))
+        self.shared_redis = shared_redis
+        self.semaphore = asyncio.Semaphore(self.max_concurrent_requests)
         self.application_limiter = self.limiter if shared_redis else SlidingWindowLimiter()
         breaker_config = config.get("circuit_breaker", {})
         self.breaker = ProviderCircuitBreaker(
             list(self.providers),
             failure_threshold=breaker_config.get("failure_threshold", 5),
             recovery_seconds=breaker_config.get("recovery_seconds", 30),
+            redis=shared_redis,
         )
         self.provider_health = ProviderHealth(shared_redis)
 
@@ -60,7 +68,7 @@ class GatewayService:
         output_rate = max((float(p.get("output_cost_per_1m", 0)) for p in prices), default=0)
         return (input_bytes * input_rate + requested_tokens * output_rate) / 1_000_000
 
-    def route_candidates(self, route_name: str) -> list[dict[str, str]]:
+    def route_candidates(self, route_name: str, request_id: str | None = None) -> list[dict[str, str]]:
         if route_name not in self.routes:
             raise KeyError(route_name)
         route = self.routes[route_name]
@@ -70,6 +78,19 @@ class GatewayService:
             provider = candidate.get("provider")
             if provider not in self.providers:
                 raise ValueError(f"Route {route_name!r} refers to unknown provider {provider!r}")
+        canary = route.get("canary")
+        if canary:
+            percentage = float(canary.get("traffic_percent", 0))
+            if not 0 <= percentage <= 100:
+                raise ValueError(f"Route {route_name!r} canary traffic_percent must be between 0 and 100")
+            canary_candidate = {"provider": canary.get("provider"), "model": canary.get("model")}
+            if canary_candidate["provider"] not in self.providers or not canary_candidate["model"]:
+                raise ValueError(f"Route {route_name!r} canary must reference a configured provider and model")
+            # Without a request id return the union so budget reservations account for the
+            # most expensive possible target. Live requests use a stable sample per request.
+            sampled = request_id is None or int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 < percentage
+            if sampled:
+                candidates = [canary_candidate, *candidates]
         return candidates
 
     async def health_snapshot(self) -> dict[str, dict[str, float | int]]:
@@ -103,13 +124,18 @@ class GatewayService:
                     (1.0 + float(sample.get("failure_rate", 0.0)) * 4.0), index)
         return [candidate for _, candidate in sorted(indexed, key=score)]
 
-    async def complete(self, route_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def complete(self, route_name: str, payload: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
         route = self.routes[route_name]
         preferred = (route["provider"], route["model"])
-        candidates = await self._order_candidates(self.route_candidates(route_name))
+        candidates = await self._order_candidates(self.route_candidates(route_name, request_id))
+        canary_config = route.get("canary")
+        canary_selected = bool(canary_config and request_id is not None and
+            int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 < float(canary_config.get("traffic_percent", 0)))
+        if canary_selected:
+            candidates = self._prioritize_canary(candidates, canary_config)
         cache_cfg = route.get("cache", {})
         cache_key = self.cache.key(payload, preferred[0], preferred[1])
-        cache_safe = self.cache_safe_payload(payload)
+        cache_safe = self.cache_safe_payload(payload) and not canary_selected
         if cache_cfg.get("enabled") and cache_safe:
             cached = await self.cache.get(cache_key)
             if cached:
@@ -121,7 +147,7 @@ class GatewayService:
         errors: list[str] = []
         max_retries = int(self.config["server"].get("max_retries", 2))
         base_delay = float(self.config["server"].get("retry_base_delay_seconds", 0.25))
-        async with self.semaphore:
+        async with self._concurrency():
             for candidate_index, candidate in enumerate(candidates):
                 name, model = candidate["provider"], candidate["model"]
                 provider_config = self.providers[name]
@@ -142,8 +168,11 @@ class GatewayService:
                             result = await self.client.complete(name, model, payload)
                             await self.provider_health.record(name, (asyncio.get_running_loop().time() - started) * 1000, True)
                             await self.breaker.success(name)
+                            used_canary = bool(canary_selected and canary_config and
+                                (name, model) == (canary_config.get("provider"), canary_config.get("model")))
                             result.update({"provider": name, "configured_model": model,
-                                           "fallback_used": (name, model) != preferred, "cached": False})
+                                           "fallback_used": (name, model) != preferred and not used_canary,
+                                           "cached": False, "canary_used": used_canary})
                             if cache_cfg.get("enabled") and cache_safe:
                                 await self.cache.put(cache_key, result, int(cache_cfg.get("ttl_seconds", 60)))
                             return result
@@ -170,14 +199,19 @@ class GatewayService:
                             raise
         raise ProviderError("All configured providers failed: " + "; ".join(errors), retryable=False)
 
-    async def stream_complete(self, route_name: str, payload: dict[str, Any]):
+    async def stream_complete(self, route_name: str, payload: dict[str, Any], request_id: str | None = None):
         """Yield provider text deltas; retries/fallbacks stop once text was emitted."""
         route = self.routes[route_name]
         preferred = (route["provider"], route["model"])
-        candidates = await self._order_candidates(self.route_candidates(route_name))
+        candidates = await self._order_candidates(self.route_candidates(route_name, request_id))
+        canary_config = route.get("canary")
+        canary_selected = bool(canary_config and request_id is not None and
+            int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 < float(canary_config.get("traffic_percent", 0)))
+        if canary_selected:
+            candidates = self._prioritize_canary(candidates, canary_config)
         cache_cfg = route.get("cache", {})
         cache_key = self.cache.key(payload, preferred[0], preferred[1])
-        cache_safe = self.cache_safe_payload(payload)
+        cache_safe = self.cache_safe_payload(payload) and not canary_selected
         if cache_cfg.get("enabled") and cache_safe:
             cached = await self.cache.get(cache_key)
             if cached:
@@ -190,7 +224,7 @@ class GatewayService:
         errors: list[str] = []
         max_retries = int(self.config["server"].get("max_retries", 2))
         base_delay = float(self.config["server"].get("retry_base_delay_seconds", 0.25))
-        async with self.semaphore:
+        async with self._concurrency():
             for candidate_index, candidate in enumerate(candidates):
                 name, model = candidate["provider"], candidate["model"]
                 provider_config = self.providers[name]
@@ -218,10 +252,13 @@ class GatewayService:
                         elapsed_ms = (asyncio.get_running_loop().time() - started) * 1000
                         await self.provider_health.record(name, elapsed_ms, True)
                         await self.breaker.success(name)
+                        used_canary = bool(canary_selected and canary_config and
+                            (name, model) == (canary_config.get("provider"), canary_config.get("model")))
                         result = {"text": "".join(text_parts), "usage": final.get("usage", {}),
                                   "finish_reason": final.get("finish_reason"), "model": final.get("model", model),
                                   "provider": name, "configured_model": model,
-                                  "fallback_used": (name, model) != preferred, "cached": False}
+                                  "fallback_used": (name, model) != preferred and not used_canary,
+                                  "cached": False, "canary_used": used_canary}
                         if cache_cfg.get("enabled") and cache_safe:
                             await self.cache.put(cache_key, result, int(cache_cfg.get("ttl_seconds", 60)))
                         yield {**result, "final": True}
@@ -250,3 +287,24 @@ class GatewayService:
                         await self.breaker.abandon(name)
                         raise
         raise ProviderError("All configured providers failed: " + "; ".join(errors), retryable=False)
+
+    def _concurrency(self):
+        if self.shared_redis:
+            return RedisConcurrencyLimiter(self.shared_redis, self.max_concurrent_requests)
+        return _SemaphoreLease(self.semaphore)
+
+    @staticmethod
+    def _prioritize_canary(candidates: list[dict[str, str]], canary: dict[str, Any]) -> list[dict[str, str]]:
+        target = {"provider": canary["provider"], "model": canary["model"]}
+        return [target, *[candidate for candidate in candidates if candidate != target]]
+
+
+class _SemaphoreLease:
+    def __init__(self, semaphore: asyncio.Semaphore):
+        self.semaphore = semaphore
+
+    async def __aenter__(self):
+        await self.semaphore.acquire()
+
+    async def __aexit__(self, *_: object):
+        self.semaphore.release()

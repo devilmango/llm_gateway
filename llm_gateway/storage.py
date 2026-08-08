@@ -27,13 +27,21 @@ class UsageStore:
                 completion_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
                 cost_usd REAL NOT NULL DEFAULT 0, status TEXT NOT NULL,
                 latency_ms INTEGER NOT NULL DEFAULT 0, fallback_used INTEGER NOT NULL DEFAULT 0,
-                cached INTEGER NOT NULL DEFAULT 0, error_type TEXT
+                cached INTEGER NOT NULL DEFAULT 0, error_type TEXT,
+                canary_used INTEGER NOT NULL DEFAULT 0, actual_cost_usd REAL,
+                cost_reconciliation_id TEXT, cost_reconciled_at TEXT
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_requests_time ON requests(occurred_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_requests_application ON requests(application)")
             columns = {row[1] for row in db.execute("PRAGMA table_info(requests)")}
             if "cost_center" not in columns:
                 db.execute("ALTER TABLE requests ADD COLUMN cost_center TEXT")
+            for column, declaration in (("canary_used", "INTEGER NOT NULL DEFAULT 0"),
+                                        ("actual_cost_usd", "REAL"),
+                                        ("cost_reconciliation_id", "TEXT"),
+                                        ("cost_reconciled_at", "TEXT")):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE requests ADD COLUMN {column} {declaration}")
             db.execute("""CREATE TABLE IF NOT EXISTS budget_reservations (
                 request_id TEXT PRIMARY KEY, application TEXT NOT NULL,
                 amount_usd REAL NOT NULL, reserved_at TEXT NOT NULL, expires_at TEXT NOT NULL
@@ -86,11 +94,26 @@ class UsageStore:
     def record(self, record: dict[str, Any]) -> None:
         columns = ("request_id", "occurred_at", "application", "route", "provider", "model",
                    "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status",
-                   "latency_ms", "fallback_used", "cached", "error_type", "cost_center")
+                   "latency_ms", "fallback_used", "cached", "error_type", "cost_center", "canary_used")
         values = [record.get(c) for c in columns]
+        assignments = ",".join(f"{column}=excluded.{column}" for column in columns[1:])
         with self._lock, self._connect() as db:
-            db.execute(f"INSERT OR REPLACE INTO requests ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", values)
+            db.execute(f"INSERT INTO requests ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)}) "
+                       f"ON CONFLICT(request_id) DO UPDATE SET {assignments}", values)
             db.execute("DELETE FROM budget_reservations WHERE request_id = ?", (record["request_id"],))
+
+    def reconcile_costs(self, records: list[dict[str, Any]], source: str,
+                        reconciled_at: datetime | None = None) -> dict[str, Any]:
+        reconciled_at = reconciled_at or datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for item in records:
+                cursor = db.execute("""UPDATE requests SET actual_cost_usd=?, cost_reconciliation_id=?,
+                    cost_reconciled_at=? WHERE request_id=?""",
+                    (float(item["actual_cost_usd"]), source, reconciled_at.isoformat(), item["request_id"]))
+                if cursor.rowcount != 1:
+                    raise ValueError(f"Unknown request_id {item['request_id']!r}; batch was not applied")
+        return {"source": source, "reconciled_requests": len(records), "reconciled_at": reconciled_at.isoformat()}
 
     def check_budget_alerts(self, application: str, monthly_limit_usd: float,
                             thresholds: list[float] | None = None,
@@ -208,21 +231,26 @@ class UsageStore:
                 COALESCE(SUM(completion_tokens),0) AS completion_tokens,
                 COALESCE(SUM(total_tokens),0) AS total_tokens,
                 COALESCE(SUM(cost_usd),0) AS cost_usd,
+                COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd,
+                COALESCE(SUM(CASE WHEN actual_cost_usd IS NOT NULL THEN actual_cost_usd-cost_usd ELSE 0 END),0) AS cost_variance_usd,
+                COALESCE(SUM(actual_cost_usd IS NOT NULL),0) AS reconciled_requests,
                 COALESCE(AVG(cost_usd),0) AS avg_cost_usd,
                 COALESCE(AVG(latency_ms),0) AS avg_latency_ms,
                 COALESCE(SUM(status != 'success'),0) AS failures,
                 COALESCE(SUM(fallback_used),0) AS fallbacks,
                 COALESCE(SUM(cached),0) AS cache_hits
+                ,COALESCE(SUM(canary_used),0) AS canary_requests
                 FROM requests{where}""", values).fetchone())
             by_app = [dict(row) for row in db.execute(f"""SELECT application,
                 COUNT(*) AS requests, SUM(total_tokens) AS total_tokens,
-                SUM(cost_usd) AS cost_usd, SUM(status != 'success') AS failures,
+                SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd,
+                SUM(status != 'success') AS failures,
                 SUM(fallback_used) AS fallbacks FROM requests{where}
                 GROUP BY application ORDER BY cost_usd DESC""", values).fetchall()]
-            by_provider = [dict(row) for row in db.execute(f"SELECT COALESCE(provider,'unknown') AS provider, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd FROM requests{where} GROUP BY provider ORDER BY cost_usd DESC", values).fetchall()]
-            by_model = [dict(row) for row in db.execute(f"SELECT COALESCE(model,'unknown') AS model, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd FROM requests{where} GROUP BY model ORDER BY cost_usd DESC", values).fetchall()]
-            by_route = [dict(row) for row in db.execute(f"SELECT route, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd FROM requests{where} GROUP BY route ORDER BY cost_usd DESC", values).fetchall()]
-            by_cost_center = [dict(row) for row in db.execute(f"SELECT COALESCE(cost_center,'unassigned') AS cost_center, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd FROM requests{where} GROUP BY cost_center ORDER BY cost_usd DESC", values).fetchall()]
+            by_provider = [dict(row) for row in db.execute(f"SELECT COALESCE(provider,'unknown') AS provider, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd FROM requests{where} GROUP BY provider ORDER BY cost_usd DESC", values).fetchall()]
+            by_model = [dict(row) for row in db.execute(f"SELECT COALESCE(model,'unknown') AS model, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd FROM requests{where} GROUP BY model ORDER BY cost_usd DESC", values).fetchall()]
+            by_route = [dict(row) for row in db.execute(f"SELECT route, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd FROM requests{where} GROUP BY route ORDER BY cost_usd DESC", values).fetchall()]
+            by_cost_center = [dict(row) for row in db.execute(f"SELECT COALESCE(cost_center,'unassigned') AS cost_center, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd FROM requests{where} GROUP BY cost_center ORDER BY cost_usd DESC", values).fetchall()]
         summary["failure_rate"] = summary["failures"] / summary["requests"] if summary["requests"] else 0
         summary["fallback_rate"] = summary["fallbacks"] / summary["requests"] if summary["requests"] else 0
         summary["generated_at"] = datetime.now(UTC).isoformat()

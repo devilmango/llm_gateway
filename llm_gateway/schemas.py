@@ -5,6 +5,23 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 
+class CostReconciliationItem(BaseModel):
+    request_id: str = Field(min_length=1, max_length=120)
+    actual_cost_usd: float = Field(ge=0)
+
+
+class CostReconciliationRequest(BaseModel):
+    source: str = Field(min_length=1, max_length=120)
+    records: list[CostReconciliationItem] = Field(min_length=1, max_length=10_000)
+
+    @model_validator(mode="after")
+    def unique_request_ids(self) -> CostReconciliationRequest:
+        ids = [item.request_id for item in self.records]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Each request_id may appear only once per reconciliation batch")
+        return self
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | list[dict[str, Any]] | None = None

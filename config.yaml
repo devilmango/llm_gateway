@@ -137,6 +137,8 @@ routes:
   simple:
     model: gpt-4o-mini
     provider: openai
+    # Optional deterministic canary sample. Canary traffic bypasses response cache.
+    # canary: {provider: anthropic, model: claude-3-5-haiku-latest, traffic_percent: 5}
     fallbacks:
       - provider: gemini
         model: gemini-2.0-flash
