@@ -44,7 +44,8 @@ class GatewayService:
     async def acquire_application_quota(self, application: str, limit: int) -> None:
         await self.application_limiter.acquire(application, limit)
 
-    def budget_reservation(self, route_name: str, payload: dict[str, Any], policy: dict[str, Any]) -> float:
+    def budget_reservation(self, route_name: str, payload: dict[str, Any], policy: dict[str, Any],
+                           tenant_policy: dict[str, Any] | None = None) -> float:
         max_input_bytes = int(policy.get("max_input_bytes", 32_768))
         input_bytes = sum(len((content if isinstance(content, str) else
                                json.dumps(content, ensure_ascii=False)).encode("utf-8"))
@@ -60,7 +61,7 @@ class GatewayService:
         if requested_tokens > max_completion_tokens:
             raise ValueError(f"max_tokens exceeds application limit of {max_completion_tokens}")
         payload["max_tokens"] = requested_tokens
-        candidates = self.route_candidates(route_name)
+        candidates = self.route_candidates(route_name, tenant_policy=tenant_policy)
         # UTF-8 bytes conservatively bound input token count; use the most expensive
         # candidate because a fallback can serve the request instead of the primary.
         prices = [self.providers[c["provider"]].get("models", {}).get(c["model"], {}) for c in candidates]
@@ -68,7 +69,9 @@ class GatewayService:
         output_rate = max((float(p.get("output_cost_per_1m", 0)) for p in prices), default=0)
         return (input_bytes * input_rate + requested_tokens * output_rate) / 1_000_000
 
-    def route_candidates(self, route_name: str, request_id: str | None = None) -> list[dict[str, str]]:
+    def route_candidates(self, route_name: str, request_id: str | None = None,
+                         tenant_policy: dict[str, Any] | None = None,
+                         include_canary: bool = True) -> list[dict[str, str]]:
         if route_name not in self.routes:
             raise KeyError(route_name)
         route = self.routes[route_name]
@@ -78,7 +81,7 @@ class GatewayService:
             provider = candidate.get("provider")
             if provider not in self.providers:
                 raise ValueError(f"Route {route_name!r} refers to unknown provider {provider!r}")
-        canary = route.get("canary")
+        canary = route.get("canary") if include_canary else None
         if canary:
             percentage = float(canary.get("traffic_percent", 0))
             if not 0 <= percentage <= 100:
@@ -88,10 +91,28 @@ class GatewayService:
                 raise ValueError(f"Route {route_name!r} canary must reference a configured provider and model")
             # Without a request id return the union so budget reservations account for the
             # most expensive possible target. Live requests use a stable sample per request.
-            sampled = request_id is None or int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 < percentage
-            if sampled:
+            sampled = percentage > 0 and (request_id is None or
+                int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 < percentage)
+            if sampled and self._tenant_allows(canary_candidate, tenant_policy):
                 candidates = [canary_candidate, *candidates]
+        candidates = [candidate for candidate in candidates if self._tenant_allows(candidate, tenant_policy)]
+        if not candidates:
+            raise ValueError("Tenant data policy does not permit any provider/model candidate for this route")
         return candidates
+
+    def _tenant_allows(self, candidate: dict[str, str], tenant_policy: dict[str, Any] | None) -> bool:
+        if not tenant_policy:
+            return True
+        provider_name = candidate["provider"]
+        provider = self.providers[provider_name]
+        allowed_providers = tenant_policy.get("allowed_providers")
+        if allowed_providers is not None and provider_name not in allowed_providers:
+            return False
+        allowed_models = tenant_policy.get("allowed_models")
+        if allowed_models is not None and candidate["model"] not in allowed_models:
+            return False
+        allowed_regions = tenant_policy.get("allowed_regions")
+        return allowed_regions is None or provider.get("data_region", "global") in allowed_regions
 
     async def health_snapshot(self) -> dict[str, dict[str, float | int]]:
         return await self.provider_health.snapshot(list(self.providers))
@@ -124,17 +145,20 @@ class GatewayService:
                     (1.0 + float(sample.get("failure_rate", 0.0)) * 4.0), index)
         return [candidate for _, candidate in sorted(indexed, key=score)]
 
-    async def complete(self, route_name: str, payload: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
+    async def complete(self, route_name: str, payload: dict[str, Any], request_id: str | None = None,
+                       tenant_policy: dict[str, Any] | None = None) -> dict[str, Any]:
         route = self.routes[route_name]
         preferred = (route["provider"], route["model"])
-        candidates = await self._order_candidates(self.route_candidates(route_name, request_id))
+        candidates = await self._order_candidates(self.route_candidates(route_name, request_id, tenant_policy))
         canary_config = route.get("canary")
         canary_selected = bool(canary_config and request_id is not None and
-            int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 < float(canary_config.get("traffic_percent", 0)))
+            int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 <
+            float(canary_config.get("traffic_percent", 0)) and
+            {"provider": canary_config.get("provider"), "model": canary_config.get("model")} in candidates)
         if canary_selected:
             candidates = self._prioritize_canary(candidates, canary_config)
         cache_cfg = route.get("cache", {})
-        cache_key = self.cache.key(payload, preferred[0], preferred[1])
+        cache_key = self._cache_key(payload, preferred, candidates, tenant_policy)
         cache_safe = self.cache_safe_payload(payload) and not canary_selected
         if cache_cfg.get("enabled") and cache_safe:
             cached = await self.cache.get(cache_key)
@@ -199,18 +223,21 @@ class GatewayService:
                             raise
         raise ProviderError("All configured providers failed: " + "; ".join(errors), retryable=False)
 
-    async def stream_complete(self, route_name: str, payload: dict[str, Any], request_id: str | None = None):
+    async def stream_complete(self, route_name: str, payload: dict[str, Any], request_id: str | None = None,
+                              tenant_policy: dict[str, Any] | None = None):
         """Yield provider text deltas; retries/fallbacks stop once text was emitted."""
         route = self.routes[route_name]
         preferred = (route["provider"], route["model"])
-        candidates = await self._order_candidates(self.route_candidates(route_name, request_id))
+        candidates = await self._order_candidates(self.route_candidates(route_name, request_id, tenant_policy))
         canary_config = route.get("canary")
         canary_selected = bool(canary_config and request_id is not None and
-            int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 < float(canary_config.get("traffic_percent", 0)))
+            int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 <
+            float(canary_config.get("traffic_percent", 0)) and
+            {"provider": canary_config.get("provider"), "model": canary_config.get("model")} in candidates)
         if canary_selected:
             candidates = self._prioritize_canary(candidates, canary_config)
         cache_cfg = route.get("cache", {})
-        cache_key = self.cache.key(payload, preferred[0], preferred[1])
+        cache_key = self._cache_key(payload, preferred, candidates, tenant_policy)
         cache_safe = self.cache_safe_payload(payload) and not canary_selected
         if cache_cfg.get("enabled") and cache_safe:
             cached = await self.cache.get(cache_key)
@@ -297,6 +324,18 @@ class GatewayService:
     def _prioritize_canary(candidates: list[dict[str, str]], canary: dict[str, Any]) -> list[dict[str, str]]:
         target = {"provider": canary["provider"], "model": canary["model"]}
         return [target, *[candidate for candidate in candidates if candidate != target]]
+
+    def _cache_key(self, payload: dict[str, Any], preferred: tuple[str, str],
+                   candidates: list[dict[str, str]], tenant_policy: dict[str, Any] | None) -> str:
+        cache_payload = payload
+        if tenant_policy is not None:
+            cache_payload = {**payload, "_gateway_tenant_cache_scope": {
+                "tenant_id": tenant_policy.get("_tenant_id"), "candidates": candidates,
+                "allowed_providers": tenant_policy.get("allowed_providers"),
+                "allowed_models": tenant_policy.get("allowed_models"),
+                "allowed_regions": tenant_policy.get("allowed_regions"),
+            }}
+        return self.cache.key(cache_payload, preferred[0], preferred[1])
 
 
 class _SemaphoreLease:

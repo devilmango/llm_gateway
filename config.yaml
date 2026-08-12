@@ -17,11 +17,13 @@ routing:
 
 security:
   redact_pii: true
+  # gateway_api_key_file: /run/secrets/gateway-api-key
   # Configure GATEWAY_API_KEY in the environment to require gateway authentication.
   # For rotating admin credentials, multiple entries may overlap. Disable the old
   # entry after callers have moved to the replacement key.
   # admin_api_keys:
   #   - id: finance-reporting
+  #     api_key_file: /run/secrets/finance-reporting-key
   #     api_key_env: GATEWAY_FINANCE_KEY
   #     scopes: [report]
   #   - id: platform-operations
@@ -37,11 +39,17 @@ security:
   #   algorithms: [RS256]
 
 # Optional tenant credentials scope logical routes and application-level policies.
-# Each api_key_env must name a secret supplied to the gateway process.
+# Use api_key_env for environment-injected credentials, or secret_file for a mounted
+# secret file. Secret files are re-read on each authentication check and provider call.
 # tenants:
 #   support-team:
-#     api_key_env: SUPPORT_TEAM_GATEWAY_KEY
+#     secret_file: /run/secrets/support-team-gateway-key
 #     allowed_routes: [simple]
+#     allowed_providers: [openai, gemini]
+#     allowed_models: [gpt-4o-mini, gemini-2.0-flash]
+#     allowed_regions: [us]
+#     data_policy:
+#       usage_retention_days: 90
 #     default_policy:
 #       max_requests_per_minute: 120
 #       max_completion_tokens: 1000
@@ -71,6 +79,8 @@ providers:
     kind: openai
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
+    # Tag the configured deployment's data-processing region for tenant policy checks.
+    # data_region: us
     requests_per_minute: 600
     models:
       gpt-4o-mini:

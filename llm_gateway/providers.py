@@ -14,6 +14,7 @@ import httpx
 
 from .capabilities import provider_capabilities
 from .observability import PROVIDER_LATENCY, PROVIDER_REQUESTS
+from .secrets import SecretUnavailable, resolve_secret
 
 
 class ProviderError(Exception):
@@ -75,7 +76,10 @@ class ProviderClient:
     async def complete(self, provider_name: str, model: str, payload: dict[str, Any]) -> dict[str, Any]:
         cfg = self.providers[provider_name]
         kind = cfg["kind"]
-        key = os.getenv(cfg.get("api_key_env", "")) if cfg.get("api_key_env") else None
+        try:
+            key = await resolve_secret(cfg.get("api_key_env"), cfg.get("api_key_file")) or None
+        except SecretUnavailable as exc:
+            raise ProviderError(f"Provider {provider_name!r} credential is unavailable") from exc
         if kind not in {"bedrock"} and not key and kind != "vertex" and not cfg.get("api_key_optional", False):
             raise ProviderError(f"Provider {provider_name!r} has no API key configured")
         base = (cfg.get("base_url") or "").rstrip("/")
@@ -115,7 +119,10 @@ class ProviderClient:
             root = base or f"https://{region}-aiplatform.googleapis.com/v1"
             url = f"{root}/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent"
             token_env = cfg.get("access_token_env", "GOOGLE_CLOUD_ACCESS_TOKEN")
-            token = os.getenv(token_env, "")
+            try:
+                token = await resolve_secret(token_env, cfg.get("access_token_file"))
+            except SecretUnavailable as exc:
+                raise ProviderError("Vertex access token is unavailable") from exc
             if not token:
                 raise ProviderError(f"Vertex provider requires an access token in {token_env}")
             headers["Authorization"] = f"Bearer {token}"
@@ -127,7 +134,16 @@ class ProviderClient:
                 raise ProviderError("Bedrock provider requires region or AWS_REGION")
             url = f"{base or f'https://bedrock-runtime.{region}.amazonaws.com'}/model/{quote(model, safe='-_.~')}/converse"
             provider_payload = self._bedrock_payload(payload)
-            self._sign_aws_request(url, provider_payload, headers, region)
+            try:
+                access_key = await resolve_secret(cfg.get("access_key_env", "AWS_ACCESS_KEY_ID"),
+                                                  cfg.get("access_key_file"))
+                secret_key = await resolve_secret(cfg.get("secret_key_env", "AWS_SECRET_ACCESS_KEY"),
+                                                  cfg.get("secret_key_file"))
+                session_token = await resolve_secret(cfg.get("session_token_env", "AWS_SESSION_TOKEN"),
+                                                     cfg.get("session_token_file"))
+            except SecretUnavailable as exc:
+                raise ProviderError("Bedrock credential is unavailable") from exc
+            self._sign_aws_request(url, provider_payload, headers, region, access_key, secret_key, session_token)
             normalize_kind = "bedrock"
         else:
             raise ProviderError(f"Unsupported provider kind {kind!r}")
@@ -174,7 +190,10 @@ class ProviderClient:
         self.validate_capabilities(provider_name, payload, streaming=True)
         if kind == "bedrock":
             raise ProviderError("Bedrock streaming is not available for this adapter", retryable=False)
-        key = os.getenv(cfg.get("api_key_env", "")) if cfg.get("api_key_env") else None
+        try:
+            key = await resolve_secret(cfg.get("api_key_env"), cfg.get("api_key_file")) or None
+        except SecretUnavailable as exc:
+            raise ProviderError(f"Provider {provider_name!r} credential is unavailable") from exc
         if kind not in {"bedrock", "vertex"} and not key and not cfg.get("api_key_optional", False):
             raise ProviderError(f"Provider {provider_name!r} has no API key configured")
         headers = {"Content-Type": "application/json"}
@@ -209,7 +228,10 @@ class ProviderClient:
             region = cfg.get("region", "us-central1")
             project = cfg.get("project_id", "")
             token_env = cfg.get("access_token_env", "GOOGLE_CLOUD_ACCESS_TOKEN")
-            token = os.getenv(token_env, "")
+            try:
+                token = await resolve_secret(token_env, cfg.get("access_token_file"))
+            except SecretUnavailable as exc:
+                raise ProviderError("Vertex access token is unavailable") from exc
             if not project or not token:
                 raise ProviderError("Vertex streaming requires project_id and an access token")
             root = base or f"https://{region}-aiplatform.googleapis.com/v1"
@@ -422,10 +444,8 @@ class ProviderClient:
         return result
 
     @staticmethod
-    def _sign_aws_request(url: str, payload: dict[str, Any], headers: dict[str, str], region: str) -> None:
-        access_key = os.getenv("AWS_ACCESS_KEY_ID", "")
-        secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-        token = os.getenv("AWS_SESSION_TOKEN", "")
+    def _sign_aws_request(url: str, payload: dict[str, Any], headers: dict[str, str], region: str,
+                          access_key: str, secret_key: str, token: str = "") -> None:
         if not access_key or not secret_key:
             raise ProviderError("Bedrock requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")

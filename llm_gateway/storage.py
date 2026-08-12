@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .config import MIN_TENANT_USAGE_RETENTION_DAYS
+
 
 class BudgetExceeded(Exception):
     pass
@@ -95,12 +97,24 @@ class UsageStore:
         columns = ("request_id", "occurred_at", "application", "route", "provider", "model",
                    "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status",
                    "latency_ms", "fallback_used", "cached", "error_type", "cost_center", "canary_used")
-        values = [record.get(c) for c in columns]
+        values = [record.get(c, 0 if c == "canary_used" else None) for c in columns]
         assignments = ",".join(f"{column}=excluded.{column}" for column in columns[1:])
         with self._lock, self._connect() as db:
             db.execute(f"INSERT INTO requests ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)}) "
                        f"ON CONFLICT(request_id) DO UPDATE SET {assignments}", values)
             db.execute("DELETE FROM budget_reservations WHERE request_id = ?", (record["request_id"],))
+
+    def prune_tenant_requests(self, tenant_id: str, retention_days: int,
+                              now: datetime | None = None) -> int:
+        if int(retention_days) < MIN_TENANT_USAGE_RETENTION_DAYS:
+            raise ValueError(f"usage_retention_days must be at least {MIN_TENANT_USAGE_RETENTION_DAYS}")
+        now = now or datetime.now(UTC)
+        cutoff = (now - timedelta(days=int(retention_days))).isoformat()
+        prefix = f"{tenant_id}:"
+        with self._lock, self._connect() as db:
+            cursor = db.execute("DELETE FROM requests WHERE substr(application,1,length(?))=? AND occurred_at < ?",
+                                (prefix, prefix, cutoff))
+            return cursor.rowcount
 
     def reconcile_costs(self, records: list[dict[str, Any]], source: str,
                         reconciled_at: datetime | None = None) -> dict[str, Any]:

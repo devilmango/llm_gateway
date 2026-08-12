@@ -51,7 +51,8 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Latency-aware routing | Optionally order a route's primary and fallback candidates using shared provider EWMA latency and failure-rate signals. |
 | Canary routing and evaluation | Deterministically send a configured share of requests to a candidate provider/model; evaluate JSONL prompt sets by pass rate, latency, and estimated cost using `llm-gateway-eval`. |
 | Streaming | Stream OpenAI-compatible, Azure, Anthropic, Gemini, and Vertex output as server-sent events, including tool-call and audio deltas where supported; account usage at completion. |
-| Tenant access controls | Configure per-tenant bearer credentials, route allowlists, application allowlists, and tenant-specific budget/limit policies. |
+| Tenant data policies | Restrict tenants to allowed routes, providers, models, and tagged processing regions; automatically expire tenant usage metadata on a per-tenant retention schedule. |
+| Dynamic credential rotation | Re-read mounted provider, tenant, gateway, and scoped-admin secret files on each use so CSI/agent-managed secret rotations take effect without restarting the gateway. |
 | Tool calling and structured outputs | Pass OpenAI-style function definitions and JSON response schemas; adapters translate them for OpenAI-compatible, Anthropic, and Gemini providers. Tool execution stays in the calling application. |
 | Durable budget alert webhooks | Persist threshold events in an outbox, retry transient failures with backoff, optionally sign with HMAC-SHA256, and inspect or redrive dead letters. |
 | Response cache | Optionally cache a route's completion for a configured TTL. Cache hits have zero upstream usage and cost in the ledger. |
@@ -114,11 +115,11 @@ Useful local URLs:
 
 To require a key from gateway clients, set `GATEWAY_API_KEY` in the gateway process and send it as a bearer token. The health endpoint remains public for liveness probes.
 
-For tenant-level access, define `tenants` in the YAML configuration. Each tenant maps an API key environment variable to allowed logical routes and application policy overrides. When tenants are configured, `/v1/chat/completions` and `/v1/routes` require a matching tenant key; admin endpoints require a separate `GATEWAY_API_KEY` or configured scoped admin key.
+For tenant-level access, define `tenants` in the YAML configuration. Each tenant can use an environment variable or a mounted `secret_file` for its bearer key, then define route, provider, model, region, and application allowlists. When tenants are configured, `/v1/chat/completions` and `/v1/routes` require a matching tenant key; admin endpoints require a separate `GATEWAY_API_KEY` or configured scoped admin key.
 
 ## Configuration
 
-Edit `config.yaml`. Provider credentials are read from environment variables named by each provider's `api_key_env`; do not put API keys in the YAML file.
+Edit `config.yaml`. Provider credentials can come from environment variables named by `api_key_env`, or from a mounted secret file named by `api_key_file`; do not put API keys in the YAML file. File-backed credentials are re-read for each provider request and authentication check.
 
 ```yaml
 server:
@@ -171,11 +172,16 @@ routes:
 routing:
   strategy: primary_first # or latency_aware
 
-# Optional tenant configuration. Keep key values in the process environment.
+# Optional tenant configuration. Use mounted secret files for live rotation.
 tenants:
   support-team:
-    api_key_env: SUPPORT_TEAM_GATEWAY_KEY
+    secret_file: /run/secrets/support-team-gateway-key
     allowed_routes: [simple]
+    allowed_providers: [openai, gemini]
+    allowed_models: [gpt-4o-mini, gemini-2.0-flash]
+    allowed_regions: [global]
+    data_policy:
+      usage_retention_days: 90
     default_policy:
       max_requests_per_minute: 120
       max_completion_tokens: 1000
@@ -186,6 +192,8 @@ tenants:
 ```
 
 Each route has a primary `provider` and `model`, an ordered optional `fallbacks` list, and optional cache settings. A route can also define a `canary` with `provider`, `model`, and `traffic_percent` from 0 to 100. A request ID hash makes sampling stable for that request; selected canary traffic bypasses route caching and falls back to the configured primary/fallback candidates if needed. Provider `kind` values include `openai`, `azure_openai`, `vllm`, `anthropic`, `gemini`, `vertex`, and `bedrock`.
+
+`allowed_providers`, `allowed_models`, and `allowed_regions` are optional tenant restrictions and apply to the route's primary, canary, and fallback candidates. Set each provider's `data_region` to the region where that deployment processes tenant data; untagged providers are treated as `global`. The gateway uses these tags as operator-supplied policy metadata and does not independently verify provider residency. Tenant `data_policy.usage_retention_days` removes old usage metadata every 24 hours. The minimum is 35 days to preserve full current-month budget accounting; prompt and completion content is not stored in the ledger.
 
 ### Pricing configuration
 
@@ -386,11 +394,12 @@ When Redis is configured, circuit states and the single half-open recovery probe
 ## Security and privacy
 
 - Set `GATEWAY_API_KEY` to protect all `/v1` endpoints with bearer authentication.
-- Configure `security.admin_api_keys` for scoped admin access. Supported scopes are `report`, `budgets`, `providers`, `webhooks`, and `audit`. Rotate by enabling a replacement key before disabling the old entry; entries take effect on process restart.
+- Configure `security.admin_api_keys` for scoped admin access. Supported scopes are `report`, `budgets`, `providers`, `webhooks`, and `audit`. Rotate by enabling a replacement key before disabling the old entry; changing the configured key list requires a restart, while changing a referenced secret file takes effect on the next request.
 - Configure `security.oidc` with issuer, audience, and JWKS URL to validate signed JWTs. Admin tokens need `llm-gateway:<scope>` or `admin:*`; client access uses the `client` scope when OIDC is enabled without tenant keys. Access tokens are validated offline, so revocation takes effect when the token expires unless the identity provider issues a replacement or rejection is reflected by a new JWKS key set.
 - Authenticated admin calls are recorded in the audit table and exposed at `/v1/admin/audit`. The audit log stores actor, path, status, and time; it omits tokens, prompts, and request bodies.
 - When using tenant credentials, configure separate admin credentials; tenant keys are restricted to allowed routes and applications.
 - Keep provider credentials in environment variables or a secrets manager. Do not commit credentials or `.env` files.
+- For live rotation, configure `api_key_file` on providers/admin keys, `access_token_file` for Vertex, `access_key_file`/`secret_key_file`/`session_token_file` for Bedrock, `secret_file` on tenants, or `security.gateway_api_key_file`. Point these at files maintained by a secrets manager integration such as a CSI secret mount or Vault Agent. File values take precedence over environment values and are re-read at each use; the gateway does not cache credentials.
 - With `security.redact_pii: true`, the gateway pattern-redacts common email, phone-like, and API-key strings in message text **before forwarding it to the model**.
 - Redaction is pattern-based and is not a full data loss prevention system. Review whether this protection is sufficient for your data and use case.
 - Prompts and completions are not written to the usage database or application logs. Avoid enabling HTTP wire-level logging in production.
@@ -445,6 +454,8 @@ Suggested next milestones, ordered by production value:
 - [x] Share concurrency leases and circuit-breaker state through Redis.
 - [x] Add deterministic canary routing and a JSONL route evaluation CLI.
 - [x] Import actual provider charges and report reconciled cost variance.
+- [x] Re-read provider, tenant, gateway, and admin credentials from rotated secret files.
+- [x] Enforce tenant provider/model/region allowlists and usage metadata retention policies.
 
 ## Contributing
 

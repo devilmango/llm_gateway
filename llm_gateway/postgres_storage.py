@@ -6,6 +6,7 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from .config import MIN_TENANT_USAGE_RETENTION_DAYS
 from .storage import BudgetExceeded
 
 
@@ -101,7 +102,7 @@ class PostgresUsageStore:
         placeholders = ", ".join("%s" for _ in columns)
         with self.pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute(f"INSERT INTO requests ({','.join(columns)}) VALUES ({placeholders}) ON CONFLICT (request_id) DO UPDATE SET {assignments}",
-                           [record.get(column) for column in columns])
+                           [record.get(column, 0 if column == "canary_used" else None) for column in columns])
             cursor.execute("DELETE FROM budget_reservations WHERE request_id = %s", (record["request_id"],))
 
     def reconcile_costs(self, records: list[dict[str, Any]], source: str,
@@ -115,6 +116,18 @@ class PostgresUsageStore:
                 if cursor.rowcount != 1:
                     raise ValueError(f"Unknown request_id {item['request_id']!r}; batch was not applied")
         return {"source": source, "reconciled_requests": len(records), "reconciled_at": reconciled_at.isoformat()}
+
+    def prune_tenant_requests(self, tenant_id: str, retention_days: int,
+                              now: datetime | None = None) -> int:
+        if int(retention_days) < MIN_TENANT_USAGE_RETENTION_DAYS:
+            raise ValueError(f"usage_retention_days must be at least {MIN_TENANT_USAGE_RETENTION_DAYS}")
+        now = now or datetime.now(UTC)
+        cutoff = (now - timedelta(days=int(retention_days))).isoformat()
+        prefix = f"{tenant_id}:"
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("DELETE FROM requests WHERE left(application, length(%s))=%s AND occurred_at < %s",
+                           (prefix, prefix, cutoff))
+            return cursor.rowcount
 
     def check_budget_alerts(self, application: str, monthly_limit_usd: float,
                             thresholds: list[float] | None = None,

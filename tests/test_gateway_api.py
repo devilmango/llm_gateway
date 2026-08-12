@@ -1071,3 +1071,112 @@ async def test_circuit_breaker_state_is_shared_in_redis():
     assert not await second.allow("provider")
     assert (await second.snapshot())["provider"]["state"] == "open"
     await redis.aclose()
+
+
+@pytest.mark.asyncio
+async def test_provider_credential_file_rotation_takes_effect_without_recreating_client(tmp_path):
+    secret_file = tmp_path / "openai-key"
+    secret_file.write_text("key-v1\n", encoding="utf-8")
+    seen = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization"))
+        return success_response()
+
+    provider = {"primary": {"kind": "openai", "base_url": "https://primary.test/v1",
+        "api_key_file": str(secret_file), "models": {"primary-model": {}}}}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+        client = ProviderClient(http, provider, 2)
+        await client.complete("primary", "primary-model", {"messages": [{"role": "user", "content": "hello"}]})
+        secret_file.write_text("key-v2\n", encoding="utf-8")
+        await client.complete("primary", "primary-model", {"messages": [{"role": "user", "content": "hello"}]})
+    assert seen == ["Bearer key-v1", "Bearer key-v2"]
+
+
+@pytest.mark.asyncio
+async def test_tenant_secret_file_rotation_rejects_old_key_immediately(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch_path = tmp_path / "tenant-key"
+    monkeypatch_path.write_text("tenant-v1\n", encoding="utf-8")
+    cfg = config(str(tmp_path / "tenant-rotation.sqlite3"))
+    cfg["tenants"] = {"support": {"secret_file": str(monkeypatch_path), "allowed_routes": ["simple"],
+        "applications": {"support-router": {}}}}
+    async with gateway_client(cfg, httpx.MockTransport(lambda request: success_response())) as client:
+        payload = {"model": "simple", "application": "support-router",
+                   "messages": [{"role": "user", "content": "hello"}]}
+        assert (await client.post("/v1/chat/completions", json=payload,
+                                  headers={"Authorization": "Bearer tenant-v1"})).status_code == 200
+        monkeypatch_path.write_text("tenant-v2\n", encoding="utf-8")
+        assert (await client.post("/v1/chat/completions", json=payload,
+                                  headers={"Authorization": "Bearer tenant-v1"})).status_code == 401
+        assert (await client.post("/v1/chat/completions", json=payload,
+                                  headers={"Authorization": "Bearer tenant-v2"})).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_tenant_provider_model_and_region_policies_filter_routes(tmp_path, monkeypatch):
+    monkeypatch.setenv("EU_CUSTOMER_KEY", "eu-key")
+    monkeypatch.setenv("OPEN_CUSTOMER_KEY", "open-key")
+    monkeypatch.setenv("APAC_CUSTOMER_KEY", "apac-key")
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    cfg = config(str(tmp_path / "tenant-data-policy.sqlite3"))
+    cfg["routes"]["simple"]["cache"] = {"enabled": True, "ttl_seconds": 30}
+    cfg["providers"]["primary"]["data_region"] = "us"
+    cfg["providers"]["backup"]["data_region"] = "eu"
+    cfg["tenants"] = {
+        "open-customer": {"api_key_env": "OPEN_CUSTOMER_KEY", "allowed_routes": ["simple"],
+            "applications": {"support-router": {}}},
+        "eu-customer": {"api_key_env": "EU_CUSTOMER_KEY", "allowed_routes": ["simple"],
+            "allowed_providers": ["backup"], "allowed_models": ["backup-model"], "allowed_regions": ["eu"],
+            "applications": {"support-router": {}}},
+        "apac-customer": {"api_key_env": "APAC_CUSTOMER_KEY", "allowed_routes": ["simple"],
+            "allowed_regions": ["apac"], "applications": {"support-router": {}}},
+    }
+    hosts = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return success_response()
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        open_headers = {"Authorization": "Bearer open-key"}
+        eu_headers = {"Authorization": "Bearer eu-key"}
+        routes = (await client.get("/v1/routes", headers=eu_headers)).json()
+        assert routes["simple"]["provider"] == "backup"
+        assert routes["simple"]["model"] == "backup-model"
+        assert routes["simple"]["fallbacks"] == []
+        payload = {
+            "model": "simple", "application": "support-router",
+            "messages": [{"role": "user", "content": "hello"}]}
+        assert (await client.post("/v1/chat/completions", headers=open_headers, json=payload)).status_code == 200
+        response = await client.post("/v1/chat/completions", headers=eu_headers, json=payload)
+        assert response.status_code == 200
+        assert hosts == ["primary.test", "backup.test"]
+        apac_headers = {"Authorization": "Bearer apac-key"}
+        assert (await client.get("/v1/routes", headers=apac_headers)).json() == {}
+        denied = await client.post("/v1/chat/completions", headers=apac_headers, json=payload)
+        assert denied.status_code == 403
+        assert hosts == ["primary.test", "backup.test"]
+
+
+def test_tenant_usage_retention_prunes_only_the_tenant_prefix(tmp_path):
+    store = create_usage_store(str(tmp_path / "retention.sqlite3"))
+    old_time = datetime(2026, 1, 1, tzinfo=UTC)
+    base = {"occurred_at": old_time.isoformat(), "route": "simple", "provider": "primary",
+        "model": "primary-model", "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2,
+        "cost_usd": 0.0001, "status": "success", "latency_ms": 1,
+        "fallback_used": 0, "cached": 0, "canary_used": 0}
+    store.record({**base, "request_id": "tenant-request", "application": "support:app"})
+    store.record({**base, "request_id": "other-request", "application": "other:app"})
+    deleted = store.prune_tenant_requests("support", 35, datetime(2026, 3, 1, tzinfo=UTC))
+    assert deleted == 1
+    assert store.report(None, None, "support:app")["requests"] == 0
+    assert store.report(None, None, "other:app")["requests"] == 1
+
+
+def test_tenant_usage_retention_must_preserve_current_month_budget_window(tmp_path):
+    cfg = config(str(tmp_path / "invalid-retention.sqlite3"))
+    cfg["tenants"] = {"short": {"data_policy": {"usage_retention_days": 7}}}
+    with pytest.raises(ValueError, match="at least 35"):
+        create_app(cfg, http_transport=httpx.MockTransport(lambda request: success_response()))

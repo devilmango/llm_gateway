@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from opentelemetry import trace
 
 from .capabilities import provider_capabilities
-from .config import load_config
+from .config import load_config, validate_tenant_policies
 from .dashboard import OPERATIONS_DASHBOARD
 from .distributed import RateLimitBackendUnavailable
 from .limiting import RateLimitExceeded
@@ -44,6 +44,7 @@ from .schemas import (
     CostReconciliationRequest,
     Usage,
 )
+from .secrets import SecretUnavailable, resolve_secret
 from .service import GatewayService
 from .storage import BudgetExceeded, create_usage_store
 
@@ -101,16 +102,36 @@ async def _webhook_delivery_loop(app: FastAPI) -> None:
         await asyncio.sleep(1)
 
 
+async def _tenant_retention_loop(app: FastAPI, tenants: dict[str, Any]) -> None:
+    while True:
+        for tenant_id, tenant in tenants.items():
+            retention_days = tenant.get("data_policy", {}).get("usage_retention_days")
+            if retention_days is None:
+                continue
+            try:
+                deleted = await asyncio.to_thread(app.state.store.prune_tenant_requests,
+                                                  tenant_id, int(retention_days))
+                if deleted:
+                    logger.info("tenant_usage_retention tenant=%s deleted=%s", redact(tenant_id), deleted)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("tenant_usage_retention_failed tenant=%s", redact(tenant_id))
+        await asyncio.sleep(24 * 60 * 60)
+
+
 def create_app(config: dict[str, Any] | None = None,
                http_transport: httpx.AsyncBaseTransport | None = None,
                shared_redis: Any | None = None) -> FastAPI:
     cfg = config or load_config()
+    validate_tenant_policies(cfg)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         timeout = httpx.Timeout(float(cfg["server"].get("request_timeout_seconds", 45)))
         app.state.http = httpx.AsyncClient(timeout=timeout, transport=http_transport)
         app.state.webhook_task = None
+        app.state.retention_task = None
         redis_client = shared_redis
         owns_redis = False
         app.state.store = None
@@ -127,14 +148,17 @@ def create_app(config: dict[str, Any] | None = None,
             database = os.getenv("GATEWAY_DATABASE", cfg["server"].get("database", "./gateway.sqlite3"))
             app.state.store = create_usage_store(database)
             app.state.webhook_task = asyncio.create_task(_webhook_delivery_loop(app))
+            app.state.retention_task = asyncio.create_task(
+                _tenant_retention_loop(app, cfg.get("tenants", cfg.get("security", {}).get("tenants", {}))))
             yield
         finally:
-            if app.state.webhook_task:
-                app.state.webhook_task.cancel()
-                try:
-                    await app.state.webhook_task
-                except asyncio.CancelledError:
-                    pass
+            for task in (app.state.webhook_task, app.state.retention_task):
+                if task:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
             await app.state.http.aclose()
             if owns_redis and redis_client:
                 await redis_client.aclose()
@@ -147,6 +171,12 @@ def create_app(config: dict[str, Any] | None = None,
 
     def configured_tenants() -> dict[str, Any]:
         return cfg.get("tenants", cfg.get("security", {}).get("tenants", {}))
+
+    async def configured_secret(env_name: str | None, file_path: str | None) -> str:
+        try:
+            return await resolve_secret(env_name, file_path)
+        except SecretUnavailable as exc:
+            raise HTTPException(status_code=503, detail="Configured credential is unavailable") from exc
 
     async def validate_admin(authorization: str | None, scope: str = "") -> str:
         provided = authorization.removeprefix("Bearer ") if authorization else ""
@@ -176,14 +206,15 @@ def create_app(config: dict[str, Any] | None = None,
         key_records = cfg.get("security", {}).get("admin_api_keys", [])
         if key_records:
             for record in key_records:
-                expected = os.getenv(record.get("api_key_env", ""), "") if record.get("enabled", True) else ""
+                expected = await configured_secret(record.get("api_key_env"), record.get("api_key_file")) \
+                    if record.get("enabled", True) else ""
                 if expected and hmac.compare_digest(provided, expected):
                     scopes = set(record.get("scopes", []))
                     if "*" not in scopes and scope not in scopes:
                         raise HTTPException(status_code=403, detail="Admin key lacks required scope")
                     return str(record.get("id", "scoped-admin-key"))
             raise HTTPException(status_code=401, detail="Invalid gateway credentials")
-        expected = os.getenv("GATEWAY_API_KEY")
+        expected = await configured_secret("GATEWAY_API_KEY", cfg.get("security", {}).get("gateway_api_key_file"))
         if configured_tenants() and not expected:
             raise HTTPException(status_code=503, detail="Admin API key is not configured")
         if expected and not hmac.compare_digest(provided, expected):
@@ -200,8 +231,8 @@ def create_app(config: dict[str, Any] | None = None,
         if tenants:
             provided = authorization.removeprefix("Bearer ") if authorization else ""
             for tenant_id, tenant in tenants.items():
-                env_name = tenant.get("api_key_env")
-                expected = os.getenv(env_name, "") if env_name else ""
+                expected = await configured_secret(tenant.get("api_key_env"),
+                                                   tenant.get("secret_file", tenant.get("api_key_file")))
                 if expected and hmac.compare_digest(provided, expected):
                     return {"id": tenant_id, "config": tenant}
             raise HTTPException(status_code=401, detail="Invalid tenant credentials")
@@ -253,14 +284,26 @@ def create_app(config: dict[str, Any] | None = None,
         return Response(content=body, media_type=content_type)
 
     @app.get("/v1/routes")
-    async def routes(tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
+    async def routes(request: Request,
+                     tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
         allowed_routes = set(tenant["config"].get("allowed_routes", [])) if tenant else set(cfg["routes"])
-        return {name: {"provider": route["provider"], "model": route["model"],
-                       "capabilities": provider_capabilities(cfg["providers"][route["provider"]]),
-                       "fallbacks": [{**candidate, "capabilities": provider_capabilities(cfg["providers"][candidate["provider"]])}
-                                     for candidate in route.get("fallbacks", [])],
-                       "cache": route.get("cache", {})}
-                for name, route in cfg["routes"].items() if name in allowed_routes}
+        visible = {}
+        for name, route in cfg["routes"].items():
+            if name not in allowed_routes:
+                continue
+            try:
+                candidates = request.app.state.gateway.route_candidates(
+                    name, request_id="route-catalog", tenant_policy=tenant["config"] if tenant else None,
+                    include_canary=False)
+            except ValueError:
+                continue
+            primary, *fallbacks = candidates
+            visible[name] = {**primary,
+                "capabilities": provider_capabilities(cfg["providers"][primary["provider"]]),
+                "fallbacks": [{**candidate,
+                    "capabilities": provider_capabilities(cfg["providers"][candidate["provider"]])}
+                    for candidate in fallbacks], "cache": route.get("cache", {})}
+        return visible
 
     @app.post("/v1/chat/completions", response_model=None)
     async def chat(body: ChatRequest, request: Request,
@@ -288,7 +331,7 @@ def create_app(config: dict[str, Any] | None = None,
         app_name = body.application.strip() or "default"
         cost_center = body.cost_center.strip() if body.cost_center else None
         if tenant:
-            tenant_cfg = tenant["config"]
+            tenant_cfg = {**tenant["config"], "_tenant_id": tenant["id"]}
             if route_name not in tenant_cfg.get("allowed_routes", []):
                 raise HTTPException(status_code=403, detail="Tenant is not permitted to use this route")
             tenant_apps = tenant_cfg.get("applications", {})
@@ -297,6 +340,12 @@ def create_app(config: dict[str, Any] | None = None,
             ledger_app_name = f"{tenant['id']}:{app_name}"
         else:
             tenant_cfg, tenant_apps, ledger_app_name = {}, {}, app_name
+        if tenant:
+            try:
+                request.app.state.gateway.route_candidates(route_name, request_id, tenant_cfg)
+            except (KeyError, ValueError) as exc:
+                raise HTTPException(status_code=403,
+                    detail="Tenant data policy does not permit this provider/model route") from exc
         IN_FLIGHT.inc()
         span = TRACER.start_span("llm.gateway.request")
         span.set_attribute("llm.gateway.request_id", request_id)
@@ -315,7 +364,8 @@ def create_app(config: dict[str, Any] | None = None,
                 await request.app.state.gateway.acquire_application_quota(ledger_app_name, int(app_rate))
             monthly_limit = policy.get("monthly_limit_usd")
             if monthly_limit is not None:
-                reservation = request.app.state.gateway.budget_reservation(route_name, upstream_payload, policy)
+                reservation = request.app.state.gateway.budget_reservation(route_name, upstream_payload, policy,
+                                                                            tenant_cfg if tenant else None)
                 await asyncio.to_thread(request.app.state.store.reserve_budget, request_id, ledger_app_name,
                                         reservation, float(monthly_limit))
             if body.stream:
@@ -329,7 +379,8 @@ def create_app(config: dict[str, Any] | None = None,
                             "created": int(time.time()), "model": route_name,
                             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}) + "\n\n"
                         with trace.use_span(span, end_on_exit=False):
-                            async for item in request.app.state.gateway.stream_complete(route_name, upstream_payload, request_id):
+                            async for item in request.app.state.gateway.stream_complete(route_name, upstream_payload,
+                                                                                       request_id, tenant_cfg if tenant else None):
                                 if item.get("final"):
                                     stream_result = item
                                     usage = item.get("usage", {})
@@ -409,7 +460,8 @@ def create_app(config: dict[str, Any] | None = None,
                 return StreamingResponse(event_stream(), media_type="text/event-stream",
                                          headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
             with trace.use_span(span, end_on_exit=False):
-                result = await request.app.state.gateway.complete(route_name, upstream_payload, request_id)
+                result = await request.app.state.gateway.complete(route_name, upstream_payload, request_id,
+                                                                  tenant_cfg if tenant else None)
             usage = result["usage"]
             provider = result["provider"]
             model = result["model"]
