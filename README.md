@@ -333,6 +333,29 @@ llm-gateway-eval prompts.jsonl --url http://localhost:8000 --output eval-report.
 
 The runner prints per-route pass rate, average and p95 latency, failures, and estimated cost. Expected-text checks are a simple deterministic baseline; use a curated dataset or external judge for semantic quality evaluation.
 
+Compare a candidate route with a baseline on the same prompts and fail the command if promotion thresholds are missed:
+
+```bash
+llm-gateway-eval prompts.jsonl --compare simple reasoning \
+  --min-pass-rate 0.95 --max-cost-regression-percent 20 \
+  --max-latency-regression-percent 15 --max-failure-rate 0.01 \
+  --output route-comparison.json
+```
+
+The candidate is evaluated against the dataset's `expected_contains` and `expected_not_contains` checks. Cost and average latency regression are measured against the baseline; the failure-rate gate counts gateway/API errors. The command exits nonzero when a candidate check or configured gate fails. These deterministic checks are useful for rollout regression control, but do not replace semantic evaluation by a human or a separately managed judge.
+
+### Idempotent requests
+
+Send an `Idempotency-Key` header to prevent caller retries from generating another completion or charge:
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: support-ticket-9842' \
+  -d '{"model":"simple","application":"support-router","messages":[{"role":"user","content":"Summarize this ticket"}]}'
+```
+
+The key is scoped to the tenant and application, and bound to the complete request body. Reusing it with a different body returns `409`. A concurrent or interrupted request also returns `409` on retry for the remainder of the configured TTL (`server.idempotency_ttl_seconds`, default 86,400 seconds), avoiding a second potentially billable generation. Completed JSON and SSE responses are replayed. Without Redis, records are process-local; configure Redis to share idempotency state across replicas. Because response bodies are retained for replay, choose a TTL and Redis retention policy appropriate for the sensitivity of completions.
+
 ```json
 {
   "requests": 18421,
@@ -365,7 +388,7 @@ Tenant application names are scoped in the ledger as `<tenant-id>:<application>`
 
 Add `alert_webhook_url` to the matching application policy to put each newly crossed `alert_thresholds` event in the persistent outbox. Optionally set `alert_webhook_secret_env` to the name of an environment variable containing a shared secret. A worker POSTs compact JSON with the `X-LLM-Gateway-Signature: sha256=<hex>` header and a stable `Idempotency-Key`. Transient HTTP 429/5xx and network failures are retried with exponential backoff; after eight failed attempts an event enters the dead-letter queue. Permanent 4xx responses go directly to dead letter. Delivery does not block or fail the model request. Inspect `/v1/admin/webhooks` and redrive dead letters after fixing the receiver. Configure webhook URLs only in trusted gateway configuration.
 
-Set `"stream": true` on a chat request to receive OpenAI-compatible SSE frames (`data: ...`) followed by `[DONE]`. Native streaming is supported for OpenAI-compatible, Anthropic, and Gemini APIs. The gateway can move to a fallback before sending text. After the first text delta, provider failures are returned as an SSE `error` event because replaying a second provider response could duplicate output. Token usage is included when the upstream sends final usage metadata.
+Set `"stream": true` on a chat request to receive OpenAI-compatible SSE frames (`data: ...`) followed by `[DONE]`. Native streaming is supported for OpenAI-compatible, Anthropic, and Gemini APIs. The gateway can move to a fallback before sending text. After the first text delta, provider failures are returned as an SSE `error` event because replaying a second provider response could duplicate output. Token usage is included when the upstream sends usage metadata. If the client disconnects, the gateway cancels upstream iteration where supported, records the request as `cancelled`, and stores usage metadata received before cancellation; providers that only report usage at the end may have unknown or zero partial usage.
 
 Requests may include OpenAI-style `tools`, `tool_choice`, and `response_format`. The gateway translates function declarations, prior assistant tool calls, and tool-result messages for Anthropic and Gemini as well as OpenAI-compatible endpoints. Tool calls are returned in the normalized assistant response; the gateway never runs the requested function. `response_format` accepts `json_object` or `json_schema`. Streaming tool calls are currently rejected. Requests containing tool definitions or tool-call history bypass response caching to avoid replaying stale actions.
 

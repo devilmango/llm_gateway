@@ -14,9 +14,10 @@ import fakeredis.aioredis
 import httpx
 import pytest
 
-from llm_gateway.evaluation import evaluate_cases
+from llm_gateway.evaluation import compare_routes, evaluate_cases
 from llm_gateway.main import _deliver_webhook_batch, create_app
 from llm_gateway.providers import ProviderClient
+from llm_gateway.schemas import ChatRequest
 from llm_gateway.storage import create_usage_store
 
 
@@ -94,6 +95,33 @@ async def test_retries_then_falls_back_redacts_and_reports_usage(tmp_path, monke
         metrics = (await client.get("/metrics")).text
         assert 'llm_gateway_provider_requests_total{outcome="upstream_error",provider="primary"} 2.0' in metrics
         assert 'llm_gateway_provider_retries_total{provider="primary"} 1.0' in metrics
+
+
+@pytest.mark.asyncio
+async def test_idempotency_replays_success_and_rejects_key_reuse(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    calls = 0
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return success_response()
+
+    async with gateway_client(config(str(tmp_path / "idempotency.sqlite3")), httpx.MockTransport(upstream)) as client:
+        request = {"model": "simple", "application": "support-router",
+                   "messages": [{"role": "user", "content": "hello"}]}
+        first = await client.post("/v1/chat/completions", json=request,
+                                  headers={"Idempotency-Key": "checkout-42"})
+        replay = await client.post("/v1/chat/completions", json=request,
+                                   headers={"Idempotency-Key": "checkout-42"})
+        changed = {**request, "messages": [{"role": "user", "content": "different"}]}
+        conflict = await client.post("/v1/chat/completions", json=changed,
+                                     headers={"Idempotency-Key": "checkout-42"})
+        assert first.status_code == replay.status_code == 200
+        assert first.json() == replay.json()
+        assert calls == 1
+        assert conflict.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -348,10 +376,13 @@ def test_gemini_audio_input_translation_and_capability_registry():
 @pytest.mark.asyncio
 async def test_gemini_native_streaming_and_image_payload(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    upstream_calls = 0
     stream_body = ('data: {"candidates":[{"content":{"parts":[{"text":"gemini"}]}}],'
                    '"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":2,"totalTokenCount":4}}\n\n')
 
     def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
         assert request.url.path.endswith(":streamGenerateContent")
         assert request.url.params["alt"] == "sse"
         body = json.loads(request.content)
@@ -361,17 +392,80 @@ async def test_gemini_native_streaming_and_image_payload(tmp_path, monkeypatch):
     cfg = config(str(tmp_path / "gemini-stream.sqlite3"))
     cfg["providers"]["primary"].update({"kind": "gemini", "base_url": "https://primary.test/v1beta"})
     async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
-        response = await client.post("/v1/chat/completions", json={
+        payload = {
             "model": "simple", "stream": True,
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": "Describe"},
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
             ]}],
-        })
+        }
+        response = await client.post("/v1/chat/completions", json=payload,
+                                     headers={"Idempotency-Key": "image-request-7"})
+        replay = await client.post("/v1/chat/completions", json=payload,
+                                   headers={"Idempotency-Key": "image-request-7"})
         assert response.status_code == 200
         assert '"content": "gemini"' in response.text
+        assert replay.status_code == 200 and replay.text == response.text
+        assert upstream_calls == 1
         report = (await client.get("/v1/admin/report")).json()
         assert report["total_tokens"] == 4
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stream_records_usage_received_before_disconnect(tmp_path):
+    from starlette.requests import Request
+
+    app = create_app(config(str(tmp_path / "partial-stream.sqlite3")), http_transport=httpx.MockTransport(
+        lambda request: httpx.Response(500)))
+
+    async def interrupted_stream(route_name, payload, request_id=None, tenant_policy=None):
+        yield {"provider_progress": {"provider": "primary", "model": "primary-model",
+            "configured_model": "primary-model", "fallback_used": False}}
+        yield {"usage_progress": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}}
+        yield {"delta": "partial"}
+        await asyncio.Event().wait()
+
+    async with app.router.lifespan_context(app):
+        app.state.gateway.stream_complete = interrupted_stream
+        route = next(route for route in app.routes if route.path == "/v1/chat/completions")
+        request = Request({"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+            "method": "POST", "scheme": "http", "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions", "query_string": b"", "headers": [],
+            "server": ("gateway", 80), "client": ("test", 1), "root_path": "", "app": app})
+        response = await route.endpoint(ChatRequest(model="simple", stream=True,
+            messages=[{"role": "user", "content": "hello"}]), request, None, None)
+        frames = response.body_iterator
+        await frames.__anext__()  # assistant role preamble
+        partial = await frames.__anext__()
+        assert '"content": "partial"' in partial
+        await frames.aclose()
+        report = app.state.store.report(None, None, None)
+        assert report["total_tokens"] == 10
+        assert report["failures"] == 1
+        assert report["cost_usd"] == 0.000012
+
+
+@pytest.mark.asyncio
+async def test_comparison_evaluator_enforces_candidate_regression_gates():
+    calls: list[str] = []
+
+    def gateway(request: httpx.Request) -> httpx.Response:
+        route = json.loads(request.content)["model"]
+        calls.append(route)
+        content = "approved within 30 days" if route == "baseline" else "not sure"
+        cost = 0.001 if route == "baseline" else 0.002
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}],
+            "gateway": {"cost_usd": cost, "provider": "mock", "upstream_model": route}})
+
+    cases = [{"id": "refund", "messages": [{"role": "user", "content": "refund?"}],
+              "expected_contains": ["30 days"]}]
+    report = await compare_routes(cases, "http://gateway", "baseline", "candidate",
+        transport=httpx.MockTransport(gateway), min_pass_rate=1.0,
+        max_cost_regression_percent=50, max_latency_regression_percent=1000)
+    assert sorted(calls) == ["baseline", "candidate"]
+    assert report["comparison"]["pass_rate_delta"] == -1.0
+    assert report["comparison"]["cost_regression_percent"] == 100.0
+    assert report["comparison"]["promotion_passed"] is False
 
 
 @pytest.mark.asyncio

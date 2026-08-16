@@ -258,6 +258,7 @@ class ProviderClient:
                 next_tool_index = 0
                 next_gemini_tool_index = 0
                 async for line in response.aiter_lines():
+                    event_usage = None
                     if not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
@@ -346,6 +347,8 @@ class ProviderClient:
                         usage = {"prompt_tokens": int(event_usage.get("prompt_tokens", 0) or 0),
                                  "completion_tokens": int(event_usage.get("completion_tokens", 0) or 0),
                                  "total_tokens": int(event_usage.get("total_tokens", 0) or 0)}
+                    if event_usage:
+                        yield {"usage_progress": dict(usage)}
                     if isinstance(delta, str) and delta:
                         saw_delta = True
                         yield {"delta": delta}

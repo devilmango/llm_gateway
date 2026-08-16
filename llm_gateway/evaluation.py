@@ -34,13 +34,14 @@ def grade_response(case: dict[str, Any], content: str) -> bool | None:
 
 async def evaluate_cases(cases: list[dict[str, Any]], base_url: str, api_key: str | None = None,
                         transport: httpx.AsyncBaseTransport | None = None,
-                        application: str = "llm-gateway-eval") -> dict[str, Any]:
+                        application: str = "llm-gateway-eval",
+                        route_override: str | None = None) -> dict[str, Any]:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     results = []
     async with httpx.AsyncClient(base_url=base_url.rstrip("/"), transport=transport,
                                  headers=headers, timeout=120) as client:
         for index, case in enumerate(cases):
-            route = case.get("route", "simple")
+            route = route_override or case.get("route", "simple")
             started = time.perf_counter()
             try:
                 response = await client.post("/v1/chat/completions", json={
@@ -83,6 +84,57 @@ async def evaluate_cases(cases: list[dict[str, Any]], base_url: str, api_key: st
     return {"routes": summaries, "results": results}
 
 
+async def compare_routes(cases: list[dict[str, Any]], base_url: str, baseline_route: str,
+                         candidate_route: str, api_key: str | None = None,
+                         transport: httpx.AsyncBaseTransport | None = None,
+                         application: str = "llm-gateway-eval",
+                         min_pass_rate: float | None = None,
+                         max_cost_regression_percent: float | None = None,
+                         max_latency_regression_percent: float | None = None,
+                         max_failure_rate: float | None = None) -> dict[str, Any]:
+    """Run the same cases on two routes and evaluate optional promotion gates."""
+    # Keep route runs sequential so each route's latency measurement is independent.
+    baseline = await evaluate_cases(cases, base_url, api_key, transport, application, baseline_route)
+    candidate = await evaluate_cases(cases, base_url, api_key, transport, application, candidate_route)
+    before = baseline["routes"].get(baseline_route, {})
+    after = candidate["routes"].get(candidate_route, {})
+
+    def regression_percent(old: float, new: float) -> float | str:
+        if old == 0:
+            return 0.0 if new == 0 else "infinite"
+        return round((new - old) / old * 100, 2)
+
+    pass_delta = None
+    if before.get("pass_rate") is not None and after.get("pass_rate") is not None:
+        pass_delta = round(after["pass_rate"] - before["pass_rate"], 4)
+    comparison = {
+        "baseline_route": baseline_route,
+        "candidate_route": candidate_route,
+        "pass_rate_delta": pass_delta,
+        "cost_regression_percent": regression_percent(
+            float(before.get("estimated_cost_usd", 0)), float(after.get("estimated_cost_usd", 0))),
+        "latency_regression_percent": regression_percent(
+            float(before.get("average_latency_ms", 0)), float(after.get("average_latency_ms", 0))),
+        "candidate_failure_rate": sum("error" in item for item in candidate["results"]) /
+            max(after.get("requests", 0), 1),
+        "candidate_checks_passed": not any(item["passed"] is False for item in candidate["results"]),
+    }
+    gates = []
+    if min_pass_rate is not None:
+        gates.append(after.get("pass_rate") is not None and after["pass_rate"] >= min_pass_rate)
+    if max_cost_regression_percent is not None:
+        gates.append(comparison["cost_regression_percent"] != "infinite" and
+                     comparison["cost_regression_percent"] <= max_cost_regression_percent)
+    if max_latency_regression_percent is not None:
+        gates.append(comparison["latency_regression_percent"] != "infinite" and
+                     comparison["latency_regression_percent"] <= max_latency_regression_percent)
+    if max_failure_rate is not None:
+        gates.append(comparison["candidate_failure_rate"] <= max_failure_rate)
+    comparison["promotion_passed"] = all(gates) and comparison["candidate_checks_passed"]
+    comparison["gates_configured"] = len(gates)
+    return {"baseline": baseline, "candidate": candidate, "comparison": comparison}
+
+
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     cases = []
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -105,17 +157,46 @@ def main() -> None:
     parser.add_argument("--api-key", default=None, help="Gateway bearer key; prefer using a shell env wrapper")
     parser.add_argument("--application", default="llm-gateway-eval")
     parser.add_argument("--output", type=Path, help="Write the JSON report to this path")
+    parser.add_argument("--compare", nargs=2, metavar=("BASELINE", "CANDIDATE"),
+                        help="Run every case against both logical routes and compare them")
+    parser.add_argument("--min-pass-rate", type=float, help="Candidate minimum graded pass rate (0..1)")
+    parser.add_argument("--max-cost-regression-percent", type=float,
+                        help="Maximum candidate estimated cost regression versus baseline")
+    parser.add_argument("--max-latency-regression-percent", type=float,
+                        help="Maximum candidate average latency regression versus baseline")
+    parser.add_argument("--max-failure-rate", type=float,
+                        help="Maximum candidate request failure rate (0..1)")
     args = parser.parse_args()
     try:
-        report = asyncio.run(evaluate_cases(_load_jsonl(args.dataset), args.url, args.api_key,
-                                            application=args.application))
+        cases = _load_jsonl(args.dataset)
+        if args.min_pass_rate is not None and not 0 <= args.min_pass_rate <= 1:
+            raise ValueError("--min-pass-rate must be between 0 and 1")
+        if args.max_failure_rate is not None and not 0 <= args.max_failure_rate <= 1:
+            raise ValueError("--max-failure-rate must be between 0 and 1")
+        for name in ("max_cost_regression_percent", "max_latency_regression_percent"):
+            value = getattr(args, name)
+            if value is not None and value < 0:
+                raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
+        if args.compare:
+            report = asyncio.run(compare_routes(cases, args.url, *args.compare, args.api_key,
+                application=args.application, min_pass_rate=args.min_pass_rate,
+                max_cost_regression_percent=args.max_cost_regression_percent,
+                max_latency_regression_percent=args.max_latency_regression_percent,
+                max_failure_rate=args.max_failure_rate))
+        else:
+            report = asyncio.run(evaluate_cases(cases, args.url, args.api_key,
+                                                application=args.application))
     except (OSError, TypeError, ValueError) as exc:
         parser.error(str(exc))
     output = json.dumps(report, indent=2, sort_keys=True)
     if args.output:
         args.output.write_text(output + "\n", encoding="utf-8")
     print(output)
-    if any(item["passed"] is False for item in report["results"]):
+    if args.compare:
+        failed = report["comparison"]["promotion_passed"] is False
+    else:
+        failed = any(item["passed"] is False for item in report["results"])
+    if failed:
         sys.exit(1)
 
 

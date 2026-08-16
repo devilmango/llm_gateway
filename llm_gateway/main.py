@@ -23,6 +23,7 @@ from .capabilities import provider_capabilities
 from .config import load_config, validate_tenant_policies
 from .dashboard import OPERATIONS_DASHBOARD
 from .distributed import RateLimitBackendUnavailable
+from .idempotency import IdempotencyRegistry
 from .limiting import RateLimitExceeded
 from .observability import (
     CACHE_HITS,
@@ -144,6 +145,8 @@ def create_app(config: dict[str, Any] | None = None,
                 owns_redis = True
                 await redis_client.ping()
             app.state.redis = redis_client
+            app.state.idempotency = IdempotencyRegistry(
+                redis_client, int(cfg.get("server", {}).get("idempotency_ttl_seconds", 86_400)))
             app.state.gateway = GatewayService(cfg, app.state.http, shared_redis=redis_client)
             database = os.getenv("GATEWAY_DATABASE", cfg["server"].get("database", "./gateway.sqlite3"))
             app.state.store = create_usage_store(database)
@@ -307,6 +310,7 @@ def create_app(config: dict[str, Any] | None = None,
 
     @app.post("/v1/chat/completions", response_model=None)
     async def chat(body: ChatRequest, request: Request,
+                   idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
                    tenant: dict[str, Any] | None = Depends(authenticate_client)) -> Any:  # noqa: B008
         request_id = "gw_" + uuid.uuid4().hex
         started = time.perf_counter()
@@ -340,6 +344,30 @@ def create_app(config: dict[str, Any] | None = None,
             ledger_app_name = f"{tenant['id']}:{app_name}"
         else:
             tenant_cfg, tenant_apps, ledger_app_name = {}, {}, app_name
+        idempotency_scope = None
+        idempotency_fingerprint = None
+        idempotency_claimed = False
+        idempotency_complete = False
+        if idempotency_key is not None:
+            if (not idempotency_key.strip() or len(idempotency_key) > 200
+                    or any(ord(char) < 33 or ord(char) > 126 for char in idempotency_key)):
+                raise HTTPException(status_code=400, detail="Idempotency-Key must be 1-200 visible ASCII characters")
+            idempotency_scope = f"{tenant['id'] if tenant else 'default'}:{ledger_app_name}:{idempotency_key}"
+            request_fingerprint = json.dumps(body.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+            idempotency_fingerprint = hashlib.sha256(request_fingerprint.encode("utf-8")).hexdigest()
+            owner, previous = await request.app.state.idempotency.claim(idempotency_scope, idempotency_fingerprint)
+            if not owner:
+                if not previous or previous.get("fingerprint") != idempotency_fingerprint:
+                    raise HTTPException(status_code=409, detail="Idempotency-Key is already used by another request")
+                if previous.get("state") != "complete":
+                    raise HTTPException(status_code=409, detail="Request with this Idempotency-Key is in progress or incomplete")
+                saved = previous["response"]
+                if saved["kind"] == "stream":
+                    return StreamingResponse(iter([saved["body"]]), media_type="text/event-stream",
+                        headers=saved.get("headers", {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}))
+                return JSONResponse(saved["body"], status_code=saved.get("status_code", 200),
+                                    headers=saved.get("headers", {}))
+            idempotency_claimed = True
         if tenant:
             try:
                 request.app.state.gateway.route_candidates(route_name, request_id, tenant_cfg)
@@ -373,21 +401,36 @@ def create_app(config: dict[str, Any] | None = None,
                     stream_result: dict[str, Any] | None = None
                     stream_error: str | None = None
                     status = "success"
+                    stream_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                    stream_provider: dict[str, Any] = {}
+                    stream_frames: list[str] = []
+                    stream_completed = False
                     text_delta = 0
                     try:
-                        yield "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk",
+                        frame = "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk",
                             "created": int(time.time()), "model": route_name,
                             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}) + "\n\n"
+                        stream_frames.append(frame)
+                        yield frame
                         with trace.use_span(span, end_on_exit=False):
                             async for item in request.app.state.gateway.stream_complete(route_name, upstream_payload,
                                                                                        request_id, tenant_cfg if tenant else None):
+                                if item.get("usage_progress"):
+                                    stream_usage = item["usage_progress"]
+                                    continue
+                                if item.get("provider_progress"):
+                                    stream_provider = item["provider_progress"]
+                                    continue
                                 if item.get("final"):
                                     stream_result = item
                                     usage = item.get("usage", {})
-                                    yield "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk",
+                                    stream_usage = usage
+                                    frame = "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk",
                                         "created": int(time.time()), "model": route_name,
                                         "choices": [{"index": 0, "delta": {}, "finish_reason": item.get("finish_reason")}],
                                         "usage": usage}) + "\n\n"
+                                    stream_frames.append(frame)
+                                    yield frame
                                     continue
                                 delta = item.get("delta", "")
                                 if "tool_call_delta" in item:
@@ -397,25 +440,41 @@ def create_app(config: dict[str, Any] | None = None,
                                 else:
                                     chunk_delta = {"content": delta}
                                     text_delta += len(delta)
-                                yield "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk",
+                                frame = "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk",
                                     "created": int(time.time()), "model": route_name,
                                     "choices": [{"index": 0, "delta": chunk_delta, "finish_reason": None}]}) + "\n\n"
-                        yield "data: [DONE]\n\n"
+                                stream_frames.append(frame)
+                                yield frame
+                        frame = "data: [DONE]\n\n"
+                        stream_frames.append(frame)
+                        yield frame
+                        stream_completed = True
                     except ProviderError:
                         status, stream_error = "failure", "upstream_error"
-                        yield "event: error\ndata: " + json.dumps({"error": {"message": "All configured providers failed",
+                        frame = "event: error\ndata: " + json.dumps({"error": {"message": "All configured providers failed",
                             "type": "upstream_error", "request_id": request_id}}) + "\n\n"
+                        stream_frames.append(frame)
+                        yield frame
+                    except asyncio.CancelledError:
+                        status, stream_error = "cancelled", "client_disconnected"
+                        raise
+                    except GeneratorExit:
+                        status, stream_error = "cancelled", "client_disconnected"
+                        raise
                     except Exception as exc:
                         status, stream_error = "failure", type(exc).__name__
                         logger.exception("stream_request_failed request_id=%s", request_id)
-                        yield "event: error\ndata: " + json.dumps({"error": {"message": "Gateway stream failed",
+                        frame = "event: error\ndata: " + json.dumps({"error": {"message": "Gateway stream failed",
                             "type": "gateway_error", "request_id": request_id}}) + "\n\n"
+                        stream_frames.append(frame)
+                        yield frame
                     finally:
                         elapsed_ms = int((time.perf_counter() - started) * 1000)
-                        usage_data = stream_result.get("usage", {}) if stream_result else {}
-                        provider_name = stream_result.get("provider") if stream_result else None
-                        model_name = stream_result.get("model") if stream_result else None
-                        configured_model = stream_result.get("configured_model", model_name) if stream_result else model_name
+                        usage_data = stream_result.get("usage", {}) if stream_result else stream_usage
+                        provider_name = stream_result.get("provider") if stream_result else stream_provider.get("provider")
+                        model_name = stream_result.get("model") if stream_result else stream_provider.get("model")
+                        configured_model = (stream_result.get("configured_model", model_name) if stream_result
+                                            else stream_provider.get("configured_model", model_name))
                         price = cfg["providers"].get(provider_name, {}).get("models", {}).get(configured_model, {}) if provider_name else {}
                         cost_value = (usage_data.get("prompt_tokens", 0) * float(price.get("input_cost_per_1m", 0)) +
                                       usage_data.get("completion_tokens", 0) * float(price.get("output_cost_per_1m", 0))) / 1_000_000
@@ -426,11 +485,20 @@ def create_app(config: dict[str, Any] | None = None,
                             "completion_tokens": usage_data.get("completion_tokens", 0),
                             "total_tokens": usage_data.get("total_tokens", 0), "cost_usd": cost_value,
                             "status": status, "latency_ms": elapsed_ms,
-                            "fallback_used": int(bool(stream_result and stream_result.get("fallback_used"))),
+                            "fallback_used": int(bool(stream_result.get("fallback_used") if stream_result else
+                                                      stream_provider.get("fallback_used"))),
                             "cached": int(bool(stream_result and stream_result.get("cached"))),
-                            "canary_used": int(bool(stream_result and stream_result.get("canary_used"))),
+                            "canary_used": int(bool(stream_result.get("canary_used") if stream_result else
+                                                     stream_provider.get("canary_used"))),
                             "error_type": stream_error}
                         await asyncio.to_thread(request.app.state.store.record, record)
+                        if idempotency_claimed and idempotency_scope and idempotency_fingerprint:
+                            if stream_completed:
+                                await request.app.state.idempotency.complete(idempotency_scope,
+                                    idempotency_fingerprint, {"kind": "stream", "body": "".join(stream_frames),
+                                        "status_code": 200, "headers": {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}})
+                            else:
+                                await request.app.state.idempotency.abandon(idempotency_scope, idempotency_fingerprint)
                         metric_route = route_name if route_name in cfg["routes"] else "unknown"
                         REQUESTS.labels(route=metric_route, status=status).inc()
                         TOKENS.labels(route=metric_route, kind="prompt").inc(record["prompt_tokens"])
@@ -483,6 +551,10 @@ def create_app(config: dict[str, Any] | None = None,
                 usage=Usage(**usage), gateway={"provider": provider, "upstream_model": model,
                     "fallback_used": result["fallback_used"], "cached": result["cached"],
                     "canary_used": result.get("canary_used", False), "cost_usd": round(cost, 8)})
+            if idempotency_claimed and idempotency_scope and idempotency_fingerprint:
+                await request.app.state.idempotency.complete(idempotency_scope, idempotency_fingerprint,
+                    {"kind": "json", "body": output.model_dump(mode="json"), "status_code": 200})
+                idempotency_complete = True
             return output
         except KeyError:
             status, error_type = "failure", "unknown_route"
@@ -506,6 +578,8 @@ def create_app(config: dict[str, Any] | None = None,
             status, error_type = "failure", type(exc).__name__
             raise
         finally:
+            if idempotency_claimed and not idempotency_complete and not stream_response_started and idempotency_scope and idempotency_fingerprint:
+                await request.app.state.idempotency.abandon(idempotency_scope, idempotency_fingerprint)
             if not stream_response_started:
                 # Persist every attempt outcome; never persist prompt or completion content.
                 elapsed_ms = int((time.perf_counter() - started) * 1000)

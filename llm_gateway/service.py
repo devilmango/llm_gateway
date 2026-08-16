@@ -266,7 +266,15 @@ class GatewayService:
                         started = asyncio.get_running_loop().time()
                         text_parts: list[str] = []
                         final: dict[str, Any] = {}
+                        used_canary = bool(canary_selected and canary_config and
+                            (name, model) == (canary_config.get("provider"), canary_config.get("model")))
+                        yield {"provider_progress": {"provider": name, "model": model,
+                            "configured_model": model, "fallback_used": (name, model) != preferred and not used_canary,
+                            "canary_used": used_canary}}
                         async for item in self.client.stream(name, model, payload):
+                            if "usage_progress" in item:
+                                yield {"usage_progress": item["usage_progress"]}
+                                continue
                             if "delta" in item:
                                 emitted = True
                                 text_parts.append(item["delta"])
@@ -279,8 +287,6 @@ class GatewayService:
                         elapsed_ms = (asyncio.get_running_loop().time() - started) * 1000
                         await self.provider_health.record(name, elapsed_ms, True)
                         await self.breaker.success(name)
-                        used_canary = bool(canary_selected and canary_config and
-                            (name, model) == (canary_config.get("provider"), canary_config.get("model")))
                         result = {"text": "".join(text_parts), "usage": final.get("usage", {}),
                                   "finish_reason": final.get("finish_reason"), "model": final.get("model", model),
                                   "provider": name, "configured_model": model,
