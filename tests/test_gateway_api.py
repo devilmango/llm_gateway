@@ -1107,6 +1107,138 @@ async def test_cost_reconciliation_preserves_estimates_and_reports_actual_cost(t
 
 
 @pytest.mark.asyncio
+async def test_billing_export_import_maps_columns_and_scales_micro_usd(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    async with gateway_client(config(str(tmp_path / "billing-import.sqlite3")),
+                              httpx.MockTransport(lambda request: success_response())) as client:
+        created = await client.post("/v1/chat/completions", json={
+            "model": "simple", "messages": [{"role": "user", "content": "hello"}]})
+        request_id = created.json()["id"]
+        imported = await client.post("/v1/admin/cost-reconciliation/import", json={
+            "source": "provider-export", "format": "csv",
+            "mapping": {"request_id": "gateway_request_id", "actual_cost_usd": "billed_micros",
+                        "currency": "currency"},
+            "cost_multiplier": 0.000001,
+            "content": f"gateway_request_id,billed_micros,currency\n{request_id},1250,USD",
+        })
+        assert imported.status_code == 200
+        assert imported.json()["imported_rows"] == 1
+        report = (await client.get("/v1/admin/report")).json()
+        assert report["actual_cost_usd"] == pytest.approx(0.00125)
+        foreign_currency = await client.post("/v1/admin/cost-reconciliation/import", json={
+            "source": "bad-export", "format": "json",
+            "content": json.dumps([{"request_id": request_id, "cost_usd": 1, "currency": "EUR"}]),
+        })
+        assert foreign_currency.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_tenant_tool_allowlist_and_call_limits_are_audited(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUPPORT_TENANT_KEY", "support-secret")
+    monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    provider_calls = 0
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal provider_calls
+        provider_calls += 1
+        calls = [{"id": f"call-{index}", "type": "function", "function": {
+            "name": "lookup_order", "arguments": "{}"}} for index in range(2 if provider_calls == 2 else 1)]
+        return httpx.Response(200, json={"model": "primary-model", "choices": [{"message": {
+            "role": "assistant", "content": None, "tool_calls": calls}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}})
+
+    cfg = config(str(tmp_path / "tool-policy.sqlite3"))
+    cfg["tenants"] = {"support": {"api_key_env": "SUPPORT_TENANT_KEY", "allowed_routes": ["simple"],
+        "allowed_tools": ["lookup_order"], "applications": {"support-router": {
+            "max_tool_calls_per_request": 1}}}}
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        request_body = {"model": "simple", "application": "support-router",
+            "messages": [{"role": "user", "content": "find order"}],
+            "tools": [{"type": "function", "function": {"name": "lookup_order",
+                "parameters": {"type": "object"}}}]}
+        headers = {"Authorization": "Bearer support-secret"}
+        allowed = await client.post("/v1/chat/completions", json=request_body, headers=headers)
+        assert allowed.status_code == 200, allowed.text
+        excessive = await client.post("/v1/chat/completions", json=request_body, headers=headers)
+        assert excessive.status_code == 502
+        forbidden_body = {**request_body, "tools": [{"type": "function", "function": {
+            "name": "delete_account", "parameters": {"type": "object"}}}]}
+        forbidden = await client.post("/v1/chat/completions", json=forbidden_body, headers=headers)
+        assert forbidden.status_code == 403
+        assert provider_calls == 2
+        audit = await client.get("/v1/admin/tool-audit?tenant_id=support",
+                                 headers={"Authorization": "Bearer admin-secret"})
+        assert audit.status_code == 200
+        events = audit.json()["events"]
+        assert any(event["tool_name"] == "lookup_order" and event["outcome"] == "allowed" for event in events)
+        assert any(event["tool_name"] == "lookup_order" and event["reason"] == "max_tool_calls_per_request"
+                   for event in events)
+        assert any(event["tool_name"] == "delete_account" and event["outcome"] == "denied" for event in events)
+        assert all("arguments" not in event for event in events)
+
+
+@pytest.mark.asyncio
+async def test_streamed_disallowed_tool_call_is_withheld_and_audited(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUPPORT_TENANT_KEY", "support-secret")
+    monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    stream_body = (
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function",'
+        '"function":{"name":"lookup_order","arguments":"{}"}}]}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}\n\n'
+        'data: [DONE]\n\n')
+    cfg = config(str(tmp_path / "stream-tool-policy.sqlite3"))
+    cfg["tenants"] = {"support": {"api_key_env": "SUPPORT_TENANT_KEY", "allowed_routes": ["simple"],
+        "allowed_tools": ["safe_lookup"], "applications": {"support-router": {}}}}
+    async with gateway_client(cfg, httpx.MockTransport(lambda request: httpx.Response(200,
+            content=stream_body, headers={"content-type": "text/event-stream"}))) as client:
+        response = await client.post("/v1/chat/completions", headers={"Authorization": "Bearer support-secret"},
+            json={"model": "simple", "application": "support-router", "stream": True,
+                "messages": [{"role": "user", "content": "find order"}],
+                "tools": [{"type": "function", "function": {"name": "safe_lookup",
+                    "parameters": {"type": "object"}}}]})
+        assert response.status_code == 200
+        assert "event: error" in response.text
+        assert '"tool_calls"' not in response.text
+        audit = await client.get("/v1/admin/tool-audit?tenant_id=support",
+                                 headers={"Authorization": "Bearer admin-secret"})
+        assert any(event["tool_name"] == "lookup_order" and event["outcome"] == "denied"
+                   for event in audit.json()["events"])
+
+
+@pytest.mark.asyncio
+async def test_tool_call_minute_quota_rejects_excess_calls(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUPPORT_TENANT_KEY", "support-secret")
+    monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    cfg = config(str(tmp_path / "tool-minute-quota.sqlite3"))
+    cfg["tenants"] = {"support": {"api_key_env": "SUPPORT_TENANT_KEY", "allowed_routes": ["simple"],
+        "allowed_tools": ["lookup_order"], "applications": {"support-router": {
+            "max_tool_calls_per_minute": 1}}}}
+    async with gateway_client(cfg, httpx.MockTransport(lambda request: httpx.Response(200, json={
+            "model": "primary-model", "choices": [{"message": {"role": "assistant", "content": None,
+                "tool_calls": [{"id": "call-1", "type": "function", "function": {
+                    "name": "lookup_order", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}}))) as client:
+        body = {"model": "simple", "application": "support-router",
+            "messages": [{"role": "user", "content": "find order"}],
+            "tools": [{"type": "function", "function": {"name": "lookup_order",
+                "parameters": {"type": "object"}}}]}
+        headers = {"Authorization": "Bearer support-secret"}
+        assert (await client.post("/v1/chat/completions", json=body, headers=headers)).status_code == 200
+        limited = await client.post("/v1/chat/completions", json=body, headers=headers)
+        assert limited.status_code == 429
+        audit = await client.get("/v1/admin/tool-audit?tenant_id=support",
+                                 headers={"Authorization": "Bearer admin-secret"})
+        assert any(event["reason"] == "max_tool_calls_per_minute" and event["outcome"] == "denied"
+                   for event in audit.json()["events"])
+
+
+@pytest.mark.asyncio
 async def test_eval_runner_reports_quality_cost_and_latency():
     def upstream(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "eval-id", "model": "test-model",

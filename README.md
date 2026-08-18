@@ -261,6 +261,8 @@ Supported request fields include `model`, `messages`, `application`, `cost_cente
 
 For tool calling, send OpenAI-style function declarations. The gateway returns normalized assistant `tool_calls`; the application remains responsible for authorizing and executing the functions, then sending their results as `role: "tool"` messages in a follow-up request.
 
+Optional tool governance restricts declared and generated function names, caps generated calls per request, and can apply a per-tenant/application per-minute call limit. Configure global `tool_governance` and/or tenant `allowed_tools`, `default_policy.max_tool_calls_per_request`, and `default_policy.max_tool_calls_per_minute`; application policies can further narrow the allowlist and limits. Global and tenant allowlists intersect, and configured limits use the most restrictive value. Disallowed declarations are rejected before a provider call. Disallowed or excessive generated calls are withheld and recorded as denied metadata. Successful tool names are audited without arguments. Admins with the `audit` scope can inspect `/v1/admin/tool-audit?tenant_id=support-team`.
+
 ```json
 {
   "model": "simple",
@@ -291,9 +293,11 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/v1/admin/report` | Aggregate token, cost, and reliability data. |
 | `GET` | `/v1/admin/report.csv` | Export filtered request-level usage and cost records as CSV (up to 100,000 rows). |
 | `POST` | `/v1/admin/cost-reconciliation` | Atomically import actual costs keyed by gateway request ID. |
+| `POST` | `/v1/admin/cost-reconciliation/import` | Normalize CSV, JSON, or JSONL billing rows and reconcile atomically. |
 | `GET` | `/v1/admin/budgets` | Current-month spend, limit, and utilization for configured applications. |
 | `GET` | `/v1/admin/providers` | Provider circuit state and consecutive failure counts. |
 | `GET` | `/v1/admin/audit` | Recent authenticated admin API access events. |
+| `GET` | `/v1/admin/tool-audit` | Metadata-only tool-call decisions, optionally filtered by tenant. |
 | `GET` | `/v1/admin/webhooks` | Inspect pending, delivered, and dead-letter budget alert events. |
 | `POST` | `/v1/admin/webhooks/{event_id}/redrive` | Retry a dead-letter alert event. |
 | `GET` | `/metrics` | Prometheus metrics in exposition format. |
@@ -318,6 +322,14 @@ Import provider invoice rows as an atomic batch. Every request ID must exist in 
 curl -X POST http://localhost:8000/v1/admin/cost-reconciliation \
   -H 'Authorization: Bearer gateway-secret' -H 'Content-Type: application/json' \
   -d '{"source":"invoice-2026-10","records":[{"request_id":"chatcmpl-123","actual_cost_usd":0.0047}]}'
+```
+
+For provider billing exports, use `/v1/admin/cost-reconciliation/import` with `format` set to `csv`, `json`, or `jsonl` and the file text in `content`. The importer recognizes `request_id`, `gateway_request_id`, or `llm_gateway_request_id` and `actual_cost_usd`, `cost_usd`, `amount_usd`, or `cost`. Provider-specific headers or nested JSON fields can be mapped explicitly; dot-separated JSON paths are supported. `cost_multiplier` converts values such as integer micro-USD to USD. If an export includes currency, only USD rows are accepted. Every row must carry the gateway request ID (for example as a provider metadata tag); provider-side request IDs cannot be matched automatically. Rows are validated as a batch before reconciliation.
+
+```bash
+curl -X POST http://localhost:8000/v1/admin/cost-reconciliation/import \
+  -H 'Authorization: Bearer gateway-secret' -H 'Content-Type: application/json' \
+  -d '{"source":"provider-invoice-2026-10","format":"csv","mapping":{"request_id":"gateway_request_id","actual_cost_usd":"billed_micros","currency":"currency"},"cost_multiplier":0.000001,"content":"gateway_request_id,billed_micros,currency\\ngw_abc,1250,USD"}'
 ```
 
 Run an evaluation set against named logical routes to compare response checks, latency, and estimated spend. Cases without an expected text check contribute to latency/cost but not pass rate.

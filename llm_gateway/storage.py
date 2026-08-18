@@ -66,6 +66,12 @@ class UsageStore:
                 actor TEXT NOT NULL, action TEXT NOT NULL, status_code INTEGER NOT NULL
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_admin_audit_time ON admin_audit_events(occurred_at)")
+            db.execute("""CREATE TABLE IF NOT EXISTS tool_call_audits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL,
+                tenant_id TEXT, application TEXT NOT NULL, occurred_at TEXT NOT NULL,
+                tool_name TEXT NOT NULL, outcome TEXT NOT NULL, reason TEXT
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_tool_audit_time ON tool_call_audits(occurred_at)")
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.database, timeout=10)
@@ -215,6 +221,29 @@ class UsageStore:
             return [dict(row) for row in db.execute(
                 "SELECT occurred_at, actor, action, status_code FROM admin_audit_events ORDER BY id DESC LIMIT ?",
                 (limit,)).fetchall()]
+
+    def record_tool_call_audits(self, request_id: str, tenant_id: str | None, application: str,
+                                events: list[dict[str, Any]]) -> None:
+        if not events:
+            return
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connect() as db:
+            db.executemany("""INSERT INTO tool_call_audits
+                (request_id, tenant_id, application, occurred_at, tool_name, outcome, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [(request_id, tenant_id, application, now, event["tool_name"],
+                  event["outcome"], event.get("reason")) for event in events])
+
+    def tool_call_audit_events(self, tenant_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as db:
+            if tenant_id is None:
+                rows = db.execute("""SELECT request_id, tenant_id, application, occurred_at,
+                    tool_name, outcome, reason FROM tool_call_audits ORDER BY id DESC LIMIT ?""", (limit,))
+            else:
+                rows = db.execute("""SELECT request_id, tenant_id, application, occurred_at,
+                    tool_name, outcome, reason FROM tool_call_audits WHERE tenant_id = ?
+                    ORDER BY id DESC LIMIT ?""", (tenant_id, limit))
+            return [dict(row) for row in rows.fetchall()]
 
     @staticmethod
     def _filters(start: str | None, end: str | None, application: str | None,

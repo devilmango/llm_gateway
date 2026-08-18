@@ -22,6 +22,24 @@ class CostReconciliationRequest(BaseModel):
         return self
 
 
+class CostReconciliationImportRequest(BaseModel):
+    source: str = Field(min_length=1, max_length=120)
+    format: Literal["csv", "json", "jsonl"]
+    content: str = Field(min_length=1, max_length=5_000_000)
+    # Keys: request_id, actual_cost_usd, optional currency. Values are CSV
+    # column names or dot-separated JSON object paths.
+    mapping: dict[str, str] | None = None
+    cost_multiplier: float = Field(default=1.0, gt=0, le=1_000_000)
+
+    @model_validator(mode="after")
+    def validate_mapping(self) -> CostReconciliationImportRequest:
+        if self.mapping:
+            unsupported = set(self.mapping) - {"request_id", "actual_cost_usd", "currency"}
+            if unsupported:
+                raise ValueError(f"Unsupported billing mapping fields: {', '.join(sorted(unsupported))}")
+        return self
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | list[dict[str, Any]] | None = None

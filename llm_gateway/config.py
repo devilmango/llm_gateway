@@ -14,14 +14,38 @@ MIN_TENANT_USAGE_RETENTION_DAYS = 35
 
 
 def validate_tenant_policies(config: dict[str, Any]) -> None:
+    governance = config.get("tool_governance", {})
+    if not isinstance(governance, dict):
+        raise TypeError("tool_governance must be an object")
+    for limit_name in ("max_tool_calls_per_request", "max_tool_calls_per_minute"):
+        limit = governance.get(limit_name)
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
+            raise ValueError(f"tool_governance.{limit_name} must be a non-negative integer")
+    global_allowlist = governance.get("allowed_tools")
+    if global_allowlist is not None and (not isinstance(global_allowlist, list)
+            or any(not isinstance(item, str) or not item for item in global_allowlist)):
+        raise ValueError("tool_governance.allowed_tools must be a list of names")
     tenants = config.get("tenants", config.get("security", {}).get("tenants", {}))
     for tenant_id, tenant in tenants.items():
         if not isinstance(tenant, dict):
             raise TypeError(f"Tenant {tenant_id!r} configuration must be an object")
-        for key in ("allowed_routes", "allowed_providers", "allowed_models", "allowed_regions"):
+        for key in ("allowed_routes", "allowed_providers", "allowed_models", "allowed_regions", "allowed_tools"):
             value = tenant.get(key)
             if value is not None and (not isinstance(value, list) or any(not isinstance(item, str) for item in value)):
                 raise ValueError(f"Tenant {tenant_id!r} {key} must be a list of strings")
+        for policy_name, policy in [("default_policy", tenant.get("default_policy", {})),
+                                    *[(f"applications.{name}", value)
+                                      for name, value in tenant.get("applications", {}).items()]]:
+            if not isinstance(policy, dict):
+                raise TypeError(f"Tenant {tenant_id!r} {policy_name} must be an object")
+            allowed_tools = policy.get("allowed_tools")
+            if allowed_tools is not None and (not isinstance(allowed_tools, list)
+                    or any(not isinstance(item, str) or not item for item in allowed_tools)):
+                raise ValueError(f"Tenant {tenant_id!r} {policy_name}.allowed_tools must be a list of names")
+            for limit_name in ("max_tool_calls_per_request", "max_tool_calls_per_minute"):
+                limit = policy.get(limit_name)
+                if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
+                    raise ValueError(f"Tenant {tenant_id!r} {policy_name}.{limit_name} must be a non-negative integer")
         data_policy = tenant.get("data_policy", {})
         if not isinstance(data_policy, dict):
             raise TypeError(f"Tenant {tenant_id!r} data_policy must be an object")

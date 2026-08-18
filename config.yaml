@@ -15,6 +15,13 @@ routing:
   # `latency_aware` orders configured route candidates by shared EWMA latency and failure rate.
   strategy: primary_first
 
+# Optional tool-call guardrails. When configured, these apply to every caller;
+# tenant/application values may only make the limits more restrictive.
+# tool_governance:
+#   allowed_tools: [lookup_order, search_policy]
+#   max_tool_calls_per_request: 8
+#   max_tool_calls_per_minute: 60
+
 security:
   redact_pii: true
   # gateway_api_key_file: /run/secrets/gateway-api-key
@@ -48,11 +55,14 @@ security:
 #     allowed_providers: [openai, gemini]
 #     allowed_models: [gpt-4o-mini, gemini-2.0-flash]
 #     allowed_regions: [us]
+#     allowed_tools: [lookup_order, search_policy]
 #     data_policy:
 #       usage_retention_days: 90
 #     default_policy:
 #       max_requests_per_minute: 120
 #       max_completion_tokens: 1000
+#       max_tool_calls_per_request: 4
+#       max_tool_calls_per_minute: 20
 #     applications:
 #       support-router:
 #         monthly_limit_usd: 50
