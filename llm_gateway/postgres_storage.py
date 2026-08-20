@@ -33,7 +33,8 @@ class PostgresUsageStore:
                 latency_ms INTEGER NOT NULL DEFAULT 0, fallback_used INTEGER NOT NULL DEFAULT 0,
                 cached INTEGER NOT NULL DEFAULT 0, error_type TEXT,
                 canary_used INTEGER NOT NULL DEFAULT 0, actual_cost_usd DOUBLE PRECISION,
-                cost_reconciliation_id TEXT, cost_reconciled_at TEXT
+                cost_reconciliation_id TEXT, cost_reconciled_at TEXT,
+                pricing_catalog TEXT NOT NULL DEFAULT 'default', pricing_version TEXT NOT NULL DEFAULT 'unversioned'
             )""",
             "CREATE INDEX IF NOT EXISTS idx_requests_time ON requests(occurred_at)",
             "CREATE INDEX IF NOT EXISTS idx_requests_application ON requests(application)",
@@ -42,6 +43,8 @@ class PostgresUsageStore:
             "ALTER TABLE requests ADD COLUMN IF NOT EXISTS actual_cost_usd DOUBLE PRECISION",
             "ALTER TABLE requests ADD COLUMN IF NOT EXISTS cost_reconciliation_id TEXT",
             "ALTER TABLE requests ADD COLUMN IF NOT EXISTS cost_reconciled_at TEXT",
+            "ALTER TABLE requests ADD COLUMN IF NOT EXISTS pricing_catalog TEXT NOT NULL DEFAULT 'default'",
+            "ALTER TABLE requests ADD COLUMN IF NOT EXISTS pricing_version TEXT NOT NULL DEFAULT 'unversioned'",
             """CREATE TABLE IF NOT EXISTS budget_reservations (
                 request_id TEXT PRIMARY KEY, application TEXT NOT NULL,
                 amount_usd DOUBLE PRECISION NOT NULL, reserved_at TEXT NOT NULL, expires_at TEXT NOT NULL
@@ -102,13 +105,15 @@ class PostgresUsageStore:
 
     def record(self, record: dict[str, Any]) -> None:
         columns = ("request_id", "occurred_at", "application", "route", "provider", "model",
-                   "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status",
+                   "pricing_catalog", "pricing_version", "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status",
                    "latency_ms", "fallback_used", "cached", "error_type", "cost_center", "canary_used")
         assignments = ", ".join(f"{column}=EXCLUDED.{column}" for column in columns[1:])
         placeholders = ", ".join("%s" for _ in columns)
         with self.pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute(f"INSERT INTO requests ({','.join(columns)}) VALUES ({placeholders}) ON CONFLICT (request_id) DO UPDATE SET {assignments}",
-                           [record.get(column, 0 if column == "canary_used" else None) for column in columns])
+                           [record.get(column, {"canary_used": 0, "pricing_catalog": "default",
+                                                "pricing_version": "unversioned"}.get(column))
+                            for column in columns])
             cursor.execute("DELETE FROM budget_reservations WHERE request_id = %s", (record["request_id"],))
 
     def reconcile_costs(self, records: list[dict[str, Any]], source: str,
@@ -297,8 +302,16 @@ class PostgresUsageStore:
             by_application = cursor.fetchall()
             breakdowns = {}
             for dimension in ("provider", "model", "route", "cost_center"):
-                cursor.execute(f"SELECT COALESCE({dimension}::text,'unassigned') AS {dimension}, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd FROM requests{where} GROUP BY {dimension} ORDER BY cost_usd DESC", values)
+                cursor.execute(f"SELECT COALESCE({dimension}::text,'unassigned') AS {dimension}, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd, COALESCE(SUM(CASE WHEN actual_cost_usd IS NOT NULL THEN actual_cost_usd-cost_usd ELSE 0 END),0) AS cost_variance_usd FROM requests{where} GROUP BY {dimension} ORDER BY cost_usd DESC", values)
                 breakdowns[f"by_{dimension}"] = cursor.fetchall()
+            cursor.execute(f"""SELECT COALESCE(provider,'unknown') AS provider,
+                COALESCE(model,'unknown') AS model, pricing_catalog, pricing_version,
+                COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd,
+                COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd,
+                COALESCE(SUM(CASE WHEN actual_cost_usd IS NOT NULL THEN actual_cost_usd-cost_usd ELSE 0 END),0) AS cost_variance_usd
+                FROM requests{where} GROUP BY provider, model, pricing_catalog, pricing_version
+                ORDER BY cost_usd DESC""", values)
+            breakdowns["by_pricing_catalog"] = cursor.fetchall()
         summary["failure_rate"] = summary["failures"] / summary["requests"] if summary["requests"] else 0
         summary["fallback_rate"] = summary["fallbacks"] / summary["requests"] if summary["requests"] else 0
         summary["generated_at"] = datetime.now(UTC).isoformat()

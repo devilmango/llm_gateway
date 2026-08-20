@@ -89,11 +89,14 @@ providers:
     kind: openai
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
+    # Stable catalog ID; version can be set per model or inherited from this provider.
+    pricing_catalog: openai-public-usd
     # Tag the configured deployment's data-processing region for tenant policy checks.
     # data_region: us
     requests_per_minute: 600
     models:
       gpt-4o-mini:
+        pricing_version: "2026-10-13"
         input_cost_per_1m: 0.15
         output_cost_per_1m: 0.60
       gpt-4o:

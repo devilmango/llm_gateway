@@ -18,6 +18,7 @@ from .limiting import RateLimitExceeded, SlidingWindowLimiter
 from .observability import PROVIDER_RETRIES
 from .provider_health import ProviderHealth
 from .providers import ProviderCapabilityError, ProviderClient, ProviderError
+from .tool_validation import validate_tool_calls
 
 
 class GatewayService:
@@ -189,7 +190,12 @@ class GatewayService:
                                 break
                             await self.limiter.acquire(name, limit)
                             started = asyncio.get_running_loop().time()
-                            result = await self.client.complete(name, model, payload)
+                            result = await self.client.complete(name, model, payload, request_id=request_id)
+                            try:
+                                validate_tool_calls(result.get("tool_calls", []), payload.get("tools"),
+                                                    reject_undeclared=False)
+                            except ValueError as exc:
+                                raise ProviderError(f"Provider returned invalid tool calls: {exc}", retryable=True) from exc
                             await self.provider_health.record(name, (asyncio.get_running_loop().time() - started) * 1000, True)
                             await self.breaker.success(name)
                             used_canary = bool(canary_selected and canary_config and
@@ -271,7 +277,7 @@ class GatewayService:
                         yield {"provider_progress": {"provider": name, "model": model,
                             "configured_model": model, "fallback_used": (name, model) != preferred and not used_canary,
                             "canary_used": used_canary}}
-                        async for item in self.client.stream(name, model, payload):
+                        async for item in self.client.stream(name, model, payload, request_id=request_id):
                             if "usage_progress" in item:
                                 yield {"usage_progress": item["usage_progress"]}
                                 continue

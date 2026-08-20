@@ -73,7 +73,8 @@ class ProviderClient:
         if payload.get("modalities") and "audio" in payload["modalities"] and not capabilities.get("audio_output", False):
             raise ProviderCapabilityError(f"Provider {provider_name!r} does not support audio output")
 
-    async def complete(self, provider_name: str, model: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def complete(self, provider_name: str, model: str, payload: dict[str, Any],
+                       request_id: str | None = None) -> dict[str, Any]:
         cfg = self.providers[provider_name]
         kind = cfg["kind"]
         try:
@@ -84,6 +85,8 @@ class ProviderClient:
             raise ProviderError(f"Provider {provider_name!r} has no API key configured")
         base = (cfg.get("base_url") or "").rstrip("/")
         headers = {"Content-Type": "application/json"}
+        if request_id:
+            headers["X-Gateway-Request-ID"] = request_id
         params = None
         self.validate_capabilities(provider_name, payload)
         if kind in {"openai", "vllm"}:
@@ -183,7 +186,8 @@ class ProviderClient:
         PROVIDER_LATENCY.labels(provider=provider_name, outcome="success").observe(time.perf_counter() - started)
         return result
 
-    async def stream(self, provider_name: str, model: str, payload: dict[str, Any]):
+    async def stream(self, provider_name: str, model: str, payload: dict[str, Any],
+                     request_id: str | None = None):
         """Yield text deltas normalized from each supported provider's native SSE API."""
         cfg = self.providers[provider_name]
         kind = cfg["kind"]
@@ -197,6 +201,8 @@ class ProviderClient:
         if kind not in {"bedrock", "vertex"} and not key and not cfg.get("api_key_optional", False):
             raise ProviderError(f"Provider {provider_name!r} has no API key configured")
         headers = {"Content-Type": "application/json"}
+        if request_id:
+            headers["X-Gateway-Request-ID"] = request_id
         params = None
         base = (cfg.get("base_url") or "").rstrip("/")
         if kind in {"openai", "vllm"}:

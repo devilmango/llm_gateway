@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from .tool_validation import validate_tool_schemas
+
 
 class CostReconciliationItem(BaseModel):
     request_id: str = Field(min_length=1, max_length=120)
@@ -95,14 +97,24 @@ class ChatRequest(BaseModel):
     @model_validator(mode="after")
     def validate_generation_options(self) -> ChatRequest:
         if self.tools is not None:
+            names: set[str] = set()
             for tool in self.tools:
                 function = tool.get("function")
                 if (tool.get("type") != "function" or not isinstance(function, dict)
                         or not isinstance(function.get("name"), str) or not function.get("name")):
                     raise ValueError("Each tool must use type=function and include function.name")
+                if function["name"] in names:
+                    raise ValueError("Function names must be unique")
+                names.add(function["name"])
                 parameters = function.get("parameters", {"type": "object"})
                 if not isinstance(parameters, dict) or parameters.get("type") != "object":
                     raise ValueError("Function parameters must be a JSON Schema object")
+            try:
+                validate_tool_schemas(self.tools)
+            except ValueError as exc:
+                raise ValueError(f"Invalid tool schema: {exc}") from exc
+            except Exception as exc:
+                raise ValueError("Invalid tool schema") from exc
         if self.tool_choice is not None and self.tools is None:
             raise ValueError("tool_choice requires tools")
         if isinstance(self.tool_choice, str) and self.tool_choice not in {"auto", "none", "required"}:

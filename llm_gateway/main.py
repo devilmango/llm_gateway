@@ -56,6 +56,7 @@ from .tool_governance import (
     generated_tool_names,
     requested_tool_names,
 )
+from .tool_validation import validate_tool_calls
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("llm_gateway")
@@ -462,6 +463,7 @@ def create_app(config: dict[str, Any] | None = None,
                     stream_completed = False
                     pending_tool_frames: list[str] = []
                     tool_call_names: dict[int, str] = {}
+                    stream_tool_calls: dict[int, dict[str, Any]] = {}
                     tool_calls_validated = False
                     text_delta = 0
                     try:
@@ -482,9 +484,15 @@ def create_app(config: dict[str, Any] | None = None,
                                 if item.get("final"):
                                     stream_result = item
                                     if pending_tool_frames:
-                                        tool_calls_validated = True
                                         await audit_generated_tool_calls(
                                             [tool_call_names[index] for index in sorted(tool_call_names)])
+                                        try:
+                                            validate_tool_calls(
+                                                [stream_tool_calls[index] for index in sorted(stream_tool_calls)],
+                                                upstream_payload.get("tools"))
+                                        except ValueError as exc:
+                                            raise ProviderError(f"Provider returned invalid tool calls: {exc}") from exc
+                                        tool_calls_validated = True
                                         for tool_frame in pending_tool_frames:
                                             stream_frames.append(tool_frame)
                                             yield tool_frame
@@ -504,6 +512,14 @@ def create_app(config: dict[str, Any] | None = None,
                                     call_index = int(tool_call.get("index", 0))
                                     function_delta = tool_call.get("function", {})
                                     tool_call_names[call_index] = tool_call_names.get(call_index, "") + function_delta.get("name", "")
+                                    assembled = stream_tool_calls.setdefault(call_index, {
+                                        "id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                                    if tool_call.get("id"):
+                                        assembled["id"] = tool_call["id"]
+                                    if function_delta.get("name"):
+                                        assembled["function"]["name"] += function_delta["name"]
+                                    if function_delta.get("arguments"):
+                                        assembled["function"]["arguments"] += function_delta["arguments"]
                                     chunk_delta = {"tool_calls": [tool_call]}
                                     frame = "data: " + json.dumps({"id": request_id, "object": "chat.completion.chunk",
                                         "created": int(time.time()), "model": route_name,
@@ -562,12 +578,17 @@ def create_app(config: dict[str, Any] | None = None,
                         configured_model = (stream_result.get("configured_model", model_name) if stream_result
                                             else stream_provider.get("configured_model", model_name))
                         price = cfg["providers"].get(provider_name, {}).get("models", {}).get(configured_model, {}) if provider_name else {}
+                        provider_pricing = cfg["providers"].get(provider_name, {}) if provider_name else {}
+                        pricing_catalog = str(provider_pricing.get("pricing_catalog", "default"))
+                        pricing_version = str(price.get("pricing_version", provider_pricing.get("pricing_version", "unversioned")))
                         cost_value = (usage_data.get("prompt_tokens", 0) * float(price.get("input_cost_per_1m", 0)) +
                                       usage_data.get("completion_tokens", 0) * float(price.get("output_cost_per_1m", 0))) / 1_000_000
                         record = {"request_id": request_id, "occurred_at": datetime.now(UTC).isoformat(),
                             "application": ledger_app_name, "route": route_name, "provider": provider_name,
                             "cost_center": cost_center,
-                            "model": model_name, "prompt_tokens": usage_data.get("prompt_tokens", 0),
+                            "model": model_name, "pricing_catalog": pricing_catalog,
+                            "pricing_version": pricing_version,
+                            "prompt_tokens": usage_data.get("prompt_tokens", 0),
                             "completion_tokens": usage_data.get("completion_tokens", 0),
                             "total_tokens": usage_data.get("total_tokens", 0), "cost_usd": cost_value,
                             "status": status, "latency_ms": elapsed_ms,
@@ -622,6 +643,10 @@ def create_app(config: dict[str, Any] | None = None,
                 result = await request.app.state.gateway.complete(route_name, upstream_payload, request_id,
                                                                   tenant_cfg if tenant else None)
             await audit_generated_tool_calls(generated_tool_names(result.get("tool_calls")))
+            try:
+                validate_tool_calls(result.get("tool_calls", []), upstream_payload.get("tools"))
+            except ValueError as exc:
+                raise ProviderError(f"Provider returned invalid tool calls: {exc}") from exc
             usage = result["usage"]
             provider = result["provider"]
             model = result["model"]
@@ -687,6 +712,11 @@ def create_app(config: dict[str, Any] | None = None,
                               usage_data.get("completion_tokens", 0) * float(report_price.get("output_cost_per_1m", 0))) / 1_000_000
                 record = {"request_id": request_id, "occurred_at": datetime.now(UTC).isoformat(),
                     "application": ledger_app_name, "route": route_name, "provider": provider_name, "model": model_name,
+                    "pricing_catalog": (str(cfg["providers"].get(provider_name, {}).get("pricing_catalog", "default"))
+                                        if provider_name else "default"),
+                    "pricing_version": (str(cfg["providers"].get(provider_name, {}).get("models", {}).get(
+                        configured_model, {}).get("pricing_version", cfg["providers"].get(provider_name, {}).get(
+                            "pricing_version", "unversioned"))) if provider_name else "unversioned"),
                     "cost_center": cost_center,
                     "prompt_tokens": usage_data.get("prompt_tokens", 0), "completion_tokens": usage_data.get("completion_tokens", 0),
                     "total_tokens": usage_data.get("total_tokens", 0), "cost_usd": cost_value,
@@ -765,6 +795,7 @@ def create_app(config: dict[str, Any] | None = None,
                                         cost_center, provider, route, limit)
         output = StringIO()
         fields = ["request_id", "occurred_at", "application", "cost_center", "route", "provider", "model",
+                  "pricing_catalog", "pricing_version",
                   "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status", "latency_ms",
                   "fallback_used", "cached", "canary_used", "actual_cost_usd",
                   "cost_reconciliation_id", "cost_reconciled_at", "error_type"]

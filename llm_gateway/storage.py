@@ -31,7 +31,8 @@ class UsageStore:
                 latency_ms INTEGER NOT NULL DEFAULT 0, fallback_used INTEGER NOT NULL DEFAULT 0,
                 cached INTEGER NOT NULL DEFAULT 0, error_type TEXT,
                 canary_used INTEGER NOT NULL DEFAULT 0, actual_cost_usd REAL,
-                cost_reconciliation_id TEXT, cost_reconciled_at TEXT
+                cost_reconciliation_id TEXT, cost_reconciled_at TEXT,
+                pricing_catalog TEXT NOT NULL DEFAULT 'default', pricing_version TEXT NOT NULL DEFAULT 'unversioned'
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_requests_time ON requests(occurred_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_requests_application ON requests(application)")
@@ -41,7 +42,9 @@ class UsageStore:
             for column, declaration in (("canary_used", "INTEGER NOT NULL DEFAULT 0"),
                                         ("actual_cost_usd", "REAL"),
                                         ("cost_reconciliation_id", "TEXT"),
-                                        ("cost_reconciled_at", "TEXT")):
+                                        ("cost_reconciled_at", "TEXT"),
+                                        ("pricing_catalog", "TEXT NOT NULL DEFAULT 'default'"),
+                                        ("pricing_version", "TEXT NOT NULL DEFAULT 'unversioned'")):
                 if column not in columns:
                     db.execute(f"ALTER TABLE requests ADD COLUMN {column} {declaration}")
             db.execute("""CREATE TABLE IF NOT EXISTS budget_reservations (
@@ -101,9 +104,10 @@ class UsageStore:
 
     def record(self, record: dict[str, Any]) -> None:
         columns = ("request_id", "occurred_at", "application", "route", "provider", "model",
-                   "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status",
+                   "pricing_catalog", "pricing_version", "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status",
                    "latency_ms", "fallback_used", "cached", "error_type", "cost_center", "canary_used")
-        values = [record.get(c, 0 if c == "canary_used" else None) for c in columns]
+        defaults = {"canary_used": 0, "pricing_catalog": "default", "pricing_version": "unversioned"}
+        values = [record.get(c, defaults.get(c)) for c in columns]
         assignments = ",".join(f"{column}=excluded.{column}" for column in columns[1:])
         with self._lock, self._connect() as db:
             db.execute(f"INSERT INTO requests ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)}) "
@@ -290,8 +294,10 @@ class UsageStore:
                 SUM(status != 'success') AS failures,
                 SUM(fallback_used) AS fallbacks FROM requests{where}
                 GROUP BY application ORDER BY cost_usd DESC""", values).fetchall()]
-            by_provider = [dict(row) for row in db.execute(f"SELECT COALESCE(provider,'unknown') AS provider, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd FROM requests{where} GROUP BY provider ORDER BY cost_usd DESC", values).fetchall()]
-            by_model = [dict(row) for row in db.execute(f"SELECT COALESCE(model,'unknown') AS model, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd FROM requests{where} GROUP BY model ORDER BY cost_usd DESC", values).fetchall()]
+            variance = "COALESCE(SUM(CASE WHEN actual_cost_usd IS NOT NULL THEN actual_cost_usd-cost_usd ELSE 0 END),0) AS cost_variance_usd"
+            by_provider = [dict(row) for row in db.execute(f"SELECT COALESCE(provider,'unknown') AS provider, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd, {variance} FROM requests{where} GROUP BY provider ORDER BY cost_usd DESC", values).fetchall()]
+            by_model = [dict(row) for row in db.execute(f"SELECT COALESCE(model,'unknown') AS model, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd, {variance} FROM requests{where} GROUP BY model ORDER BY cost_usd DESC", values).fetchall()]
+            by_pricing_catalog = [dict(row) for row in db.execute(f"SELECT COALESCE(provider,'unknown') AS provider, COALESCE(model,'unknown') AS model, pricing_catalog, pricing_version, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd, {variance} FROM requests{where} GROUP BY provider, model, pricing_catalog, pricing_version ORDER BY cost_usd DESC", values).fetchall()]
             by_route = [dict(row) for row in db.execute(f"SELECT route, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd FROM requests{where} GROUP BY route ORDER BY cost_usd DESC", values).fetchall()]
             by_cost_center = [dict(row) for row in db.execute(f"SELECT COALESCE(cost_center,'unassigned') AS cost_center, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd FROM requests{where} GROUP BY cost_center ORDER BY cost_usd DESC", values).fetchall()]
         summary["failure_rate"] = summary["failures"] / summary["requests"] if summary["requests"] else 0
@@ -300,6 +306,7 @@ class UsageStore:
         summary["by_application"] = by_app
         summary["by_provider"] = by_provider
         summary["by_model"] = by_model
+        summary["by_pricing_catalog"] = by_pricing_catalog
         summary["by_route"] = by_route
         summary["by_cost_center"] = by_cost_center
         return summary

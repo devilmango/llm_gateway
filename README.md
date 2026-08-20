@@ -197,7 +197,7 @@ Each route has a primary `provider` and `model`, an ordered optional `fallbacks`
 
 ### Pricing configuration
 
-`input_cost_per_1m` and `output_cost_per_1m` are USD per million tokens. The gateway multiplies these rates by the provider-reported token counts. A model without an explicit price entry is treated as zero cost, so add a price entry for every billable model. Update prices when provider pricing changes. The report is an estimate, not an invoice; it does not include provider-specific discounts, taxes, or other billing adjustments.
+`input_cost_per_1m` and `output_cost_per_1m` are USD per million tokens. The gateway multiplies these rates by the provider-reported token counts. A model without an explicit price entry is treated as zero cost, so add a price entry for every billable model. Set `pricing_catalog` on a provider and `pricing_version` per model (or on the provider as a default) whenever you update rates. The request ledger preserves the catalog and version used at request time, so `/v1/admin/report` can compare estimates, invoice actuals, and variance by provider/model/catalog without rewriting historical rates. The report is an estimate, not an invoice; it does not include provider-specific discounts, taxes, or other billing adjustments.
 
 ### Environment variables
 
@@ -261,6 +261,10 @@ Supported request fields include `model`, `messages`, `application`, `cost_cente
 
 For tool calling, send OpenAI-style function declarations. The gateway returns normalized assistant `tool_calls`; the application remains responsible for authorizing and executing the functions, then sending their results as `role: "tool"` messages in a follow-up request.
 
+Generated tool-call argument strings must parse as JSON objects and satisfy the declared function's JSON Schema before they are returned. The gateway checks local schema references only; remote `$ref` values are rejected to prevent implicit network fetches. For streaming responses, tool-call chunks are withheld until their complete arguments pass schema validation.
+
+Each upstream attempt receives the gateway's generated request ID in `X-Gateway-Request-ID`, including retries, fallbacks, and streaming calls. Providers that support custom request metadata can use this stable value to correlate their billing exports with `/v1/admin/report` and cost reconciliation.
+
 Optional tool governance restricts declared and generated function names, caps generated calls per request, and can apply a per-tenant/application per-minute call limit. Configure global `tool_governance` and/or tenant `allowed_tools`, `default_policy.max_tool_calls_per_request`, and `default_policy.max_tool_calls_per_minute`; application policies can further narrow the allowlist and limits. Global and tenant allowlists intersect, and configured limits use the most restrictive value. Disallowed declarations are rejected before a provider call. Disallowed or excessive generated calls are withheld and recorded as denied metadata. Successful tool names are audited without arguments. Admins with the `audit` scope can inspect `/v1/admin/tool-audit?tenant_id=support-team`.
 
 ```json
@@ -314,7 +318,7 @@ curl -H 'Authorization: Bearer gateway-secret' \
   'http://localhost:8000/v1/admin/report?start=2026-10-01T00:00:00Z&end=2026-11-01T00:00:00Z&application=support-router'
 ```
 
-`start` is inclusive, `end` is exclusive, and both accept ISO-8601 timestamps. The response includes aggregate requests, input/output/total tokens, estimated and reconciled cost totals, cost variance, failure and fallback rates, canary request counts, average latency, cache hits, and breakdowns by application, provider, model, route, and cost center. Optional `cost_center`, `provider`, and `route` filters can be combined with time and application filters. `GET /v1/admin/report.csv` accepts the same filters and exports at most 100,000 request rows. `cost_usd` remains the estimate used for budgets; actual charges are stored separately.
+`start` is inclusive, `end` is exclusive, and both accept ISO-8601 timestamps. The response includes aggregate requests, input/output/total tokens, estimated and reconciled cost totals, cost variance, failure and fallback rates, canary request counts, average latency, cache hits, and breakdowns by application, provider, model, route, cost center, and provider/model/pricing catalog version. Optional `cost_center`, `provider`, and `route` filters can be combined with time and application filters. `GET /v1/admin/report.csv` accepts the same filters and exports at most 100,000 request rows. `cost_usd` remains the estimate used for budgets; actual charges are stored separately.
 
 Import provider invoice rows as an atomic batch. Every request ID must exist in the ledger; unknown IDs reject the full batch. Re-importing a request replaces its prior actual cost and records the reconciliation source.
 

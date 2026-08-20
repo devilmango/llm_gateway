@@ -13,6 +13,7 @@ from types import ModuleType, SimpleNamespace
 import fakeredis.aioredis
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from llm_gateway.evaluation import compare_routes, evaluate_cases
 from llm_gateway.main import _deliver_webhook_batch, create_app
@@ -318,6 +319,103 @@ async def test_openai_tool_calls_and_structured_output_are_normalized(tmp_path, 
         assert json.loads(body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]) == {"order_id": "A-17"}
         assert received["tool_choice"]["function"]["name"] == "lookup_order"
         assert received["response_format"]["json_schema"]["name"] == "order_result"
+
+
+@pytest.mark.asyncio
+async def test_tool_arguments_are_validated_and_gateway_request_id_is_correlated(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    cfg = config(str(tmp_path / "tool-validation.sqlite3"))
+    cfg["providers"]["backup"]["pricing_catalog"] = "test-rates"
+    cfg["providers"]["backup"]["models"]["backup-model"]["pricing_version"] = "2026-10-test"
+    sent: list[tuple[str, str | None]] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        sent.append((request.url.host, request.headers.get("X-Gateway-Request-ID")))
+        if request.url.host == "primary.test":
+            body = success_response().json()
+            body["choices"][0] = {"message": {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call-bad", "type": "function", "function": {"name": "lookup_order", "arguments": "not-json"}}
+            ]}, "finish_reason": "tool_calls"}
+            return httpx.Response(200, json=body)
+        body = success_response().json()
+        body["choices"][0] = {"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call-ok", "type": "function", "function": {"name": "lookup_order", "arguments": '{"order_id":"A-17"}'}}
+        ]}, "finish_reason": "tool_calls"}
+        body["model"] = "backup-model"
+        return httpx.Response(200, json=body)
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "simple", "application": "support-router",
+            "messages": [{"role": "user", "content": "look up A-17"}],
+            "tools": [{"type": "function", "function": {"name": "lookup_order",
+                "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
+                               "required": ["order_id"], "additionalProperties": False}}}],
+        })
+        assert response.status_code == 200
+        request_id = response.json()["id"]
+        assert response.json()["gateway"]["provider"] == "backup"
+        assert json.loads(response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]) == {
+            "order_id": "A-17"}
+        assert len(sent) == 3  # invalid primary is retried, then fallback succeeds
+        assert {correlation_id for _, correlation_id in sent} == {request_id}
+
+        reconciled = await client.post("/v1/admin/cost-reconciliation", json={
+            "source": "test-invoice", "records": [{"request_id": request_id, "actual_cost_usd": 0.00005}],
+        })
+        assert reconciled.status_code == 200
+        report = (await client.get("/v1/admin/report", params={"application": "support-router"})).json()
+        catalog = report["by_pricing_catalog"][0]
+        assert catalog["provider"] == "backup"
+        assert catalog["model"] == "backup-model"
+        assert catalog["pricing_catalog"] == "test-rates"
+        assert catalog["pricing_version"] == "2026-10-test"
+        assert catalog["actual_cost_usd"] == 0.00005
+        assert catalog["cost_variance_usd"] == pytest.approx(0.00003)
+
+
+def test_request_rejects_invalid_or_remote_referenced_tool_schemas():
+    with pytest.raises(ValidationError, match="Invalid tool schema"):
+        ChatRequest(messages=[{"role": "user", "content": "hello"}], tools=[{
+            "type": "function", "function": {"name": "f", "parameters": {"type": "object",
+                "properties": {"x": {"type": "not-a-schema-type"}}}}
+        }])
+    with pytest.raises(ValidationError, match="local JSON pointer"):
+        ChatRequest(messages=[{"role": "user", "content": "hello"}], tools=[{
+            "type": "function", "function": {"name": "f", "parameters": {
+                "type": "object", "properties": {"x": {"$ref": "https://example.test/schema.json"}}
+            }}
+        }])
+
+
+@pytest.mark.asyncio
+async def test_invalid_streamed_tool_arguments_are_withheld(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    stream_body = (
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function",'
+        '"function":{"name":"lookup_order","arguments":"{\\"order_id\\":17}"}}]}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}\n\n'
+        'data: [DONE]\n\n')
+    seen_ids: list[str | None] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        seen_ids.append(request.headers.get("X-Gateway-Request-ID"))
+        return httpx.Response(200, content=stream_body, headers={"content-type": "text/event-stream"})
+
+    async with gateway_client(config(str(tmp_path / "invalid-stream-tool.sqlite3")),
+                              httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={
+            "model": "simple", "stream": True,
+            "messages": [{"role": "user", "content": "find order"}],
+            "tools": [{"type": "function", "function": {"name": "lookup_order",
+                "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
+                               "required": ["order_id"]}}}],
+        })
+        assert response.status_code == 200
+        assert "event: error" in response.text
+        assert '"tool_calls"' not in response.text
+        assert seen_ids and seen_ids[0]
 
 
 def test_anthropic_and_gemini_tool_and_schema_translation():
