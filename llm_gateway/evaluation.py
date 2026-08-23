@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import os
 import statistics
 import sys
 import time
@@ -135,6 +137,15 @@ async def compare_routes(cases: list[dict[str, Any]], base_url: str, baseline_ro
     return {"baseline": baseline, "candidate": candidate, "comparison": comparison}
 
 
+async def persist_report(base_url: str, api_key: str, metadata: dict[str, Any],
+                         report: dict[str, Any]) -> dict[str, Any]:
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with httpx.AsyncClient(base_url=base_url.rstrip("/"), headers=headers, timeout=30) as client:
+        response = await client.post("/v1/admin/evaluations", json={**metadata, "report": report})
+        response.raise_for_status()
+        return response.json()
+
+
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     cases = []
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -157,6 +168,11 @@ def main() -> None:
     parser.add_argument("--api-key", default=None, help="Gateway bearer key; prefer using a shell env wrapper")
     parser.add_argument("--application", default="llm-gateway-eval")
     parser.add_argument("--output", type=Path, help="Write the JSON report to this path")
+    parser.add_argument("--dataset-name", help="Stable evaluation dataset name; defaults to the file name")
+    parser.add_argument("--dataset-version", help="Immutable version label; defaults to the dataset SHA-256 prefix")
+    parser.add_argument("--persist", action="store_true", help="Save the dataset version and report to the gateway")
+    parser.add_argument("--admin-api-key", default=os.getenv("GATEWAY_ADMIN_API_KEY"),
+                        help="Admin key with report scope; can also use GATEWAY_ADMIN_API_KEY")
     parser.add_argument("--compare", nargs=2, metavar=("BASELINE", "CANDIDATE"),
                         help="Run every case against both logical routes and compare them")
     parser.add_argument("--min-pass-rate", type=float, help="Candidate minimum graded pass rate (0..1)")
@@ -169,6 +185,16 @@ def main() -> None:
     args = parser.parse_args()
     try:
         cases = _load_jsonl(args.dataset)
+        dataset_bytes = args.dataset.read_bytes()
+        dataset_sha256 = hashlib.sha256(dataset_bytes).hexdigest()
+        metadata = {
+            "dataset_name": args.dataset_name or args.dataset.stem,
+            "dataset_version": args.dataset_version or f"sha256:{dataset_sha256[:12]}",
+            "dataset_sha256": dataset_sha256,
+            "case_count": len(cases),
+        }
+        if args.persist and not args.admin_api_key:
+            raise ValueError("--persist requires --admin-api-key or GATEWAY_ADMIN_API_KEY")
         if args.min_pass_rate is not None and not 0 <= args.min_pass_rate <= 1:
             raise ValueError("--min-pass-rate must be between 0 and 1")
         if args.max_failure_rate is not None and not 0 <= args.max_failure_rate <= 1:
@@ -186,7 +212,10 @@ def main() -> None:
         else:
             report = asyncio.run(evaluate_cases(cases, args.url, args.api_key,
                                                 application=args.application))
-    except (OSError, TypeError, ValueError) as exc:
+        report["dataset"] = metadata
+        if args.persist:
+            report["persistence"] = asyncio.run(persist_report(args.url, args.admin_api_key, metadata, report))
+    except (OSError, TypeError, ValueError, httpx.HTTPError) as exc:
         parser.error(str(exc))
     output = json.dumps(report, indent=2, sort_keys=True)
     if args.output:

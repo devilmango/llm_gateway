@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -75,6 +77,26 @@ class UsageStore:
                 tool_name TEXT NOT NULL, outcome TEXT NOT NULL, reason TEXT
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_tool_audit_time ON tool_call_audits(occurred_at)")
+            audit_columns = {row[1] for row in db.execute("PRAGMA table_info(tool_call_audits)")}
+            if "tool_call_id" not in audit_columns:
+                db.execute("ALTER TABLE tool_call_audits ADD COLUMN tool_call_id TEXT")
+            db.execute("""CREATE TABLE IF NOT EXISTS tool_execution_outcomes (
+                request_id TEXT NOT NULL, tool_call_id TEXT NOT NULL, tenant_id TEXT,
+                application TEXT NOT NULL, tool_name TEXT NOT NULL, outcome TEXT NOT NULL,
+                error_code TEXT, occurred_at TEXT NOT NULL,
+                PRIMARY KEY(request_id, tool_call_id)
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_tool_execution_time ON tool_execution_outcomes(occurred_at)")
+            db.execute("""CREATE TABLE IF NOT EXISTS evaluation_datasets (
+                dataset_name TEXT NOT NULL, dataset_version TEXT NOT NULL, dataset_sha256 TEXT NOT NULL,
+                case_count INTEGER NOT NULL, created_at TEXT NOT NULL,
+                PRIMARY KEY(dataset_name, dataset_version)
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS evaluation_runs (
+                run_id TEXT PRIMARY KEY, dataset_name TEXT NOT NULL, dataset_version TEXT NOT NULL,
+                dataset_sha256 TEXT NOT NULL, report TEXT NOT NULL, created_at TEXT NOT NULL
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_evaluation_runs_time ON evaluation_runs(created_at)")
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.database, timeout=10)
@@ -233,21 +255,95 @@ class UsageStore:
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as db:
             db.executemany("""INSERT INTO tool_call_audits
-                (request_id, tenant_id, application, occurred_at, tool_name, outcome, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                [(request_id, tenant_id, application, now, event["tool_name"],
+                (request_id, tenant_id, application, occurred_at, tool_call_id, tool_name, outcome, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(request_id, tenant_id, application, now, event.get("tool_call_id"), event["tool_name"],
                   event["outcome"], event.get("reason")) for event in events])
 
     def tool_call_audit_events(self, tenant_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock, self._connect() as db:
             if tenant_id is None:
                 rows = db.execute("""SELECT request_id, tenant_id, application, occurred_at,
-                    tool_name, outcome, reason FROM tool_call_audits ORDER BY id DESC LIMIT ?""", (limit,))
+                    tool_call_id, tool_name, outcome, reason FROM tool_call_audits ORDER BY id DESC LIMIT ?""", (limit,))
             else:
                 rows = db.execute("""SELECT request_id, tenant_id, application, occurred_at,
-                    tool_name, outcome, reason FROM tool_call_audits WHERE tenant_id = ?
+                    tool_call_id, tool_name, outcome, reason FROM tool_call_audits WHERE tenant_id = ?
                     ORDER BY id DESC LIMIT ?""", (tenant_id, limit))
             return [dict(row) for row in rows.fetchall()]
+
+    def record_tool_execution_outcome(self, request_id: str, tool_call_id: str, tenant_id: str | None,
+                                      application: str, outcome: str, error_code: str | None = None) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            audit = db.execute("""SELECT tenant_id, application, tool_name FROM tool_call_audits
+                WHERE request_id=? AND tool_call_id=? AND outcome='allowed'
+                ORDER BY id DESC LIMIT 1""", (request_id, tool_call_id)).fetchone()
+            if audit is None or audit["tenant_id"] != tenant_id or audit["application"] != application:
+                raise ValueError("No authorized generated tool call matches this request")
+            existing = db.execute("""SELECT outcome, error_code FROM tool_execution_outcomes
+                WHERE request_id=? AND tool_call_id=?""", (request_id, tool_call_id)).fetchone()
+            if existing:
+                if existing["outcome"] != outcome or existing["error_code"] != error_code:
+                    raise ValueError("A different execution outcome is already recorded for this tool call")
+                return {"request_id": request_id, "tool_call_id": tool_call_id,
+                        "tool_name": audit["tool_name"], "outcome": outcome, "duplicate": True}
+            db.execute("""INSERT INTO tool_execution_outcomes
+                (request_id, tool_call_id, tenant_id, application, tool_name, outcome, error_code, occurred_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (request_id, tool_call_id, tenant_id, application, audit["tool_name"], outcome, error_code, now))
+        return {"request_id": request_id, "tool_call_id": tool_call_id,
+                "tool_name": audit["tool_name"], "outcome": outcome, "duplicate": False}
+
+    def tool_execution_outcomes(self, tenant_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as db:
+            if tenant_id is None:
+                rows = db.execute("""SELECT request_id, tool_call_id, tenant_id, application,
+                    tool_name, outcome, error_code, occurred_at FROM tool_execution_outcomes
+                    ORDER BY occurred_at DESC LIMIT ?""", (limit,))
+            else:
+                rows = db.execute("""SELECT request_id, tool_call_id, tenant_id, application,
+                    tool_name, outcome, error_code, occurred_at FROM tool_execution_outcomes
+                    WHERE tenant_id=? ORDER BY occurred_at DESC LIMIT ?""", (tenant_id, limit))
+            return [dict(row) for row in rows.fetchall()]
+
+    def save_evaluation_report(self, dataset_name: str, dataset_version: str, dataset_sha256: str,
+                              case_count: int, report: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        run_id = "eval_" + uuid.uuid4().hex
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""INSERT OR IGNORE INTO evaluation_datasets
+                (dataset_name, dataset_version, dataset_sha256, case_count, created_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (dataset_name, dataset_version, dataset_sha256, case_count, now))
+            dataset = db.execute("""SELECT dataset_sha256, case_count FROM evaluation_datasets
+                WHERE dataset_name=? AND dataset_version=?""", (dataset_name, dataset_version)).fetchone()
+            if dataset["dataset_sha256"] != dataset_sha256 or dataset["case_count"] != case_count:
+                raise ValueError("Dataset name/version already exists with different content")
+            db.execute("""INSERT INTO evaluation_runs
+                (run_id, dataset_name, dataset_version, dataset_sha256, report, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (run_id, dataset_name, dataset_version, dataset_sha256,
+                 json.dumps(report, separators=(",", ":"), sort_keys=True), now))
+        return {"run_id": run_id, "dataset_name": dataset_name, "dataset_version": dataset_version,
+                "dataset_sha256": dataset_sha256, "case_count": case_count, "created_at": now}
+
+    def evaluation_reports(self, dataset_name: str | None = None, dataset_version: str | None = None,
+                           limit: int = 100) -> list[dict[str, Any]]:
+        clauses, values = [], []
+        if dataset_name:
+            clauses.append("dataset_name=?")
+            values.append(dataset_name)
+        if dataset_version:
+            clauses.append("dataset_version=?")
+            values.append(dataset_version)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock, self._connect() as db:
+            rows = db.execute(f"""SELECT run_id, dataset_name, dataset_version, dataset_sha256,
+                report, created_at FROM evaluation_runs{where} ORDER BY created_at DESC LIMIT ?""",
+                [*values, limit]).fetchall()
+            return [{**dict(row), "report": json.loads(row["report"])} for row in rows]
 
     @staticmethod
     def _filters(start: str | None, end: str | None, application: str | None,

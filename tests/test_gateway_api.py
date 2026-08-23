@@ -418,6 +418,65 @@ async def test_invalid_streamed_tool_arguments_are_withheld(tmp_path, monkeypatc
         assert seen_ids and seen_ids[0]
 
 
+@pytest.mark.asyncio
+async def test_tool_execution_outcomes_are_idempotent_and_admin_visible(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("SUPPORT_TENANT_KEY", "support-secret")
+    monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+    tool_response = success_response().json()
+    tool_response["choices"][0] = {"message": {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call-execute-1", "type": "function", "function": {
+            "name": "lookup_order", "arguments": '{"order_id":"A-17"}'}}
+    ]}, "finish_reason": "tool_calls"}
+    cfg = config(str(tmp_path / "tool-outcomes.sqlite3"))
+    cfg["tenants"] = {"support": {"api_key_env": "SUPPORT_TENANT_KEY", "allowed_routes": ["simple"],
+        "allowed_tools": ["lookup_order"], "applications": {"support-router": {}}}}
+    async with gateway_client(cfg,
+                              httpx.MockTransport(lambda _: httpx.Response(200, json=tool_response))) as client:
+        completion = await client.post("/v1/chat/completions", headers={"Authorization": "Bearer support-secret"}, json={
+            "model": "simple", "application": "support-router",
+            "messages": [{"role": "user", "content": "find A-17"}],
+            "tools": [{"type": "function", "function": {"name": "lookup_order",
+                "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}}}}],
+        })
+        assert completion.status_code == 200
+        request_id = completion.json()["id"]
+        outcome = {"request_id": request_id, "tool_call_id": "call-execute-1",
+                   "application": "support-router", "outcome": "succeeded"}
+        first = await client.post("/v1/tool-executions", headers={"Authorization": "Bearer support-secret"}, json=outcome)
+        retry = await client.post("/v1/tool-executions", headers={"Authorization": "Bearer support-secret"}, json=outcome)
+        assert first.status_code == retry.status_code == 200
+        assert first.json()["duplicate"] is False
+        assert retry.json()["duplicate"] is True
+        conflict = await client.post("/v1/tool-executions", headers={"Authorization": "Bearer support-secret"},
+                                     json={**outcome, "outcome": "failed"})
+        assert conflict.status_code == 404
+        events = (await client.get("/v1/admin/tool-executions", headers={
+            "Authorization": "Bearer admin-secret"})).json()["events"]
+        assert len(events) == 1
+        assert events[0]["tool_name"] == "lookup_order"
+        assert events[0]["outcome"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_evaluation_dataset_versions_are_immutable_and_reports_persist(tmp_path):
+    async with gateway_client(config(str(tmp_path / "evaluation-runs.sqlite3")),
+                              httpx.MockTransport(lambda _: success_response())) as client:
+        metadata = {"dataset_name": "support", "dataset_version": "v1",
+                    "dataset_sha256": "a" * 64, "case_count": 2}
+        saved = await client.post("/v1/admin/evaluations", json={**metadata, "report": {
+            "comparison": {"promotion_passed": True}, "baseline": {}, "candidate": {}}})
+        assert saved.status_code == 200
+        listing = await client.get("/v1/admin/evaluations", params={"dataset_name": "support", "dataset_version": "v1"})
+        assert listing.status_code == 200
+        report = listing.json()["reports"][0]
+        assert report["dataset_sha256"] == "a" * 64
+        assert report["report"]["comparison"]["promotion_passed"] is True
+        conflict = await client.post("/v1/admin/evaluations", json={**metadata,
+            "dataset_sha256": "b" * 64, "report": {}})
+        assert conflict.status_code == 409
+
+
 def test_anthropic_and_gemini_tool_and_schema_translation():
     payload = {"messages": [
         {"role": "user", "content": "Find order A-17"},

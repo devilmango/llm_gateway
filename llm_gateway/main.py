@@ -45,6 +45,8 @@ from .schemas import (
     ChatResponse,
     CostReconciliationImportRequest,
     CostReconciliationRequest,
+    EvaluationReportCreate,
+    ToolExecutionOutcomeRequest,
     Usage,
 )
 from .secrets import SecretUnavailable, resolve_secret
@@ -400,9 +402,16 @@ def create_app(config: dict[str, Any] | None = None,
             allowed_tools, max_tool_calls, max_tool_calls_per_minute = effective_tool_policy(
                 cfg.get("tool_governance", {}), tenant_cfg, policy)
 
-            async def audit_generated_tool_calls(names: list[str]) -> None:
+            async def audit_generated_tool_calls(calls: list[dict[str, Any]]) -> None:
+                names = generated_tool_names(calls)
                 if not names:
                     return
+
+                def event(index: int, outcome: str, reason: str | None = None) -> dict[str, Any]:
+                    call_id = calls[index].get("id")
+                    return {"tool_call_id": call_id, "tool_name": names[index] or "<missing>",
+                            "outcome": outcome, "reason": reason}
+
                 denied = []
                 reason = None
                 if any(not name for name in names):
@@ -415,9 +424,9 @@ def create_app(config: dict[str, Any] | None = None,
                     if denied:
                         reason = "tool_not_allowed"
                 if reason:
-                    tool_audit_records.extend({"tool_name": name or "<missing>", "outcome": "denied",
-                        "reason": reason if reason == "max_tool_calls_per_request" or name in denied else "request_blocked"}
-                        for name in names)
+                    tool_audit_records.extend(event(index, "denied",
+                        reason if reason == "max_tool_calls_per_request" or name in denied else "request_blocked")
+                        for index, name in enumerate(names))
                     detail = ("Provider returned more tool calls than the configured per-request limit"
                               if reason == "max_tool_calls_per_request" else
                               "Provider returned a tool not allowed by gateway policy")
@@ -428,12 +437,11 @@ def create_app(config: dict[str, Any] | None = None,
                             await request.app.state.gateway.acquire_application_quota(
                                 f"{ledger_app_name}:tool-calls", max_tool_calls_per_minute)
                     except RateLimitExceeded as exc:
-                        tool_audit_records.extend({"tool_name": name or "<missing>",
-                            "outcome": "denied", "reason": "max_tool_calls_per_minute"} for name in names)
+                        tool_audit_records.extend(event(index, "denied", "max_tool_calls_per_minute")
+                                                  for index, _ in enumerate(names))
                         raise ToolGovernanceError("Tenant tool-call rate limit exceeded", 429,
                                                   "max_tool_calls_per_minute") from exc
-                tool_audit_records.extend({"tool_name": name or "<missing>", "outcome": "allowed", "reason": None}
-                                          for name in names)
+                tool_audit_records.extend(event(index, "allowed") for index, _ in enumerate(names))
 
             requested_names = requested_tool_names(body.tools)
             forbidden_requested = ([name for name in requested_names
@@ -485,7 +493,7 @@ def create_app(config: dict[str, Any] | None = None,
                                     stream_result = item
                                     if pending_tool_frames:
                                         await audit_generated_tool_calls(
-                                            [tool_call_names[index] for index in sorted(tool_call_names)])
+                                            [stream_tool_calls[index] for index in sorted(stream_tool_calls)])
                                         try:
                                             validate_tool_calls(
                                                 [stream_tool_calls[index] for index in sorted(stream_tool_calls)],
@@ -642,7 +650,7 @@ def create_app(config: dict[str, Any] | None = None,
             with trace.use_span(span, end_on_exit=False):
                 result = await request.app.state.gateway.complete(route_name, upstream_payload, request_id,
                                                                   tenant_cfg if tenant else None)
-            await audit_generated_tool_calls(generated_tool_names(result.get("tool_calls")))
+            await audit_generated_tool_calls(result.get("tool_calls", []))
             try:
                 validate_tool_calls(result.get("tool_calls", []), upstream_payload.get("tools"))
             except ValueError as exc:
@@ -869,6 +877,46 @@ def create_app(config: dict[str, Any] | None = None,
                                 limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
         events = await asyncio.to_thread(request.app.state.store.tool_call_audit_events, tenant_id, limit)
         return {"events": events}
+
+    @app.post("/v1/tool-executions")
+    async def report_tool_execution(body: ToolExecutionOutcomeRequest, request: Request,
+                                    tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
+        tenant_id = tenant["id"] if tenant else None
+        application = body.application
+        if tenant:
+            applications = tenant["config"].get("applications", {})
+            if application not in applications:
+                raise HTTPException(status_code=403, detail="Tenant is not permitted to use this application")
+            application = f"{tenant_id}:{application}"
+        try:
+            return await asyncio.to_thread(request.app.state.store.record_tool_execution_outcome,
+                body.request_id, body.tool_call_id, tenant_id, application, body.outcome, body.error_code)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/v1/admin/tool-executions", dependencies=[Depends(admin_dependency("audit"))])
+    async def tool_execution_events(request: Request, tenant_id: str | None = Query(default=None),
+                                    limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
+        events = await asyncio.to_thread(request.app.state.store.tool_execution_outcomes, tenant_id, limit)
+        return {"events": events}
+
+    @app.post("/v1/admin/evaluations", dependencies=[Depends(admin_dependency("report"))])
+    async def persist_evaluation(body: EvaluationReportCreate, request: Request) -> dict[str, Any]:
+        try:
+            result = await asyncio.to_thread(request.app.state.store.save_evaluation_report,
+                body.dataset_name, body.dataset_version, body.dataset_sha256, body.case_count, body.report)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"saved": True, **result}
+
+    @app.get("/v1/admin/evaluations", dependencies=[Depends(admin_dependency("report"))])
+    async def evaluation_reports(request: Request,
+                                 dataset_name: str | None = Query(default=None, max_length=200),
+                                 dataset_version: str | None = Query(default=None, max_length=120),
+                                 limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
+        reports = await asyncio.to_thread(request.app.state.store.evaluation_reports,
+            dataset_name, dataset_version, limit)
+        return {"reports": reports}
 
     @app.get("/v1/admin/webhooks", dependencies=[Depends(admin_dependency("webhooks"))])
     async def webhook_events(request: Request, status: str | None = Query(default=None),

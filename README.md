@@ -267,6 +267,14 @@ Each upstream attempt receives the gateway's generated request ID in `X-Gateway-
 
 Optional tool governance restricts declared and generated function names, caps generated calls per request, and can apply a per-tenant/application per-minute call limit. Configure global `tool_governance` and/or tenant `allowed_tools`, `default_policy.max_tool_calls_per_request`, and `default_policy.max_tool_calls_per_minute`; application policies can further narrow the allowlist and limits. Global and tenant allowlists intersect, and configured limits use the most restrictive value. Disallowed declarations are rejected before a provider call. Disallowed or excessive generated calls are withheld and recorded as denied metadata. Successful tool names are audited without arguments. Admins with the `audit` scope can inspect `/v1/admin/tool-audit?tenant_id=support-team`.
 
+The application still executes tools itself. After execution, report only the outcome metadata; arguments, results, and exception text are not accepted or stored. The gateway verifies the request, tool-call ID, application, and tenant against the generated-call audit record. Repeating the same outcome is idempotent; changing an already recorded outcome is rejected.
+
+```bash
+curl -X POST http://localhost:8000/v1/tool-executions \
+  -H 'Authorization: Bearer tenant-secret' -H 'Content-Type: application/json' \
+  -d '{"request_id":"gw_abc","tool_call_id":"call_123","application":"support-router","outcome":"failed","error_code":"order_service_timeout"}'
+```
+
 ```json
 {
   "model": "simple",
@@ -302,12 +310,16 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/v1/admin/providers` | Provider circuit state and consecutive failure counts. |
 | `GET` | `/v1/admin/audit` | Recent authenticated admin API access events. |
 | `GET` | `/v1/admin/tool-audit` | Metadata-only tool-call decisions, optionally filtered by tenant. |
+| `POST` | `/v1/tool-executions` | Report a caller-executed tool outcome for an authorized generated call. |
+| `GET` | `/v1/admin/tool-executions` | Inspect reported execution outcomes, optionally filtered by tenant. |
+| `POST` | `/v1/admin/evaluations` | Register an immutable evaluation dataset version and save a report. |
+| `GET` | `/v1/admin/evaluations` | List saved evaluation reports by dataset and version. |
 | `GET` | `/v1/admin/webhooks` | Inspect pending, delivered, and dead-letter budget alert events. |
 | `POST` | `/v1/admin/webhooks/{event_id}/redrive` | Retry a dead-letter alert event. |
 | `GET` | `/metrics` | Prometheus metrics in exposition format. |
 | `GET` | `/docs` | FastAPI Swagger UI. |
 
-When tenant credentials are configured, `/v1/chat/completions` and `/v1/routes` require a tenant key, while `/v1/admin/*` requires a `GATEWAY_API_KEY`, scoped admin key, or configured OIDC bearer token. Without tenant configuration, `GATEWAY_API_KEY` optionally protects `/v1` endpoints.
+When tenant credentials are configured, `/v1/chat/completions`, `/v1/routes`, and `/v1/tool-executions` require a tenant key, while `/v1/admin/*` requires a `GATEWAY_API_KEY`, scoped admin key, or configured OIDC bearer token. Without tenant configuration, `GATEWAY_API_KEY` optionally protects `/v1` endpoints.
 
 ## Cost and reliability reporting
 
@@ -348,6 +360,15 @@ llm-gateway-eval prompts.jsonl --url http://localhost:8000 --output eval-report.
 ```
 
 The runner prints per-route pass rate, average and p95 latency, failures, and estimated cost. Expected-text checks are a simple deterministic baseline; use a curated dataset or external judge for semantic quality evaluation.
+
+Give a dataset a stable version and save each run to the gateway for history. The dataset name/version pair is immutable: trying to reuse it with different file contents is rejected. The gateway stores the file SHA-256 and report, not the prompt set itself. Set `GATEWAY_ADMIN_API_KEY` or pass `--admin-api-key` with a key that has the `report` scope.
+
+```bash
+llm-gateway-eval prompts.jsonl --compare simple reasoning \
+  --api-key "$GATEWAY_TENANT_KEY" --admin-api-key "$GATEWAY_ADMIN_API_KEY" \
+  --dataset-name support-prompts --dataset-version 2026-10 \
+  --persist --output route-comparison.json
+```
 
 Compare a candidate route with a baseline on the same prompts and fail the command if promotion thresholds are missed:
 
@@ -495,6 +516,8 @@ Suggested next milestones, ordered by production value:
 - [x] Import actual provider charges and report reconciled cost variance.
 - [x] Re-read provider, tenant, gateway, and admin credentials from rotated secret files.
 - [x] Enforce tenant provider/model/region allowlists and usage metadata retention policies.
+- [x] Version evaluation datasets and persist route-comparison reports.
+- [x] Record caller-reported tool execution outcomes against audited generated calls.
 
 ## Contributing
 

@@ -42,6 +42,28 @@ class CostReconciliationImportRequest(BaseModel):
         return self
 
 
+class EvaluationReportCreate(BaseModel):
+    dataset_name: str = Field(min_length=1, max_length=200)
+    dataset_version: str = Field(min_length=1, max_length=120)
+    dataset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    case_count: int = Field(ge=0, le=100_000)
+    report: dict[str, Any]
+
+
+class ToolExecutionOutcomeRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=120)
+    tool_call_id: str = Field(min_length=1, max_length=200)
+    application: str = Field(min_length=1, max_length=120)
+    outcome: Literal["succeeded", "failed", "skipped"]
+    error_code: str | None = Field(default=None, max_length=80, pattern=r"^[A-Za-z0-9_.-]+$")
+
+    @model_validator(mode="after")
+    def validate_error_code(self) -> ToolExecutionOutcomeRequest:
+        if self.error_code is not None and self.outcome != "failed":
+            raise ValueError("error_code is only valid when outcome is failed")
+        return self
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | list[dict[str, Any]] | None = None
