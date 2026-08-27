@@ -61,6 +61,9 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Scoped admin keys | Configure multiple admin keys with report, budget, provider-health, or webhook scopes; overlap keys during rotation and disable old entries to revoke them. |
 | Cost-center reporting and exports | Tag requests with a cost center, view provider/model/route breakdowns, filter reports, and export request-level records as CSV. |
 | Cost reconciliation | Import actual provider charges by gateway request ID and compare totals and variance with the original per-request estimates. |
+| Saved evaluation comparisons | Compare persisted evaluation runs by route, including pass-rate confidence intervals, cost and latency regressions, failure rates, and optional promotion gates. |
+| Tool execution timeout visibility | Inspect generated tool calls without reported outcomes, flag overdue calls, and scrape pending/overdue counts for Prometheus alerting. |
+| Provider billing correlation metadata | Map the gateway request ID into provider-specific headers and nested request-body fields for invoice matching. |
 | Multimodal image input | Accept OpenAI-style image content parts and translate data URIs or image URLs for supported providers. |
 | Audio input and output | Accept base64 audio input parts and request generated audio for providers whose capability registry enables it. |
 | OIDC/JWT and audit log | Validate admin JWTs against configured issuer/audience/JWKS, enforce scopes, and persist admin request records. |
@@ -263,11 +266,13 @@ For tool calling, send OpenAI-style function declarations. The gateway returns n
 
 Generated tool-call argument strings must parse as JSON objects and satisfy the declared function's JSON Schema before they are returned. The gateway checks local schema references only; remote `$ref` values are rejected to prevent implicit network fetches. For streaming responses, tool-call chunks are withheld until their complete arguments pass schema validation.
 
-Each upstream attempt receives the gateway's generated request ID in `X-Gateway-Request-ID`, including retries, fallbacks, and streaming calls. Providers that support custom request metadata can use this stable value to correlate their billing exports with `/v1/admin/report` and cost reconciliation.
+Each upstream attempt receives the gateway's generated request ID in `X-Gateway-Request-ID`, including retries, fallbacks, and streaming calls. Per-provider `request_id_header` and `request_id_body_field` settings can override the header name and insert the same ID into a provider-supported metadata field. The body path is dot-separated and created when missing. For example, set `request_id_header: X-Invoice-Request` and `request_id_body_field: metadata.gateway_request_id` on one provider. Use only metadata fields supported by that provider; the gateway cannot guarantee the provider retains custom body fields in its invoice export.
 
 Optional tool governance restricts declared and generated function names, caps generated calls per request, and can apply a per-tenant/application per-minute call limit. Configure global `tool_governance` and/or tenant `allowed_tools`, `default_policy.max_tool_calls_per_request`, and `default_policy.max_tool_calls_per_minute`; application policies can further narrow the allowlist and limits. Global and tenant allowlists intersect, and configured limits use the most restrictive value. Disallowed declarations are rejected before a provider call. Disallowed or excessive generated calls are withheld and recorded as denied metadata. Successful tool names are audited without arguments. Admins with the `audit` scope can inspect `/v1/admin/tool-audit?tenant_id=support-team`.
 
 The application still executes tools itself. After execution, report only the outcome metadata; arguments, results, and exception text are not accepted or stored. The gateway verifies the request, tool-call ID, application, and tenant against the generated-call audit record. Repeating the same outcome is idempotent; changing an already recorded outcome is rejected.
+
+Set `tool_governance.execution_timeout_seconds` to control when an unreported outcome is considered overdue (default: 300 seconds). Admins with the `audit` scope can inspect pending calls at `/v1/admin/tool-executions/pending`; the endpoint returns age, timeout, pending count, and overdue count. `/metrics` refreshes `llm_gateway_tool_executions_pending` and `llm_gateway_tool_executions_overdue` on each scrape, so Prometheus can alert when the overdue gauge is above zero.
 
 ```bash
 curl -X POST http://localhost:8000/v1/tool-executions \
@@ -312,8 +317,11 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/v1/admin/tool-audit` | Metadata-only tool-call decisions, optionally filtered by tenant. |
 | `POST` | `/v1/tool-executions` | Report a caller-executed tool outcome for an authorized generated call. |
 | `GET` | `/v1/admin/tool-executions` | Inspect reported execution outcomes, optionally filtered by tenant. |
+| `GET` | `/v1/admin/tool-executions/pending` | Inspect generated tool calls without outcomes and identify overdue calls. |
 | `POST` | `/v1/admin/evaluations` | Register an immutable evaluation dataset version and save a report. |
 | `GET` | `/v1/admin/evaluations` | List saved evaluation reports by dataset and version. |
+| `POST` | `/v1/admin/evaluations/compare` | Compare two saved runs by route and persist cost, latency, pass-rate, and failure gates. |
+| `GET` | `/v1/admin/evaluations/comparisons` | List saved comparisons. |
 | `GET` | `/v1/admin/webhooks` | Inspect pending, delivered, and dead-letter budget alert events. |
 | `POST` | `/v1/admin/webhooks/{event_id}/redrive` | Retry a dead-letter alert event. |
 | `GET` | `/metrics` | Prometheus metrics in exposition format. |
@@ -518,6 +526,9 @@ Suggested next milestones, ordered by production value:
 - [x] Enforce tenant provider/model/region allowlists and usage metadata retention policies.
 - [x] Version evaluation datasets and persist route-comparison reports.
 - [x] Record caller-reported tool execution outcomes against audited generated calls.
+- [x] Compare saved evaluation runs by route with conservative pass-rate intervals and configurable promotion gates.
+- [x] Track pending and overdue tool execution outcomes and expose Prometheus alert metrics.
+- [x] Map gateway request IDs into provider-specific headers and nested body metadata for invoice correlation.
 
 ## Contributing
 

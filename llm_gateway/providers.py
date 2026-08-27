@@ -52,6 +52,31 @@ class ProviderClient:
         self.providers = providers
         self.timeout = timeout
 
+    @staticmethod
+    def _apply_request_correlation(cfg: dict[str, Any], headers: dict[str, str],
+                                   provider_payload: dict[str, Any], request_id: str | None) -> None:
+        if not request_id:
+            return
+        header_name = cfg.get("request_id_header", "X-Gateway-Request-ID")
+        if header_name:
+            headers[str(header_name)] = request_id
+        body_field = cfg.get("request_id_body_field")
+        if body_field:
+            if not isinstance(body_field, str) or any(not part for part in body_field.split(".")):
+                raise ProviderError("Provider request_id_body_field must be a dot-separated path", retryable=False)
+            parts = body_field.split(".")
+            current = provider_payload
+            for part in parts[:-1]:
+                nested = current.get(part)
+                if nested is None:
+                    nested = {}
+                    current[part] = nested
+                if not isinstance(nested, dict):
+                    raise ProviderError("Provider request ID metadata path conflicts with an existing value",
+                                        retryable=False)
+                current = nested
+            current[parts[-1]] = request_id
+
     def validate_capabilities(self, provider_name: str, payload: dict[str, Any], streaming: bool = False) -> None:
         cfg = self.providers[provider_name]
         capabilities = provider_capabilities(cfg)
@@ -85,9 +110,8 @@ class ProviderClient:
             raise ProviderError(f"Provider {provider_name!r} has no API key configured")
         base = (cfg.get("base_url") or "").rstrip("/")
         headers = {"Content-Type": "application/json"}
-        if request_id:
-            headers["X-Gateway-Request-ID"] = request_id
         params = None
+        bedrock_signing: tuple[str, str, str, str, str] | None = None
         self.validate_capabilities(provider_name, payload)
         if kind in {"openai", "vllm"}:
             url = f"{base}/chat/completions"
@@ -146,10 +170,15 @@ class ProviderClient:
                                                      cfg.get("session_token_file"))
             except SecretUnavailable as exc:
                 raise ProviderError("Bedrock credential is unavailable") from exc
-            self._sign_aws_request(url, provider_payload, headers, region, access_key, secret_key, session_token)
+            bedrock_signing = (url, region, access_key, secret_key, session_token)
             normalize_kind = "bedrock"
         else:
             raise ProviderError(f"Unsupported provider kind {kind!r}")
+        self._apply_request_correlation(cfg, headers, provider_payload, request_id)
+        if bedrock_signing:
+            signed_url, region, access_key, secret_key, session_token = bedrock_signing
+            self._sign_aws_request(signed_url, provider_payload, headers, region, access_key, secret_key,
+                                   session_token)
         started = time.perf_counter()
         outcome = "network_error"
         try:
@@ -201,8 +230,6 @@ class ProviderClient:
         if kind not in {"bedrock", "vertex"} and not key and not cfg.get("api_key_optional", False):
             raise ProviderError(f"Provider {provider_name!r} has no API key configured")
         headers = {"Content-Type": "application/json"}
-        if request_id:
-            headers["X-Gateway-Request-ID"] = request_id
         params = None
         base = (cfg.get("base_url") or "").rstrip("/")
         if kind in {"openai", "vllm"}:
@@ -247,6 +274,7 @@ class ProviderClient:
             request_payload = self._gemini_payload(payload)
         else:
             raise ProviderError(f"Unsupported provider kind {kind!r}")
+        self._apply_request_correlation(cfg, headers, request_payload, request_id)
         started = time.perf_counter()
         outcome = "network_error"
         try:

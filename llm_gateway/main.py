@@ -24,6 +24,7 @@ from .capabilities import provider_capabilities
 from .config import load_config, validate_tenant_policies
 from .dashboard import OPERATIONS_DASHBOARD
 from .distributed import RateLimitBackendUnavailable
+from .evaluation import compare_saved_runs
 from .idempotency import IdempotencyRegistry
 from .limiting import RateLimitExceeded
 from .observability import (
@@ -34,6 +35,8 @@ from .observability import (
     LATENCY,
     REQUESTS,
     TOKENS,
+    TOOL_EXECUTIONS_OVERDUE,
+    TOOL_EXECUTIONS_PENDING,
     initialize_tracing,
     metrics_response,
 )
@@ -45,6 +48,7 @@ from .schemas import (
     ChatResponse,
     CostReconciliationImportRequest,
     CostReconciliationRequest,
+    EvaluationCompareRequest,
     EvaluationReportCreate,
     ToolExecutionOutcomeRequest,
     Usage,
@@ -293,7 +297,12 @@ def create_app(config: dict[str, Any] | None = None,
         return response
 
     @app.get("/metrics", include_in_schema=False)
-    async def metrics() -> Response:
+    async def metrics(request: Request) -> Response:
+        timeout_seconds = int(cfg.get("tool_governance", {}).get("execution_timeout_seconds", 300))
+        pending = await asyncio.to_thread(request.app.state.store.pending_tool_execution_calls,
+                                          timeout_seconds, None, 1)
+        TOOL_EXECUTIONS_PENDING.set(pending["pending_count"])
+        TOOL_EXECUTIONS_OVERDUE.set(pending["overdue_count"])
         body, content_type = metrics_response()
         return Response(content=body, media_type=content_type)
 
@@ -900,6 +909,14 @@ def create_app(config: dict[str, Any] | None = None,
         events = await asyncio.to_thread(request.app.state.store.tool_execution_outcomes, tenant_id, limit)
         return {"events": events}
 
+    @app.get("/v1/admin/tool-executions/pending", dependencies=[Depends(admin_dependency("audit"))])
+    async def pending_tool_execution_events(request: Request, tenant_id: str | None = Query(default=None),
+                                            limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
+        timeout_seconds = int(cfg.get("tool_governance", {}).get("execution_timeout_seconds", 300))
+        pending = await asyncio.to_thread(request.app.state.store.pending_tool_execution_calls,
+                                          timeout_seconds, tenant_id, limit)
+        return {**pending, "timeout_seconds": timeout_seconds}
+
     @app.post("/v1/admin/evaluations", dependencies=[Depends(admin_dependency("report"))])
     async def persist_evaluation(body: EvaluationReportCreate, request: Request) -> dict[str, Any]:
         try:
@@ -917,6 +934,31 @@ def create_app(config: dict[str, Any] | None = None,
         reports = await asyncio.to_thread(request.app.state.store.evaluation_reports,
             dataset_name, dataset_version, limit)
         return {"reports": reports}
+
+    @app.post("/v1/admin/evaluations/compare", dependencies=[Depends(admin_dependency("report"))])
+    async def compare_evaluation_reports(body: EvaluationCompareRequest, request: Request) -> dict[str, Any]:
+        if body.baseline_run_id == body.candidate_run_id:
+            raise HTTPException(status_code=400, detail="Baseline and candidate runs must be different")
+        baseline, candidate = await asyncio.gather(
+            asyncio.to_thread(request.app.state.store.evaluation_report, body.baseline_run_id),
+            asyncio.to_thread(request.app.state.store.evaluation_report, body.candidate_run_id))
+        if baseline is None or candidate is None:
+            missing = body.baseline_run_id if baseline is None else body.candidate_run_id
+            raise HTTPException(status_code=404, detail=f"Evaluation run {missing!r} was not found")
+        report = compare_saved_runs(baseline, candidate,
+            min_pass_rate=body.min_pass_rate,
+            max_cost_regression_percent=body.max_cost_regression_percent,
+            max_latency_regression_percent=body.max_latency_regression_percent,
+            max_failure_rate=body.max_failure_rate)
+        saved = await asyncio.to_thread(request.app.state.store.save_evaluation_comparison,
+            body.baseline_run_id, body.candidate_run_id, report)
+        return {"saved": True, **saved, "report": report}
+
+    @app.get("/v1/admin/evaluations/comparisons", dependencies=[Depends(admin_dependency("report"))])
+    async def evaluation_comparisons(request: Request,
+                                     limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
+        comparisons = await asyncio.to_thread(request.app.state.store.evaluation_comparisons, limit)
+        return {"comparisons": comparisons}
 
     @app.get("/v1/admin/webhooks", dependencies=[Depends(admin_dependency("webhooks"))])
     async def webhook_events(request: Request, status: str | None = Query(default=None),

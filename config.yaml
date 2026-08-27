@@ -21,6 +21,7 @@ routing:
 #   allowed_tools: [lookup_order, search_policy]
 #   max_tool_calls_per_request: 8
 #   max_tool_calls_per_minute: 60
+#   execution_timeout_seconds: 300
 
 security:
   redact_pii: true
@@ -89,6 +90,9 @@ providers:
     kind: openai
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
+    # Optional invoice correlation overrides; the body field path is dot-separated.
+    # request_id_header: X-Invoice-Request
+    # request_id_body_field: metadata.gateway_request_id
     # Stable catalog ID; version can be set per model or inherited from this provider.
     pricing_catalog: openai-public-usd
     # Tag the configured deployment's data-processing region for tenant policy checks.

@@ -75,6 +75,7 @@ class PostgresUsageStore:
             )""",
             "CREATE INDEX IF NOT EXISTS idx_tool_audit_time ON tool_call_audits(occurred_at)",
             "ALTER TABLE tool_call_audits ADD COLUMN IF NOT EXISTS tool_call_id TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_tool_audit_execution ON tool_call_audits(request_id, tool_call_id, outcome)",
             """CREATE TABLE IF NOT EXISTS tool_execution_outcomes (
                 request_id TEXT NOT NULL, tool_call_id TEXT NOT NULL, tenant_id TEXT,
                 application TEXT NOT NULL, tool_name TEXT NOT NULL, outcome TEXT NOT NULL,
@@ -92,6 +93,11 @@ class PostgresUsageStore:
                 dataset_sha256 TEXT NOT NULL, report JSONB NOT NULL, created_at TEXT NOT NULL
             )""",
             "CREATE INDEX IF NOT EXISTS idx_evaluation_runs_time ON evaluation_runs(created_at)",
+            """CREATE TABLE IF NOT EXISTS evaluation_comparisons (
+                comparison_id TEXT PRIMARY KEY, baseline_run_id TEXT NOT NULL,
+                candidate_run_id TEXT NOT NULL, report JSONB NOT NULL, created_at TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_evaluation_comparisons_time ON evaluation_comparisons(created_at)",
         ]
         with self.pool.connection() as conn, conn.cursor() as cursor:
             for statement in statements:
@@ -267,6 +273,35 @@ class PostgresUsageStore:
                     ORDER BY id DESC LIMIT %s""", (tenant_id, limit))
             return cursor.fetchall()
 
+    def pending_tool_execution_calls(self, timeout_seconds: int, tenant_id: str | None = None,
+                                     limit: int = 100, now: datetime | None = None) -> dict[str, Any]:
+        current = now or datetime.now(UTC)
+        cutoff = (current - timedelta(seconds=timeout_seconds)).isoformat()
+        tenant_clause = " AND a.tenant_id = %s" if tenant_id is not None else ""
+        values: tuple[Any, ...] = (tenant_id,) if tenant_id is not None else ()
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute(f"""SELECT COUNT(*) AS pending_count,
+                COUNT(*) FILTER (WHERE a.occurred_at <= %s) AS overdue_count
+                FROM tool_call_audits a LEFT JOIN tool_execution_outcomes o
+                ON o.request_id=a.request_id AND o.tool_call_id=a.tool_call_id
+                WHERE a.outcome='allowed' AND a.tool_call_id IS NOT NULL AND o.request_id IS NULL{tenant_clause}""",
+                (cutoff, *values))
+            counts = cursor.fetchone()
+            cursor.execute(f"""SELECT a.request_id, a.tool_call_id, a.tenant_id, a.application,
+                a.occurred_at, a.tool_name FROM tool_call_audits a LEFT JOIN tool_execution_outcomes o
+                ON o.request_id=a.request_id AND o.tool_call_id=a.tool_call_id
+                WHERE a.outcome='allowed' AND a.tool_call_id IS NOT NULL AND o.request_id IS NULL{tenant_clause}
+                ORDER BY a.occurred_at ASC LIMIT %s""", (*values, limit))
+            rows = cursor.fetchall()
+        calls = []
+        for row in rows:
+            call = dict(row)
+            call["age_seconds"] = max(0, round((current - datetime.fromisoformat(call["occurred_at"])).total_seconds(), 2))
+            call["overdue"] = call["occurred_at"] <= cutoff
+            calls.append(call)
+        return {"pending_count": counts["pending_count"] or 0, "overdue_count": counts["overdue_count"] or 0,
+                "calls": calls}
+
     def record_tool_execution_outcome(self, request_id: str, tool_call_id: str, tenant_id: str | None,
                                       application: str, outcome: str, error_code: str | None = None) -> dict[str, Any]:
         now = datetime.now(UTC).isoformat()
@@ -341,6 +376,32 @@ class PostgresUsageStore:
             cursor.execute(f"""SELECT run_id, dataset_name, dataset_version, dataset_sha256,
                 report, created_at FROM evaluation_runs{where} ORDER BY created_at DESC LIMIT %s""",
                 [*values, limit])
+            return cursor.fetchall()
+
+    def evaluation_report(self, run_id: str) -> dict[str, Any] | None:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("""SELECT run_id, dataset_name, dataset_version, dataset_sha256,
+                report, created_at FROM evaluation_runs WHERE run_id=%s""", (run_id,))
+            return cursor.fetchone()
+
+    def save_evaluation_comparison(self, baseline_run_id: str, candidate_run_id: str,
+                                   report: dict[str, Any]) -> dict[str, Any]:
+        import uuid
+        comparison_id = "cmp_" + uuid.uuid4().hex
+        created_at = datetime.now(UTC).isoformat()
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("""INSERT INTO evaluation_comparisons
+                (comparison_id, baseline_run_id, candidate_run_id, report, created_at)
+                VALUES (%s, %s, %s, %s::jsonb, %s)""",
+                (comparison_id, baseline_run_id, candidate_run_id,
+                 json.dumps(report, separators=(",", ":"), sort_keys=True), created_at))
+        return {"comparison_id": comparison_id, "created_at": created_at}
+
+    def evaluation_comparisons(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("""SELECT comparison_id, baseline_run_id, candidate_run_id,
+                report, created_at FROM evaluation_comparisons ORDER BY created_at DESC LIMIT %s""",
+                (limit,))
             return cursor.fetchall()
 
     @staticmethod

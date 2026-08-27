@@ -7,7 +7,7 @@ import json
 import os
 import sys
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import ModuleType, SimpleNamespace
 
 import fakeredis.aioredis
@@ -459,6 +459,44 @@ async def test_tool_execution_outcomes_are_idempotent_and_admin_visible(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_pending_tool_calls_show_overdue_and_export_alert_metrics(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+    tool_response = success_response().json()
+    tool_response["choices"][0] = {"message": {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call-pending-1", "type": "function", "function": {
+            "name": "lookup_order", "arguments": '{"order_id":"A-17"}'}}
+    ]}, "finish_reason": "tool_calls"}
+    cfg = config(str(tmp_path / "pending-tools.sqlite3"))
+    cfg["tool_governance"] = {"execution_timeout_seconds": 1}
+    async with gateway_client(cfg, httpx.MockTransport(lambda _: httpx.Response(200, json=tool_response))) as client:
+        completion = await client.post("/v1/chat/completions", headers={"Authorization": "Bearer admin-secret"}, json={
+            "model": "simple", "messages": [{"role": "user", "content": "find A-17"}],
+            "tools": [{"type": "function", "function": {"name": "lookup_order",
+                "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}}}}],
+        })
+        assert completion.status_code == 200
+        pending = await client.get("/v1/admin/tool-executions/pending",
+                                   headers={"Authorization": "Bearer admin-secret"})
+        assert pending.status_code == 200
+        assert pending.json()["pending_count"] == 1
+        assert pending.json()["overdue_count"] == 0
+        assert pending.json()["calls"][0]["tool_call_id"] == "call-pending-1"
+
+        # Deterministically age the recorded call without sleeping in the test.
+        with client._transport.app.state.store._connect() as db:
+            db.execute("UPDATE tool_call_audits SET occurred_at=? WHERE tool_call_id=?",
+                       ((datetime.now(UTC) - timedelta(seconds=5)).isoformat(), "call-pending-1"))
+        overdue = (await client.get("/v1/admin/tool-executions/pending",
+                                    headers={"Authorization": "Bearer admin-secret"})).json()
+        assert overdue["overdue_count"] == 1
+        assert overdue["calls"][0]["overdue"] is True
+        metrics = (await client.get("/metrics")).text
+        assert "llm_gateway_tool_executions_pending 1.0" in metrics
+        assert "llm_gateway_tool_executions_overdue 1.0" in metrics
+
+
+@pytest.mark.asyncio
 async def test_evaluation_dataset_versions_are_immutable_and_reports_persist(tmp_path):
     async with gateway_client(config(str(tmp_path / "evaluation-runs.sqlite3")),
                               httpx.MockTransport(lambda _: success_response())) as client:
@@ -475,6 +513,31 @@ async def test_evaluation_dataset_versions_are_immutable_and_reports_persist(tmp
         conflict = await client.post("/v1/admin/evaluations", json={**metadata,
             "dataset_sha256": "b" * 64, "report": {}})
         assert conflict.status_code == 409
+
+        baseline = await client.post("/v1/admin/evaluations", json={
+            "dataset_name": "support", "dataset_version": "v2", "dataset_sha256": "c" * 64,
+            "case_count": 2, "report": {"routes": {"simple": {
+                "requests": 2, "graded_cases": 2, "pass_rate": 0.5, "average_latency_ms": 100,
+                "estimated_cost_usd": 0.01, "failures": 1}},
+                "results": [{"route": "simple", "passed": True}, {"route": "simple", "passed": False}]}})
+        candidate = await client.post("/v1/admin/evaluations", json={
+            "dataset_name": "support", "dataset_version": "v3", "dataset_sha256": "d" * 64,
+            "case_count": 2, "report": {"routes": {"simple": {
+                "requests": 2, "graded_cases": 2, "pass_rate": 1.0, "average_latency_ms": 80,
+                "estimated_cost_usd": 0.008, "failures": 0}, "reasoning": {
+                "requests": 2, "graded_cases": 2, "pass_rate": 0.5, "average_latency_ms": 150,
+                "estimated_cost_usd": 0.02, "failures": 1}},
+                "results": [{"route": "simple", "passed": True}, {"route": "simple", "passed": True}]}})
+        compared = await client.post("/v1/admin/evaluations/compare", json={
+            "baseline_run_id": baseline.json()["run_id"], "candidate_run_id": candidate.json()["run_id"],
+            "min_pass_rate": 0.75, "max_cost_regression_percent": 0, "max_failure_rate": 0})
+        assert compared.status_code == 200
+        comparison = compared.json()
+        assert comparison["report"]["routes"]["simple"]["deltas"]["pass_rate"] == 0.5
+        assert comparison["report"]["routes"]["reasoning"]["change"] == "added"
+        assert comparison["report"]["promotion_passed"] is True
+        saved_comparisons = await client.get("/v1/admin/evaluations/comparisons")
+        assert saved_comparisons.json()["comparisons"][0]["comparison_id"] == comparison["comparison_id"]
 
 
 def test_anthropic_and_gemini_tool_and_schema_translation():
@@ -1474,6 +1537,25 @@ async def test_provider_credential_file_rotation_takes_effect_without_recreating
         secret_file.write_text("key-v2\n", encoding="utf-8")
         await client.complete("primary", "primary-model", {"messages": [{"role": "user", "content": "hello"}]})
     assert seen == ["Bearer key-v1", "Bearer key-v2"]
+
+
+@pytest.mark.asyncio
+async def test_provider_request_correlation_supports_custom_header_and_body_path():
+    seen = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        seen.append((request.headers.get("X-Invoice-Request"), json.loads(request.content)))
+        return success_response()
+
+    provider = {"primary": {"kind": "openai", "base_url": "https://primary.test/v1",
+        "api_key_optional": True, "request_id_header": "X-Invoice-Request",
+        "request_id_body_field": "metadata.gateway.request_id", "models": {"primary-model": {}}}}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+        client = ProviderClient(http, provider, 2)
+        await client.complete("primary", "primary-model", {"messages": [
+            {"role": "user", "content": "hello"}]}, request_id="gw_invoice_123")
+    assert seen[0][0] == "gw_invoice_123"
+    assert seen[0][1]["metadata"]["gateway"]["request_id"] == "gw_invoice_123"
 
 
 @pytest.mark.asyncio

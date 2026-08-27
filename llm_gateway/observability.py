@@ -26,6 +26,8 @@ PROVIDER_REQUESTS = Counter("llm_gateway_provider_requests_total", "Provider req
 PROVIDER_RETRIES = Counter("llm_gateway_provider_retries_total", "Retries attempted against providers", ["provider"], registry=REGISTRY)
 PROVIDER_CIRCUIT_STATE = Gauge("llm_gateway_provider_circuit_state", "Provider circuit state (closed=0, half_open=1, open=2)", ["provider"], registry=REGISTRY)
 IN_FLIGHT = Gauge("llm_gateway_requests_in_flight", "Requests currently being handled", registry=REGISTRY)
+TOOL_EXECUTIONS_PENDING = Gauge("llm_gateway_tool_executions_pending", "Generated tool calls without a reported outcome", registry=REGISTRY)
+TOOL_EXECUTIONS_OVERDUE = Gauge("llm_gateway_tool_executions_overdue", "Generated tool calls past the execution outcome deadline", registry=REGISTRY)
 LATENCY = Histogram("llm_gateway_request_duration_seconds", "End-to-end request duration", ["route", "status"], registry=REGISTRY,
                     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60))
 PROVIDER_LATENCY = Histogram("llm_gateway_provider_request_duration_seconds", "Provider request duration by outcome", ["provider", "outcome"], registry=REGISTRY,

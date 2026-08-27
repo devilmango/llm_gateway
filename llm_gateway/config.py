@@ -17,10 +17,12 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
     governance = config.get("tool_governance", {})
     if not isinstance(governance, dict):
         raise TypeError("tool_governance must be an object")
-    for limit_name in ("max_tool_calls_per_request", "max_tool_calls_per_minute"):
+    for limit_name in ("max_tool_calls_per_request", "max_tool_calls_per_minute", "execution_timeout_seconds"):
         limit = governance.get(limit_name)
-        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
-            raise ValueError(f"tool_governance.{limit_name} must be a non-negative integer")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool)
+                or limit < (1 if limit_name == "execution_timeout_seconds" else 0)):
+            qualifier = "positive" if limit_name == "execution_timeout_seconds" else "non-negative"
+            raise ValueError(f"tool_governance.{limit_name} must be a {qualifier} integer")
     global_allowlist = governance.get("allowed_tools")
     if global_allowlist is not None and (not isinstance(global_allowlist, list)
             or any(not isinstance(item, str) or not item for item in global_allowlist)):
@@ -84,7 +86,16 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
             raise ValueError(f"Tenant {tenant_id!r} refers to unknown route(s): {', '.join(sorted(unknown_routes))}")
         if unknown_providers:
             raise ValueError(f"Tenant {tenant_id!r} refers to unknown provider(s): {', '.join(sorted(unknown_providers))}")
-    for provider in config["providers"].values():
+    for provider_name, provider in config["providers"].items():
+        request_id_header = provider.get("request_id_header")
+        if request_id_header is not None and not isinstance(request_id_header, str):
+            raise TypeError(f"Provider {provider_name!r} request_id_header must be a string")
+        if request_id_header and not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", request_id_header):
+            raise ValueError(f"Provider {provider_name!r} request_id_header must be an HTTP header name")
+        body_path = provider.get("request_id_body_field")
+        if body_path is not None and (not isinstance(body_path, str)
+                or any(not part for part in body_path.split("."))):
+            raise ValueError(f"Provider {provider_name!r} request_id_body_field must be a dot-separated path")
         provider_capabilities(provider)
     validate_tenant_policies(config)
     oidc = config.get("security", {}).get("oidc", {})

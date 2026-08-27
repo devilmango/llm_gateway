@@ -50,6 +50,15 @@ class EvaluationReportCreate(BaseModel):
     report: dict[str, Any]
 
 
+class EvaluationCompareRequest(BaseModel):
+    baseline_run_id: str = Field(min_length=1, max_length=120)
+    candidate_run_id: str = Field(min_length=1, max_length=120)
+    min_pass_rate: float | None = Field(default=None, ge=0, le=1)
+    max_cost_regression_percent: float | None = Field(default=None, ge=0)
+    max_latency_regression_percent: float | None = Field(default=None, ge=0)
+    max_failure_rate: float | None = Field(default=None, ge=0, le=1)
+
+
 class ToolExecutionOutcomeRequest(BaseModel):
     request_id: str = Field(min_length=1, max_length=120)
     tool_call_id: str = Field(min_length=1, max_length=200)
