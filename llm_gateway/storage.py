@@ -49,6 +49,7 @@ class UsageStore:
                                         ("pricing_version", "TEXT NOT NULL DEFAULT 'unversioned'")):
                 if column not in columns:
                     db.execute(f"ALTER TABLE requests ADD COLUMN {column} {declaration}")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_requests_anomaly_dimensions ON requests(occurred_at, application, provider, model, pricing_version)")
             db.execute("""CREATE TABLE IF NOT EXISTS budget_reservations (
                 request_id TEXT PRIMARY KEY, application TEXT NOT NULL,
                 amount_usd REAL NOT NULL, reserved_at TEXT NOT NULL, expires_at TEXT NOT NULL
@@ -88,6 +89,14 @@ class UsageStore:
                 PRIMARY KEY(request_id, tool_call_id)
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_tool_execution_time ON tool_execution_outcomes(occurred_at)")
+            db.execute("""CREATE TABLE IF NOT EXISTS routing_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL,
+                occurred_at TEXT NOT NULL, application TEXT NOT NULL, route TEXT NOT NULL,
+                sequence INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+                decision TEXT NOT NULL, reason TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(request_id, sequence)
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_routing_decisions_report ON routing_decisions(occurred_at, application, route, decision)")
             db.execute("""CREATE TABLE IF NOT EXISTS evaluation_datasets (
                 dataset_name TEXT NOT NULL, dataset_version TEXT NOT NULL, dataset_sha256 TEXT NOT NULL,
                 case_count INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -141,6 +150,37 @@ class UsageStore:
             db.execute(f"INSERT INTO requests ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)}) "
                        f"ON CONFLICT(request_id) DO UPDATE SET {assignments}", values)
             db.execute("DELETE FROM budget_reservations WHERE request_id = ?", (record["request_id"],))
+
+    def record_routing_decisions(self, request_id: str, application: str, route: str,
+                                 decisions: list[dict[str, Any]],
+                                 occurred_at: datetime | None = None) -> None:
+        if not decisions:
+            return
+        occurred_at = occurred_at or datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            db.execute("DELETE FROM routing_decisions WHERE request_id=?", (request_id,))
+            db.executemany("""INSERT INTO routing_decisions
+                (request_id, occurred_at, application, route, sequence, provider, model,
+                 decision, reason, attempt_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(request_id, occurred_at.isoformat(), application, route, index,
+                  item["provider"], item["model"], item["decision"], item["reason"],
+                  int(item.get("attempt_count", 0))) for index, item in enumerate(decisions)])
+
+    def routing_decision_events(self, request_id: str | None = None, application: str | None = None,
+                                route: str | None = None, provider: str | None = None,
+                                decision: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        filters, values = [], []
+        for field, value in (("request_id", request_id), ("application", application),
+                             ("route", route), ("provider", provider), ("decision", decision)):
+            if value is not None:
+                filters.append(f"{field} = ?")
+                values.append(value)
+        where = " WHERE " + " AND ".join(filters) if filters else ""
+        with self._lock, self._connect() as db:
+            rows = db.execute(f"""SELECT request_id, occurred_at, application, route, sequence,
+                provider, model, decision, reason, attempt_count FROM routing_decisions{where}
+                ORDER BY occurred_at DESC, sequence ASC LIMIT ?""", [*values, limit]).fetchall()
+            return [dict(row) for row in rows]
 
     def prune_tenant_requests(self, tenant_id: str, retention_days: int,
                               now: datetime | None = None) -> int:
@@ -463,7 +503,89 @@ class UsageStore:
         summary["by_pricing_catalog"] = by_pricing_catalog
         summary["by_route"] = by_route
         summary["by_cost_center"] = by_cost_center
+        decision_filters, decision_values = [], []
+        if start:
+            decision_filters.append("occurred_at >= ?"); decision_values.append(start)
+        if end:
+            decision_filters.append("occurred_at < ?"); decision_values.append(end)
+        if application:
+            decision_filters.append("application = ?"); decision_values.append(application)
+        if route:
+            decision_filters.append("route = ?"); decision_values.append(route)
+        if provider:
+            decision_filters.append("provider = ?"); decision_values.append(provider)
+        decision_where = " WHERE " + " AND ".join(decision_filters) if decision_filters else ""
+        with self._lock, self._connect() as db:
+            summary["by_routing_decision"] = [dict(row) for row in db.execute(f"""SELECT decision, reason,
+                provider, model, COUNT(*) AS decision_events FROM routing_decisions{decision_where}
+                GROUP BY decision, reason, provider, model ORDER BY decision_events DESC""",
+                decision_values).fetchall()]
         return summary
+
+    def cost_anomalies(self, window_hours: int = 24, threshold_percent: float = 50,
+                       min_requests: int = 5, now: datetime | None = None) -> dict[str, Any]:
+        current_end = now or datetime.now(UTC)
+        current_start = current_end - timedelta(hours=window_hours)
+        baseline_start = current_start - timedelta(hours=window_hours)
+        query = """SELECT application, COALESCE(provider, 'unknown') AS provider,
+            COALESCE(model, 'unknown') AS model, pricing_version,
+            SUM(CASE WHEN occurred_at >= ? AND occurred_at < ? THEN 1 ELSE 0 END) AS baseline_requests,
+            SUM(CASE WHEN occurred_at >= ? AND occurred_at < ? THEN 1 ELSE 0 END) AS current_requests,
+            SUM(CASE WHEN occurred_at >= ? AND occurred_at < ? THEN cost_usd ELSE 0 END) AS baseline_cost_usd,
+            SUM(CASE WHEN occurred_at >= ? AND occurred_at < ? THEN cost_usd ELSE 0 END) AS current_cost_usd,
+            SUM(CASE WHEN occurred_at >= ? AND occurred_at < ? THEN total_tokens ELSE 0 END) AS baseline_tokens,
+            SUM(CASE WHEN occurred_at >= ? AND occurred_at < ? THEN total_tokens ELSE 0 END) AS current_tokens
+            FROM requests WHERE occurred_at >= ? AND occurred_at < ? AND status='success'
+            GROUP BY application, provider, model, pricing_version"""
+        params = (baseline_start.isoformat(), current_start.isoformat(),
+                  current_start.isoformat(), current_end.isoformat(),
+                  baseline_start.isoformat(), current_start.isoformat(),
+                  current_start.isoformat(), current_end.isoformat(),
+                  baseline_start.isoformat(), current_start.isoformat(),
+                  current_start.isoformat(), current_end.isoformat(),
+                  baseline_start.isoformat(), current_end.isoformat())
+        with self._lock, self._connect() as db:
+            rows = [dict(row) for row in db.execute(query, params).fetchall()]
+        comparisons = []
+        for row in rows:
+            baseline_n, current_n = int(row["baseline_requests"]), int(row["current_requests"])
+            if baseline_n < min_requests or current_n < min_requests:
+                continue
+            baseline_cost, current_cost = float(row["baseline_cost_usd"]), float(row["current_cost_usd"])
+            baseline_tokens, current_tokens = int(row["baseline_tokens"]), int(row["current_tokens"])
+            before_request = baseline_cost / baseline_n
+            after_request = current_cost / current_n
+            before_token = baseline_cost / baseline_tokens * 1000 if baseline_tokens else 0.0
+            after_token = current_cost / current_tokens * 1000 if current_tokens else 0.0
+
+            def change_percent(before: float, after: float) -> float | str:
+                if before == 0:
+                    return "infinite" if after > 0 else 0.0
+                return round((after - before) / before * 100, 2)
+
+            request_change = change_percent(before_request, after_request)
+            token_change = change_percent(before_token, after_token)
+            request_anomaly = request_change == "infinite" or abs(request_change) > threshold_percent
+            token_anomaly = token_change == "infinite" or abs(token_change) > threshold_percent
+            comparisons.append({
+                "application": row["application"], "provider": row["provider"], "model": row["model"],
+                "pricing_version": row["pricing_version"],
+                "baseline": {"requests": baseline_n, "tokens": baseline_tokens,
+                    "cost_usd": round(baseline_cost, 8), "cost_per_request_usd": round(before_request, 8),
+                    "cost_per_1k_tokens_usd": round(before_token, 8)},
+                "current": {"requests": current_n, "tokens": current_tokens,
+                    "cost_usd": round(current_cost, 8), "cost_per_request_usd": round(after_request, 8),
+                    "cost_per_1k_tokens_usd": round(after_token, 8)},
+                "change_percent": {"per_request": request_change, "per_1k_tokens": token_change},
+                "anomaly": request_anomaly or token_anomaly,
+                "anomaly_dimensions": [name for name, flagged in (("per_request", request_anomaly),
+                    ("per_1k_tokens", token_anomaly)) if flagged],
+            })
+        comparisons.sort(key=lambda item: item["anomaly"], reverse=True)
+        return {"window_hours": window_hours, "threshold_percent": threshold_percent,
+            "min_requests_per_window": min_requests, "baseline_start": baseline_start.isoformat(),
+            "current_start": current_start.isoformat(), "current_end": current_end.isoformat(),
+            "comparisons": comparisons, "anomalies": [item for item in comparisons if item["anomaly"]]}
 
     def export_rows(self, start: str | None, end: str | None, application: str | None,
                     cost_center: str | None = None, provider: str | None = None,

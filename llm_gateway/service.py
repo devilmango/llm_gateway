@@ -146,11 +146,71 @@ class GatewayService:
                     (1.0 + float(sample.get("failure_rate", 0.0)) * 4.0), index)
         return [candidate for _, candidate in sorted(indexed, key=score)]
 
+    @staticmethod
+    def _decision(candidate: dict[str, str], decision: str, reason: str,
+                  attempt_count: int = 0) -> dict[str, Any]:
+        return {"provider": candidate["provider"], "model": candidate["model"],
+                "decision": decision, "reason": reason, "attempt_count": attempt_count}
+
+    def _selection_reason(self, candidate_index: int, candidate: dict[str, str],
+                          preferred: tuple[str, str], canary_config: dict[str, Any] | None,
+                          canary_selected: bool, previous_failure: str | None) -> str:
+        if canary_selected and canary_config and (candidate["provider"], candidate["model"]) == (
+                canary_config.get("provider"), canary_config.get("model")):
+            return "canary_sampled"
+        if candidate_index > 0:
+            return f"prior_candidate_failed:{previous_failure or 'provider_error'}"
+        if self.config.get("routing", {}).get("strategy") == "latency_aware":
+            return "latency_aware_priority"
+        if (candidate["provider"], candidate["model"]) == preferred:
+            return "route_primary"
+        return "preferred_candidate_filtered_by_policy"
+
+    def routing_policy_exclusions(self, route_name: str, request_id: str | None = None,
+                                  tenant_policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        route = self.routes.get(route_name)
+        if route is None:
+            return []
+        candidates = [{"provider": route["provider"], "model": route["model"]},
+                      *route.get("fallbacks", [])]
+        canary = route.get("canary")
+        sampled_canary = bool(canary and request_id is not None and
+            int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 <
+            float(canary.get("traffic_percent", 0)))
+        if sampled_canary:
+            candidates.insert(0, {"provider": canary["provider"], "model": canary["model"]})
+        excluded = []
+        seen = set()
+        for candidate in candidates:
+            key = (candidate["provider"], candidate["model"])
+            if key not in seen and not self._tenant_allows(candidate, tenant_policy):
+                excluded.append(self._decision(candidate, "skipped", "tenant_policy_excluded"))
+            seen.add(key)
+        return excluded
+
+    @staticmethod
+    def _provider_failure_reason(error: ProviderError) -> str:
+        if isinstance(error, ProviderCapabilityError):
+            return "unsupported_capability"
+        if error.status_code == 429:
+            return "upstream_rate_limited"
+        if error.status_code is not None and error.status_code >= 500:
+            return "upstream_server_error"
+        if error.retryable:
+            return "retryable_provider_error"
+        return "provider_error"
+
+    @classmethod
+    def _skip_remaining(cls, decisions: list[dict[str, Any]], candidates: list[dict[str, str]],
+                        start: int, reason: str) -> None:
+        decisions.extend(cls._decision(candidate, "skipped", reason) for candidate in candidates[start:])
+
     async def complete(self, route_name: str, payload: dict[str, Any], request_id: str | None = None,
                        tenant_policy: dict[str, Any] | None = None) -> dict[str, Any]:
         route = self.routes[route_name]
         preferred = (route["provider"], route["model"])
         candidates = await self._order_candidates(self.route_candidates(route_name, request_id, tenant_policy))
+        policy_exclusions = self.routing_policy_exclusions(route_name, request_id, tenant_policy)
         canary_config = route.get("canary")
         canary_selected = bool(canary_config and request_id is not None and
             int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 <
@@ -167,9 +227,15 @@ class GatewayService:
                 # A cache hit incurs no upstream token spend. The response still contains the
                 # cached completion, while gateway usage represents billable upstream usage.
                 cached["usage"] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-                return {**cached, "cached": True, "fallback_used": False}
+                cached_decision = self._decision(
+                    {"provider": cached["provider"], "model": cached.get("configured_model", cached["model"])},
+                    "selected", "response_cache_hit")
+                return {**cached, "cached": True, "fallback_used": False,
+                        "routing_decisions": [cached_decision]}
 
         errors: list[str] = []
+        routing_decisions: list[dict[str, Any]] = []
+        previous_failure: str | None = None
         max_retries = int(self.config["server"].get("max_retries", 2))
         base_delay = float(self.config["server"].get("retry_base_delay_seconds", 0.25))
         async with self._concurrency():
@@ -177,7 +243,10 @@ class GatewayService:
                 name, model = candidate["provider"], candidate["model"]
                 provider_config = self.providers[name]
                 limit = int(provider_config.get("requests_per_minute", 600))
+                candidate_failure: str | None = None
+                attempt_count = 0
                 for attempt in range(max_retries + 1):
+                    attempt_count = attempt + 1
                     started: float | None = None
                     with trace.get_tracer("llm_gateway").start_as_current_span("llm.gateway.provider_attempt") as span:
                         span.set_attribute("llm.gateway.provider", name)
@@ -187,6 +256,7 @@ class GatewayService:
                         try:
                             if not await self.breaker.allow(name):
                                 errors.append(f"{name}: circuit open")
+                                candidate_failure = "circuit_open"
                                 break
                             await self.limiter.acquire(name, limit)
                             started = asyncio.get_running_loop().time()
@@ -203,12 +273,21 @@ class GatewayService:
                             result.update({"provider": name, "configured_model": model,
                                            "fallback_used": (name, model) != preferred and not used_canary,
                                            "cached": False, "canary_used": used_canary})
+                            decision = "fallback" if result["fallback_used"] else "selected"
+                            routing_decisions.append(self._decision(candidate, decision,
+                                self._selection_reason(candidate_index, candidate, preferred, canary_config,
+                                                       canary_selected, previous_failure), attempt_count))
+                            self._skip_remaining(routing_decisions, candidates, candidate_index + 1,
+                                                 "not_needed_after_prior_success")
+                            routing_decisions.extend(policy_exclusions)
+                            result["routing_decisions"] = routing_decisions
                             if cache_cfg.get("enabled") and cache_safe:
                                 await self.cache.put(cache_key, result, int(cache_cfg.get("ttl_seconds", 60)))
                             return result
                         except RateLimitExceeded:
                             await self.breaker.abandon(name)
                             errors.append(f"{name}: rate limited")
+                            candidate_failure = "provider_rate_limited"
                             break
                         except ProviderError as exc:
                             if started is not None and not isinstance(exc, ProviderCapabilityError):
@@ -216,6 +295,7 @@ class GatewayService:
                             span.set_attribute("error.type", type(exc).__name__)
                             span.set_attribute("llm.gateway.retryable", exc.retryable)
                             errors.append(f"{name}: {exc}")
+                            candidate_failure = self._provider_failure_reason(exc)
                             if exc.retryable:
                                 await self.breaker.failure(name)
                             else:
@@ -224,10 +304,22 @@ class GatewayService:
                                 break
                             PROVIDER_RETRIES.labels(provider=name).inc()
                             await asyncio.sleep(min(base_delay * (2 ** attempt), 4.0))
-                        except RateLimitBackendUnavailable:
+                        except RateLimitBackendUnavailable as exc:
                             await self.breaker.abandon(name)
+                            routing_decisions.append(self._decision(
+                                candidate, "skipped", "shared_rate_limit_backend_unavailable", attempt_count))
+                            self._skip_remaining(routing_decisions, candidates, candidate_index + 1,
+                                                 "not_attempted_after_rate_limit_backend_failure")
+                            routing_decisions.extend(policy_exclusions)
+                            exc.routing_decisions = routing_decisions
                             raise
-        raise ProviderError("All configured providers failed: " + "; ".join(errors), retryable=False)
+                routing_decisions.append(self._decision(candidate, "skipped",
+                    candidate_failure or "candidate_failed", attempt_count))
+                previous_failure = candidate_failure or "provider_error"
+        routing_decisions.extend(policy_exclusions)
+        failure = ProviderError("All configured providers failed: " + "; ".join(errors), retryable=False)
+        failure.routing_decisions = routing_decisions
+        raise failure
 
     async def stream_complete(self, route_name: str, payload: dict[str, Any], request_id: str | None = None,
                               tenant_policy: dict[str, Any] | None = None):
@@ -235,6 +327,7 @@ class GatewayService:
         route = self.routes[route_name]
         preferred = (route["provider"], route["model"])
         candidates = await self._order_candidates(self.route_candidates(route_name, request_id, tenant_policy))
+        policy_exclusions = self.routing_policy_exclusions(route_name, request_id, tenant_policy)
         canary_config = route.get("canary")
         canary_selected = bool(canary_config and request_id is not None and
             int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 <
@@ -249,12 +342,17 @@ class GatewayService:
             cached = await self.cache.get(cache_key)
             if cached:
                 yield {"delta": cached["text"]}
+                cached_decision = self._decision(
+                    {"provider": cached["provider"], "model": cached.get("configured_model", cached["model"])},
+                    "selected", "response_cache_hit")
                 yield {**cached, "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                        "provider": cached["provider"], "configured_model": cached.get("configured_model", cached["model"]),
-                       "fallback_used": False, "cached": True, "final": True}
+                       "fallback_used": False, "cached": True, "routing_decisions": [cached_decision], "final": True}
                 return
 
         errors: list[str] = []
+        routing_decisions: list[dict[str, Any]] = []
+        previous_failure: str | None = None
         max_retries = int(self.config["server"].get("max_retries", 2))
         base_delay = float(self.config["server"].get("retry_base_delay_seconds", 0.25))
         async with self._concurrency():
@@ -262,11 +360,15 @@ class GatewayService:
                 name, model = candidate["provider"], candidate["model"]
                 provider_config = self.providers[name]
                 emitted = False
+                candidate_failure: str | None = None
+                attempt_count = 0
                 for attempt in range(max_retries + 1):
+                    attempt_count = attempt + 1
                     started: float | None = None
                     try:
                         if not await self.breaker.allow(name):
                             errors.append(f"{name}: circuit open")
+                            candidate_failure = "circuit_open"
                             break
                         await self.limiter.acquire(name, int(provider_config.get("requests_per_minute", 600)))
                         started = asyncio.get_running_loop().time()
@@ -298,6 +400,14 @@ class GatewayService:
                                   "provider": name, "configured_model": model,
                                   "fallback_used": (name, model) != preferred and not used_canary,
                                   "cached": False, "canary_used": used_canary}
+                        decision = "fallback" if result["fallback_used"] else "selected"
+                        routing_decisions.append(self._decision(candidate, decision,
+                            self._selection_reason(candidate_index, candidate, preferred, canary_config,
+                                                   canary_selected, previous_failure), attempt_count))
+                        self._skip_remaining(routing_decisions, candidates, candidate_index + 1,
+                                             "not_needed_after_prior_success")
+                        routing_decisions.extend(policy_exclusions)
+                        result["routing_decisions"] = routing_decisions
                         if cache_cfg.get("enabled") and cache_safe:
                             await self.cache.put(cache_key, result, int(cache_cfg.get("ttl_seconds", 60)))
                         yield {**result, "final": True}
@@ -305,12 +415,14 @@ class GatewayService:
                     except RateLimitExceeded:
                         await self.breaker.abandon(name)
                         errors.append(f"{name}: rate limited")
+                        candidate_failure = "provider_rate_limited"
                         break
                     except ProviderError as exc:
                         unsupported_capability = isinstance(exc, ProviderCapabilityError)
                         if started is not None and not unsupported_capability:
                             await self.provider_health.record(name, (asyncio.get_running_loop().time() - started) * 1000, False)
                         errors.append(f"{name}: {exc}")
+                        candidate_failure = self._provider_failure_reason(exc)
                         if exc.retryable:
                             await self.breaker.failure(name)
                         else:
@@ -319,13 +431,32 @@ class GatewayService:
                             break
                         # Once a delta is visible to the caller, retrying could duplicate text.
                         if emitted or not exc.retryable or attempt >= max_retries:
+                            routing_decisions.append(self._decision(candidate, "skipped",
+                                "stream_failed_after_output" if emitted else candidate_failure or "provider_error",
+                                attempt_count))
+                            self._skip_remaining(routing_decisions, candidates, candidate_index + 1,
+                                                 "stream_stopped_after_provider_error")
+                            routing_decisions.extend(policy_exclusions)
+                            exc.routing_decisions = routing_decisions
                             raise
                         PROVIDER_RETRIES.labels(provider=name).inc()
                         await asyncio.sleep(min(base_delay * (2 ** attempt), 4.0))
-                    except RateLimitBackendUnavailable:
+                    except RateLimitBackendUnavailable as exc:
                         await self.breaker.abandon(name)
+                        routing_decisions.append(self._decision(
+                            candidate, "skipped", "shared_rate_limit_backend_unavailable", attempt_count))
+                        self._skip_remaining(routing_decisions, candidates, candidate_index + 1,
+                                             "not_attempted_after_rate_limit_backend_failure")
+                        routing_decisions.extend(policy_exclusions)
+                        exc.routing_decisions = routing_decisions
                         raise
-        raise ProviderError("All configured providers failed: " + "; ".join(errors), retryable=False)
+                routing_decisions.append(self._decision(candidate, "skipped",
+                    candidate_failure or "candidate_failed", attempt_count))
+                previous_failure = candidate_failure or "provider_error"
+        routing_decisions.extend(policy_exclusions)
+        failure = ProviderError("All configured providers failed: " + "; ".join(errors), retryable=False)
+        failure.routing_decisions = routing_decisions
+        raise failure
 
     def _concurrency(self):
         if self.shared_redis:

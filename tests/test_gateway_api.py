@@ -93,6 +93,15 @@ async def test_retries_then_falls_back_redacts_and_reports_usage(tmp_path, monke
         assert report["total_tokens"] == 15
         assert report["cost_usd"] == 0.00002
         assert report["fallbacks"] == 1
+        route_history = (await client.get("/v1/admin/routing-decisions",
+            params={"request_id": body["id"]})).json()["events"]
+        assert [(event["provider"], event["decision"], event["reason"], event["attempt_count"])
+                for event in route_history] == [
+                    ("primary", "skipped", "upstream_server_error", 2),
+                    ("backup", "fallback", "prior_candidate_failed:upstream_server_error", 1),
+                ]
+        assert any(row["reason"] == "prior_candidate_failed:upstream_server_error"
+                   for row in report["by_routing_decision"])
         metrics = (await client.get("/metrics")).text
         assert 'llm_gateway_provider_requests_total{outcome="upstream_error",provider="primary"} 2.0' in metrics
         assert 'llm_gateway_provider_retries_total{provider="primary"} 1.0' in metrics
@@ -152,6 +161,37 @@ async def test_monthly_budget_reserves_estimated_spend_before_upstream(tmp_path,
         assert calls == 0
         budget = (await client.get("/v1/admin/budgets")).json()["applications"][0]
         assert budget["monthly_limit_usd"] == 0.000001
+
+
+@pytest.mark.asyncio
+async def test_cost_anomalies_compare_request_and_token_cost_by_pricing_version(tmp_path):
+    now = datetime.now(UTC)
+    async with gateway_client(config(str(tmp_path / "cost-anomalies.sqlite3")),
+                              httpx.MockTransport(lambda _: success_response())) as client:
+        store = client._transport.app.state.store
+        for index in range(5):
+            for occurred_at, cost in ((now - timedelta(hours=30, minutes=index), 0.001),
+                                      (now - timedelta(hours=2, minutes=index), 0.003)):
+                store.record({"request_id": f"anomaly-{index}-{cost}",
+                    "occurred_at": occurred_at.isoformat(), "application": "support-router",
+                    "route": "simple", "provider": "primary", "model": "primary-model",
+                    "pricing_catalog": "test-catalog", "pricing_version": "v7",
+                    "prompt_tokens": 400, "completion_tokens": 600, "total_tokens": 1000,
+                    "cost_usd": cost, "status": "success", "latency_ms": 20,
+                    "fallback_used": 0, "cached": 0, "canary_used": 0})
+
+        detected = await client.get("/v1/admin/cost-anomalies", params={
+            "window_hours": 24, "threshold_percent": 50, "min_requests": 3})
+        assert detected.status_code == 200
+        report = detected.json()
+        assert len(report["anomalies"]) == 1
+        anomaly = report["anomalies"][0]
+        assert (anomaly["application"], anomaly["provider"], anomaly["model"],
+                anomaly["pricing_version"]) == ("support-router", "primary", "primary-model", "v7")
+        assert anomaly["change_percent"] == {"per_request": 200.0, "per_1k_tokens": 200.0}
+        quiet = await client.get("/v1/admin/cost-anomalies", params={
+            "window_hours": 24, "threshold_percent": 250, "min_requests": 3})
+        assert quiet.json()["anomalies"] == []
 
 
 @pytest.mark.asyncio

@@ -61,6 +61,8 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Scoped admin keys | Configure multiple admin keys with report, budget, provider-health, or webhook scopes; overlap keys during rotation and disable old entries to revoke them. |
 | Cost-center reporting and exports | Tag requests with a cost center, view provider/model/route breakdowns, filter reports, and export request-level records as CSV. |
 | Cost reconciliation | Import actual provider charges by gateway request ID and compare totals and variance with the original per-request estimates. |
+| Cost anomaly detection | Compare recent per-request and per-1,000-token costs with the previous equal-length window by application, provider, model, and pricing version. |
+| Routing decision history | Inspect selected, fallback, and skipped provider/model candidates with safe reason codes, retry counts, and report aggregates. |
 | Saved evaluation comparisons | Compare persisted evaluation runs by route, including pass-rate confidence intervals, cost and latency regressions, failure rates, and optional promotion gates. |
 | Tool execution timeout visibility | Inspect generated tool calls without reported outcomes, flag overdue calls, and scrape pending/overdue counts for Prometheus alerting. |
 | Provider billing correlation metadata | Map the gateway request ID into provider-specific headers and nested request-body fields for invoice matching. |
@@ -308,6 +310,8 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `POST` | `/v1/chat/completions` | Make a routed chat completion. |
 | `GET` | `/admin` | Operations dashboard shell; data loads through authenticated admin APIs. |
 | `GET` | `/v1/admin/report` | Aggregate token, cost, and reliability data. |
+| `GET` | `/v1/admin/cost-anomalies` | Compare recent cost rates with the prior window and flag threshold breaches. |
+| `GET` | `/v1/admin/routing-decisions` | Inspect per-request provider/model selection, fallback, and skip reasons. |
 | `GET` | `/v1/admin/report.csv` | Export filtered request-level usage and cost records as CSV (up to 100,000 rows). |
 | `POST` | `/v1/admin/cost-reconciliation` | Atomically import actual costs keyed by gateway request ID. |
 | `POST` | `/v1/admin/cost-reconciliation/import` | Normalize CSV, JSON, or JSONL billing rows and reconcile atomically. |
@@ -339,6 +343,15 @@ curl -H 'Authorization: Bearer gateway-secret' \
 ```
 
 `start` is inclusive, `end` is exclusive, and both accept ISO-8601 timestamps. The response includes aggregate requests, input/output/total tokens, estimated and reconciled cost totals, cost variance, failure and fallback rates, canary request counts, average latency, cache hits, and breakdowns by application, provider, model, route, cost center, and provider/model/pricing catalog version. Optional `cost_center`, `provider`, and `route` filters can be combined with time and application filters. `GET /v1/admin/report.csv` accepts the same filters and exports at most 100,000 request rows. `cost_usd` remains the estimate used for budgets; actual charges are stored separately.
+
+Cost anomaly detection compares successful requests in the latest window with the immediately preceding window of equal length. It groups by application, provider, model, and pricing version, and returns both per-request and USD per 1,000-token changes. Defaults are a 24-hour window, a 50% absolute-change threshold, and at least five requests in each window. Small samples are omitted; zero-cost baselines are flagged when the current cost becomes nonzero.
+
+```bash
+curl -H 'Authorization: Bearer gateway-secret' \
+  'http://localhost:8000/v1/admin/cost-anomalies?window_hours=24&threshold_percent=50&min_requests=5'
+```
+
+Each completed request also records routing outcomes without prompt or response content. The `/v1/admin/report` response includes an aggregate breakdown by decision reason; `GET /v1/admin/routing-decisions?request_id=...` returns the ordered provider/model candidates, whether each was selected, used as a fallback, or skipped, the safe reason code, and retry count. Other supported filters include application, route, provider, and decision.
 
 Import provider invoice rows as an atomic batch. Every request ID must exist in the ledger; unknown IDs reject the full batch. Re-importing a request replaces its prior actual cost and records the reconciliation source.
 
@@ -529,6 +542,8 @@ Suggested next milestones, ordered by production value:
 - [x] Compare saved evaluation runs by route with conservative pass-rate intervals and configurable promotion gates.
 - [x] Track pending and overdue tool execution outcomes and expose Prometheus alert metrics.
 - [x] Map gateway request IDs into provider-specific headers and nested body metadata for invoice correlation.
+- [x] Detect per-request and per-token cost anomalies by application, provider, model, and pricing version.
+- [x] Persist provider/model routing decisions and expose selection, fallback, and skip reasons in reports.
 
 ## Contributing
 

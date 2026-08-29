@@ -392,12 +392,18 @@ def create_app(config: dict[str, Any] | None = None,
             try:
                 request.app.state.gateway.route_candidates(route_name, request_id, tenant_cfg)
             except (KeyError, ValueError) as exc:
+                policy_exclusions = request.app.state.gateway.routing_policy_exclusions(
+                    route_name, request_id, tenant_cfg)
+                if policy_exclusions:
+                    await asyncio.to_thread(request.app.state.store.record_routing_decisions,
+                        request_id, ledger_app_name, route_name, policy_exclusions)
                 raise HTTPException(status_code=403,
                     detail="Tenant data policy does not permit this provider/model route") from exc
         IN_FLIGHT.inc()
         span = TRACER.start_span("llm.gateway.request")
         span.set_attribute("llm.gateway.request_id", request_id)
         result: dict[str, Any] | None = None
+        routing_decisions: list[dict[str, Any]] = []
         error_type: str | None = None
         reservation = 0.0
         policy: dict[str, Any] = {}
@@ -472,6 +478,7 @@ def create_app(config: dict[str, Any] | None = None,
             if body.stream:
                 async def event_stream():
                     stream_result: dict[str, Any] | None = None
+                    stream_routing_decisions: list[dict[str, Any]] = []
                     stream_error: str | None = None
                     status = "success"
                     stream_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -500,6 +507,7 @@ def create_app(config: dict[str, Any] | None = None,
                                     continue
                                 if item.get("final"):
                                     stream_result = item
+                                    stream_routing_decisions = item.get("routing_decisions", [])
                                     if pending_tool_frames:
                                         await audit_generated_tool_calls(
                                             [stream_tool_calls[index] for index in sorted(stream_tool_calls)])
@@ -557,7 +565,8 @@ def create_app(config: dict[str, Any] | None = None,
                         stream_frames.append(frame)
                         yield frame
                         stream_completed = True
-                    except ProviderError:
+                    except ProviderError as exc:
+                        stream_routing_decisions = getattr(exc, "routing_decisions", stream_routing_decisions)
                         status, stream_error = "failure", "upstream_error"
                         frame = "event: error\ndata: " + json.dumps({"error": {"message": "All configured providers failed",
                             "type": "upstream_error", "request_id": request_id}}) + "\n\n"
@@ -577,6 +586,7 @@ def create_app(config: dict[str, Any] | None = None,
                         status, stream_error = "cancelled", "client_disconnected"
                         raise
                     except Exception as exc:
+                        stream_routing_decisions = getattr(exc, "routing_decisions", stream_routing_decisions)
                         status, stream_error = "failure", type(exc).__name__
                         logger.exception("stream_request_failed request_id=%s", request_id)
                         frame = "event: error\ndata: " + json.dumps({"error": {"message": "Gateway stream failed",
@@ -616,6 +626,9 @@ def create_app(config: dict[str, Any] | None = None,
                                                      stream_provider.get("canary_used"))),
                             "error_type": stream_error}
                         await asyncio.to_thread(request.app.state.store.record, record)
+                        if stream_routing_decisions:
+                            await asyncio.to_thread(request.app.state.store.record_routing_decisions,
+                                request_id, ledger_app_name, route_name, stream_routing_decisions)
                         if tool_audit_records:
                             await asyncio.to_thread(request.app.state.store.record_tool_call_audits,
                                 request_id, tenant.get("id") if tenant else None,
@@ -659,6 +672,7 @@ def create_app(config: dict[str, Any] | None = None,
             with trace.use_span(span, end_on_exit=False):
                 result = await request.app.state.gateway.complete(route_name, upstream_payload, request_id,
                                                                   tenant_cfg if tenant else None)
+            routing_decisions = result.get("routing_decisions", [])
             await audit_generated_tool_calls(result.get("tool_calls", []))
             try:
                 validate_tool_calls(result.get("tool_calls", []), upstream_payload.get("tools"))
@@ -706,9 +720,11 @@ def create_app(config: dict[str, Any] | None = None,
             status, error_type = "rejected", "application_rate_limit_exceeded"
             raise HTTPException(status_code=429, detail="Application request quota exceeded") from exc
         except RateLimitBackendUnavailable as exc:
+            routing_decisions = getattr(exc, "routing_decisions", routing_decisions)
             status, error_type = "failure", "shared_rate_limit_store_unavailable"
             raise HTTPException(status_code=503, detail="Shared rate-limit store is unavailable") from exc
         except ProviderError as exc:
+            routing_decisions = getattr(exc, "routing_decisions", routing_decisions)
             status, error_type = "failure", "upstream_error"
             raise HTTPException(status_code=502, detail="All configured providers failed") from exc
         except Exception as exc:
@@ -742,6 +758,9 @@ def create_app(config: dict[str, Any] | None = None,
                     "cached": int(bool(result and result.get("cached"))),
                     "canary_used": int(bool(result and result.get("canary_used"))), "error_type": error_type}
                 await asyncio.to_thread(request.app.state.store.record, record)
+                if routing_decisions:
+                    await asyncio.to_thread(request.app.state.store.record_routing_decisions,
+                        request_id, ledger_app_name, route_name, routing_decisions)
                 if tool_audit_records:
                     await asyncio.to_thread(request.app.state.store.record_tool_call_audits,
                         request_id, tenant.get("id") if tenant else None,
@@ -780,6 +799,27 @@ def create_app(config: dict[str, Any] | None = None,
                                            cost_center, provider, route)
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Invalid report filters") from exc
+
+    @app.get("/v1/admin/cost-anomalies", dependencies=[Depends(admin_dependency("report"))])
+    async def cost_anomalies(request: Request,
+                             window_hours: int = Query(default=24, ge=1, le=720),
+                             threshold_percent: float = Query(default=50, gt=0, le=1000),
+                             min_requests: int = Query(default=5, ge=2, le=100_000)) -> dict[str, Any]:
+        return await asyncio.to_thread(request.app.state.store.cost_anomalies,
+            window_hours, threshold_percent, min_requests)
+
+    @app.get("/v1/admin/routing-decisions", dependencies=[Depends(admin_dependency("audit"))])
+    async def routing_decisions(request: Request, request_id: str | None = Query(default=None, max_length=120),
+                                application: str | None = Query(default=None, max_length=120),
+                                route: str | None = Query(default=None, max_length=120),
+                                provider: str | None = Query(default=None, max_length=120),
+                                decision: str | None = Query(default=None),
+                                limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
+        if decision not in {None, "selected", "fallback", "skipped"}:
+            raise HTTPException(status_code=400, detail="decision must be selected, fallback, or skipped")
+        events = await asyncio.to_thread(request.app.state.store.routing_decision_events,
+            request_id, application, route, provider, decision, limit)
+        return {"events": events}
 
     @app.post("/v1/admin/cost-reconciliation", dependencies=[Depends(admin_dependency("report"))])
     async def reconcile_costs(body: CostReconciliationRequest, request: Request) -> dict[str, Any]:
