@@ -678,7 +678,8 @@ async def test_cancelled_stream_records_usage_received_before_disconnect(tmp_pat
     app = create_app(config(str(tmp_path / "partial-stream.sqlite3")), http_transport=httpx.MockTransport(
         lambda request: httpx.Response(500)))
 
-    async def interrupted_stream(route_name, payload, request_id=None, tenant_policy=None):
+    async def interrupted_stream(route_name, payload, request_id=None, tenant_policy=None,
+                                evaluation_context=None):
         yield {"provider_progress": {"provider": "primary", "model": "primary-model",
             "configured_model": "primary-model", "fallback_used": False}}
         yield {"usage_progress": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}}
@@ -1340,6 +1341,73 @@ async def test_canary_route_is_sampled_and_reported_without_fallback_accounting(
         assert hosts == ["backup.test"]
         report = (await client.get("/v1/admin/report")).json()
         assert report["canary_requests"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ofrep_canary_selection_uses_application_context(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    cfg = config(str(tmp_path / "flag-canary.sqlite3"))
+    cfg["routes"]["simple"]["canary"] = {
+        "provider": "backup", "model": "backup-model", "traffic_percent": 0}
+    cfg["routing"] = {"feature_flags": {"enabled": True, "base_url": "https://flags.test",
+        "flag_key": "canary", "timeout_seconds": 0.5}}
+    seen_context = []
+    provider_hosts = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "flags.test":
+            seen_context.append(json.loads(request.content)["context"])
+            return httpx.Response(200, json={"key": "canary", "value": True,
+                "reason": "TARGETING_MATCH"})
+        provider_hosts.append(request.url.host)
+        return success_response()
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={"model": "simple",
+            "application": "support-router", "messages": [{"role": "user", "content": "hello"}]})
+        assert response.status_code == 200
+        assert response.json()["gateway"]["canary_used"] is True
+        assert provider_hosts == ["backup.test"]
+        assert seen_context == [{"targetingKey": "support-router", "application": "support-router"}]
+        decisions = (await client.get("/v1/admin/routing-decisions")).json()["events"]
+        assert any(item["reason"] == "TARGETING_MATCH" and item["decision"] == "selected"
+                   for item in decisions)
+
+
+@pytest.mark.asyncio
+async def test_ofrep_failure_fails_closed_and_slo_report_tracks_burn(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    cfg = config(str(tmp_path / "slo.sqlite3"))
+    cfg["routes"]["simple"]["canary"] = {
+        "provider": "backup", "model": "backup-model", "traffic_percent": 100}
+    cfg["routing"] = {"feature_flags": {"enabled": True, "base_url": "https://flags.test",
+        "flag_key": "canary", "timeout_seconds": 0.5}}
+    cfg["slos"] = {"default": {"availability_target": 0.9,
+        "latency_target_ms": 0, "latency_objective": 0.9}}
+    provider_hosts = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "flags.test":
+            return httpx.Response(503)
+        provider_hosts.append(request.url.host)
+        return httpx.Response(500)
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={"model": "simple",
+            "application": "billing", "messages": [{"role": "user", "content": "hello"}]})
+        assert response.status_code == 502
+        assert provider_hosts == ["primary.test", "primary.test", "backup.test", "backup.test"]
+        slo = (await client.get("/v1/admin/slos", params={"application": "billing"})).json()
+        row = slo["slos"][0]
+        assert row["requests"] == 1
+        assert row["availability"] == 0
+        assert row["availability_error_budget_burn_rate"] == pytest.approx(10)
+        assert row["latency_compliance"] == 0
+        metrics = (await client.get("/metrics")).text
+        assert "gen_ai_client_inference_duration_seconds" in metrics
+        assert 'llm_gateway_slo_requests_total{application="billing",outcome="failure",route="simple"} 1.0' in metrics
 
 
 @pytest.mark.asyncio

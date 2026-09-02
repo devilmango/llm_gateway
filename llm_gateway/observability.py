@@ -33,6 +33,63 @@ LATENCY = Histogram("llm_gateway_request_duration_seconds", "End-to-end request 
 PROVIDER_LATENCY = Histogram("llm_gateway_provider_request_duration_seconds", "Provider request duration by outcome", ["provider", "outcome"], registry=REGISTRY,
                              buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60))
 
+# GenAI semantic-convention metric names and bounded attributes. These mirror the
+# corresponding OTel instruments so Prometheus dashboards can use the same concepts.
+GEN_AI_OPERATION_DURATION = Histogram(
+    "gen_ai_client_inference_duration_seconds",
+    "Duration of GenAI client inference operations",
+    ["gen_ai_operation_name", "gen_ai_provider_name", "gen_ai_request_model"],
+    registry=REGISTRY, buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
+)
+GEN_AI_INPUT_TOKENS = Counter(
+    "gen_ai_client_inference_usage_input_tokens_total",
+    "Number of input tokens used by GenAI client inference operations",
+    ["gen_ai_operation_name", "gen_ai_provider_name", "gen_ai_request_model"],
+    registry=REGISTRY,
+)
+GEN_AI_OUTPUT_TOKENS = Counter(
+    "gen_ai_client_inference_usage_output_tokens_total",
+    "Number of output tokens used by GenAI client inference operations",
+    ["gen_ai_operation_name", "gen_ai_provider_name", "gen_ai_request_model"],
+    registry=REGISTRY,
+)
+SLO_REQUESTS = Counter(
+    "llm_gateway_slo_requests_total", "Requests counted toward configured SLOs",
+    ["application", "route", "outcome"], registry=REGISTRY,
+)
+SLO_LATENCY_REQUESTS = Counter(
+    "llm_gateway_slo_latency_requests_total", "Requests meeting or missing the configured latency objective",
+    ["application", "route", "outcome"], registry=REGISTRY,
+)
+SLO_AVAILABILITY_TARGET = Gauge(
+    "llm_gateway_slo_availability_target_ratio", "Configured availability objective",
+    ["application", "route"], registry=REGISTRY,
+)
+SLO_LATENCY_TARGET = Gauge(
+    "llm_gateway_slo_latency_target_seconds", "Configured latency objective threshold in seconds",
+    ["application", "route"], registry=REGISTRY,
+)
+SLO_LATENCY_OBJECTIVE = Gauge(
+    "llm_gateway_slo_latency_objective_ratio", "Configured fraction of requests within the latency threshold",
+    ["application", "route"], registry=REGISTRY,
+)
+
+
+def gen_ai_provider_name(provider_config: dict) -> str:
+    """Map gateway adapter kinds to the OpenTelemetry GenAI provider vocabulary."""
+    kind = str(provider_config.get("kind", "")).lower()
+    if kind in {"gemini", "google_genai"}:
+        return "gcp.gemini"
+    if kind == "vertex":
+        return "gcp.vertex_ai"
+    if kind in {"azure_openai", "azure"}:
+        return "azure.ai.openai"
+    if kind == "bedrock":
+        return "aws.bedrock"
+    return {
+        "openai": "openai", "anthropic": "anthropic", "vllm": "openai",
+    }.get(kind, kind or "unknown")
+
 
 def initialize_tracing() -> TracerProvider:
     provider = TracerProvider(resource=Resource.create({"service.name": os.getenv("OTEL_SERVICE_NAME", "llm-gateway")}))

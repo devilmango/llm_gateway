@@ -14,6 +14,25 @@ circuit_breaker:
 routing:
   # `latency_aware` orders configured route candidates by shared EWMA latency and failure rate.
   strategy: primary_first
+  # Optional OpenFeature Remote Evaluation Protocol endpoint. A boolean true value
+  # selects the route's configured canary; timeout/error/invalid values use the
+  # normal primary and fallback order. Context contains application and tenant_id.
+  # feature_flags:
+  #   enabled: true
+  #   base_url: https://flags.example.com
+  #   flag_key: llm-gateway-canary
+  #   bearer_token_env: OPENFEATURE_OFREP_BEARER_TOKEN
+  #   timeout_seconds: 0.5
+
+# Route/application SLO objectives. Per-route and per-application maps override
+# defaults; application values take precedence when both are configured.
+slos:
+  default:
+    availability_target: 0.99
+    latency_target_ms: 1000
+    latency_objective: 0.95
+  applications: {}
+  routes: {}
 
 # Optional tool-call guardrails. When configured, these apply to every caller;
 # tenant/application values may only make the limits more restrictive.

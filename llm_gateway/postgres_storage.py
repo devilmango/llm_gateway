@@ -532,6 +532,15 @@ class PostgresUsageStore:
             summary["by_routing_decision"] = cursor.fetchall()
         return summary
 
+    def slo_observations(self, start: str, end: str) -> list[dict[str, Any]]:
+        """Return request outcome/latency distributions grouped by application and route."""
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("""SELECT application, route, status, latency_ms, COUNT(*) AS requests
+                FROM requests WHERE occurred_at >= %s AND occurred_at < %s
+                GROUP BY application, route, status, latency_ms
+                ORDER BY application, route, status, latency_ms""", (start, end))
+            return cursor.fetchall()
+
     def cost_anomalies(self, window_hours: int = 24, threshold_percent: float = 50,
                        min_requests: int = 5, now: datetime | None = None) -> dict[str, Any]:
         current_end = now or datetime.now(UTC)

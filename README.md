@@ -46,10 +46,12 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Application reporting | Group usage and reliability totals by application, provider, model, route, and cost center. |
 | Application budgets and quotas | Enforce UTC calendar-month spend caps, per-application request rates, and request size/output bounds. Reserve estimated maximum cost before provider calls to limit concurrent overspend. |
 | Budget alerts | Emit structured warning logs and optional signed webhook events when configured spend thresholds (80% and 100% by default) are crossed. |
-| Observability | Export Prometheus request, token, cost, fallback, cache, in-flight, end-to-end latency, provider outcome/latency, and retry metrics; emit nested OpenTelemetry request/provider-attempt spans and optionally export them over OTLP/HTTP. |
+| Observability | Export Prometheus request, token, cost, fallback, cache, in-flight, end-to-end latency, provider outcome/latency, retry, SLO, and GenAI semantic-convention metrics; emit OpenTelemetry GenAI request/provider-attempt attributes and optionally export spans over OTLP/HTTP. Message content is excluded from telemetry. |
 | Provider health | Open a circuit after repeated transient failures, skip open providers, and allow a single half-open probe after the recovery period. Redis shares circuit state across replicas. |
 | Latency-aware routing | Optionally order a route's primary and fallback candidates using shared provider EWMA latency and failure-rate signals. |
 | Canary routing and evaluation | Deterministically send a configured share of requests to a candidate provider/model; evaluate JSONL prompt sets by pass rate, latency, and estimated cost using `llm-gateway-eval`. |
+| Context-aware canary flags | Optionally evaluate an OpenFeature Remote Evaluation Protocol boolean flag with application and tenant context. Evaluation errors fail closed to the normal route. |
+| Route and application SLOs | Report availability and latency objective compliance and error-budget burn; ship example Prometheus recording and alerting rules. |
 | Streaming | Stream OpenAI-compatible, Azure, Anthropic, Gemini, and Vertex output as server-sent events, including tool-call and audio deltas where supported; account usage at completion. |
 | Tenant data policies | Restrict tenants to allowed routes, providers, models, and tagged processing regions; automatically expire tenant usage metadata on a per-tenant retention schedule. |
 | Dynamic credential rotation | Re-read mounted provider, tenant, gateway, and scoped-admin secret files on each use so CSI/agent-managed secret rotations take effect without restarting the gateway. |
@@ -310,6 +312,7 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `POST` | `/v1/chat/completions` | Make a routed chat completion. |
 | `GET` | `/admin` | Operations dashboard shell; data loads through authenticated admin APIs. |
 | `GET` | `/v1/admin/report` | Aggregate token, cost, and reliability data. |
+| `GET` | `/v1/admin/slos` | Report route/application availability and latency objectives with error-budget burn. |
 | `GET` | `/v1/admin/cost-anomalies` | Compare recent cost rates with the prior window and flag threshold breaches. |
 | `GET` | `/v1/admin/routing-decisions` | Inspect per-request provider/model selection, fallback, and skip reasons. |
 | `GET` | `/v1/admin/report.csv` | Export filtered request-level usage and cost records as CSV (up to 100,000 rows). |
@@ -343,6 +346,47 @@ curl -H 'Authorization: Bearer gateway-secret' \
 ```
 
 `start` is inclusive, `end` is exclusive, and both accept ISO-8601 timestamps. The response includes aggregate requests, input/output/total tokens, estimated and reconciled cost totals, cost variance, failure and fallback rates, canary request counts, average latency, cache hits, and breakdowns by application, provider, model, route, cost center, and provider/model/pricing catalog version. Optional `cost_center`, `provider`, and `route` filters can be combined with time and application filters. `GET /v1/admin/report.csv` accepts the same filters and exports at most 100,000 request rows. `cost_usd` remains the estimate used for budgets; actual charges are stored separately.
+
+### Route and application SLOs
+
+Configure defaults and optional per-route or per-application overrides in `slos`:
+
+```yaml
+slos:
+  default:
+    availability_target: 0.99
+    latency_target_ms: 1000
+    latency_objective: 0.95
+  applications:
+    support-router:
+      availability_target: 0.999
+  routes:
+    reasoning:
+      latency_target_ms: 3000
+```
+
+`GET /v1/admin/slos?window_hours=24` reports observed availability, latency compliance, and each objective's error-budget burn rate and remaining percentage by application and route. Latency compliance measures requests within `latency_target_ms`; availability counts requests with status `success`. Example Prometheus rules are in [`deploy/prometheus/llm-gateway-slo.rules.yml`](deploy/prometheus/llm-gateway-slo.rules.yml). Load the file using Prometheus `rule_files`; the example alerts use a 14.4x short-window burn threshold.
+
+### Context-aware canary routing
+
+Deterministic `traffic_percent` canaries continue to work without a flag service. For dynamic targeting, configure an OFREP-compatible endpoint:
+
+```yaml
+routing:
+  strategy: primary_first
+  feature_flags:
+    enabled: true
+    base_url: https://flags.example.com
+    flag_key: llm-gateway-canary
+    bearer_token_env: OPENFEATURE_OFREP_BEARER_TOKEN
+    timeout_seconds: 0.5
+```
+
+For each request with a configured route canary, the gateway posts to `/ofrep/v1/evaluate/flags/{flag_key}` with `targetingKey`, `application`, and (for authenticated tenants) `tenant_id`. A boolean `true` selects the canary. False values, timeouts, malformed responses, and provider errors retain the normal primary/fallback order and appear in routing-decision history. Request messages and user content are excluded from flag context and telemetry.
+
+### GenAI telemetry
+
+Spans include `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, and token usage attributes where available. Prometheus exposes the normalized GenAI inference metrics `gen_ai_client_inference_duration_seconds`, `gen_ai_client_inference_usage_input_tokens_total`, and `gen_ai_client_inference_usage_output_tokens_total`, with operation, provider, and model labels. The gateway does not emit GenAI input/output message attributes.
 
 Cost anomaly detection compares successful requests in the latest window with the immediately preceding window of equal length. It groups by application, provider, model, and pricing version, and returns both per-request and USD per 1,000-token changes. Defaults are a 24-hour window, a 50% absolute-change threshold, and at least five requests in each window. Small samples are omitted; zero-cost baselines are flagged when the current cost becomes nonzero.
 
@@ -544,6 +588,9 @@ Suggested next milestones, ordered by production value:
 - [x] Map gateway request IDs into provider-specific headers and nested body metadata for invoice correlation.
 - [x] Detect per-request and per-token cost anomalies by application, provider, model, and pricing version.
 - [x] Persist provider/model routing decisions and expose selection, fallback, and skip reasons in reports.
+- [x] Add OpenTelemetry GenAI semantic attributes and token/duration metrics without message content.
+- [x] Support optional context-aware canary selection through OpenFeature OFREP with fail-closed defaults.
+- [x] Report route/application SLOs and provide Prometheus recording and alert rules.
 
 ## Contributing
 

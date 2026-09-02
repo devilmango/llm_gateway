@@ -3,8 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import re
 from typing import Any
+from urllib.parse import quote
 
+import httpx
 from opentelemetry import trace
 
 from .cache import RedisResponseCache, ResponseCache
@@ -15,7 +19,7 @@ from .distributed import (
     RedisSlidingWindowLimiter,
 )
 from .limiting import RateLimitExceeded, SlidingWindowLimiter
-from .observability import PROVIDER_RETRIES
+from .observability import PROVIDER_RETRIES, gen_ai_provider_name
 from .provider_health import ProviderHealth
 from .providers import ProviderCapabilityError, ProviderClient, ProviderError
 from .tool_validation import validate_tool_calls
@@ -24,6 +28,7 @@ from .tool_validation import validate_tool_calls
 class GatewayService:
     def __init__(self, config: dict[str, Any], http: Any, shared_redis: Any | None = None):
         self.config = config
+        self.http = http
         self.providers = config["providers"]
         self.routes = config["routes"]
         self.client = ProviderClient(http, self.providers, float(config["server"].get("request_timeout_seconds", 45)))
@@ -72,7 +77,8 @@ class GatewayService:
 
     def route_candidates(self, route_name: str, request_id: str | None = None,
                          tenant_policy: dict[str, Any] | None = None,
-                         include_canary: bool = True) -> list[dict[str, str]]:
+                         include_canary: bool = True,
+                         canary_enabled: bool | None = None) -> list[dict[str, str]]:
         if route_name not in self.routes:
             raise KeyError(route_name)
         route = self.routes[route_name]
@@ -92,14 +98,55 @@ class GatewayService:
                 raise ValueError(f"Route {route_name!r} canary must reference a configured provider and model")
             # Without a request id return the union so budget reservations account for the
             # most expensive possible target. Live requests use a stable sample per request.
-            sampled = percentage > 0 and (request_id is None or
-                int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 < percentage)
+            sampled = (canary_enabled if canary_enabled is not None else
+                percentage > 0 and (request_id is None or
+                int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 < percentage))
             if sampled and self._tenant_allows(canary_candidate, tenant_policy):
                 candidates = [canary_candidate, *candidates]
         candidates = [candidate for candidate in candidates if self._tenant_allows(candidate, tenant_policy)]
         if not candidates:
             raise ValueError("Tenant data policy does not permit any provider/model candidate for this route")
         return candidates
+
+    async def _feature_flag_canary(self, route_name: str, request_id: str | None,
+                                   context: dict[str, Any] | None) -> tuple[bool | None, str | None]:
+        """Evaluate an optional OFREP boolean flag; failures safely leave canary disabled."""
+        flag_config = self.config.get("routing", {}).get("feature_flags", {})
+        if not flag_config.get("enabled"):
+            return None, None
+        route = self.routes.get(route_name, {})
+        if not route.get("canary"):
+            return None, None
+        endpoint = str(flag_config.get("base_url", "")).rstrip("/")
+        key = str(flag_config.get("flag_key", "")).strip()
+        if not endpoint or not key:
+            return False, "feature_flag_misconfigured"
+        url = endpoint if "/ofrep/v1/evaluate/flags/" in endpoint else (
+            f"{endpoint}/ofrep/v1/evaluate/flags/{quote(key, safe='')}")
+        app_context = {k: v for k, v in (context or {}).items()
+                       if k in {"application", "tenant_id"} and isinstance(v, (str, int, float, bool))}
+        targeting_key = str(app_context.get("tenant_id") or app_context.get("application") or "llm-gateway")
+        evaluation_context = {"targetingKey": targeting_key, **app_context}
+        headers: dict[str, str] = {}
+        token_env = flag_config.get("bearer_token_env")
+        token = os.getenv(str(token_env)) if token_env else None
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            response = await self.http.post(url, json={"context": evaluation_context}, headers=headers,
+                timeout=float(flag_config.get("timeout_seconds", 0.5)))
+            response.raise_for_status()
+            result = response.json()
+            value = result.get("value")
+            if not isinstance(value, bool):
+                return False, "feature_flag_invalid_value"
+            reason = str(result.get("reason") or "")
+            safe_reason = reason if re.fullmatch(r"[A-Za-z0-9_]{1,64}", reason) else (
+                "feature_flag_enabled" if value else "feature_flag_disabled")
+            return value, safe_reason
+        except (httpx.HTTPError, ValueError, TypeError, AttributeError, KeyError) as exc:
+            # Do not include provider response bodies or credentials in logs/decisions.
+            return False, f"feature_flag_error:{type(exc).__name__}"
 
     def _tenant_allows(self, candidate: dict[str, str], tenant_policy: dict[str, Any] | None) -> bool:
         if not tenant_policy:
@@ -167,16 +214,18 @@ class GatewayService:
         return "preferred_candidate_filtered_by_policy"
 
     def routing_policy_exclusions(self, route_name: str, request_id: str | None = None,
-                                  tenant_policy: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                                  tenant_policy: dict[str, Any] | None = None,
+                                  canary_enabled: bool | None = None) -> list[dict[str, Any]]:
         route = self.routes.get(route_name)
         if route is None:
             return []
         candidates = [{"provider": route["provider"], "model": route["model"]},
                       *route.get("fallbacks", [])]
         canary = route.get("canary")
-        sampled_canary = bool(canary and request_id is not None and
-            int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 <
-            float(canary.get("traffic_percent", 0)))
+        sampled_canary = (canary_enabled if canary_enabled is not None else
+            bool(canary and request_id is not None and
+                int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 <
+                float(canary.get("traffic_percent", 0))))
         if sampled_canary:
             candidates.insert(0, {"provider": canary["provider"], "model": canary["model"]})
         excluded = []
@@ -206,16 +255,28 @@ class GatewayService:
         decisions.extend(cls._decision(candidate, "skipped", reason) for candidate in candidates[start:])
 
     async def complete(self, route_name: str, payload: dict[str, Any], request_id: str | None = None,
-                       tenant_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+                       tenant_policy: dict[str, Any] | None = None,
+                       evaluation_context: dict[str, Any] | None = None) -> dict[str, Any]:
         route = self.routes[route_name]
         preferred = (route["provider"], route["model"])
-        candidates = await self._order_candidates(self.route_candidates(route_name, request_id, tenant_policy))
-        policy_exclusions = self.routing_policy_exclusions(route_name, request_id, tenant_policy)
+        feature_canary, feature_reason = await self._feature_flag_canary(route_name, request_id, evaluation_context)
+        candidates = await self._order_candidates(self.route_candidates(route_name, request_id, tenant_policy,
+            canary_enabled=feature_canary))
+        policy_exclusions = self.routing_policy_exclusions(route_name, request_id, tenant_policy,
+                                                           canary_enabled=feature_canary)
         canary_config = route.get("canary")
-        canary_selected = bool(canary_config and request_id is not None and
+        canary_candidate = ({"provider": canary_config.get("provider"), "model": canary_config.get("model")}
+                            if canary_config else None)
+        static_canary_selected = bool(canary_config and request_id is not None and
             int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 <
-            float(canary_config.get("traffic_percent", 0)) and
-            {"provider": canary_config.get("provider"), "model": canary_config.get("model")} in candidates)
+            float(canary_config.get("traffic_percent", 0)))
+        canary_selected = bool(canary_config and canary_candidate in candidates and
+                               (feature_canary is True or
+                                (feature_canary is None and static_canary_selected)))
+        if feature_reason:
+            policy_exclusions.append(self._decision(
+                canary_candidate,
+                "selected" if canary_selected else "skipped", feature_reason))
         if canary_selected:
             candidates = self._prioritize_canary(candidates, canary_config)
         cache_cfg = route.get("cache", {})
@@ -251,6 +312,9 @@ class GatewayService:
                     with trace.get_tracer("llm_gateway").start_as_current_span("llm.gateway.provider_attempt") as span:
                         span.set_attribute("llm.gateway.provider", name)
                         span.set_attribute("llm.gateway.model", model)
+                        span.set_attribute("gen_ai.operation.name", "chat")
+                        span.set_attribute("gen_ai.provider.name", gen_ai_provider_name(provider_config))
+                        span.set_attribute("gen_ai.request.model", model)
                         span.set_attribute("llm.gateway.attempt", attempt + 1)
                         span.set_attribute("llm.gateway.fallback_index", candidate_index)
                         try:
@@ -261,6 +325,10 @@ class GatewayService:
                             await self.limiter.acquire(name, limit)
                             started = asyncio.get_running_loop().time()
                             result = await self.client.complete(name, model, payload, request_id=request_id)
+                            span.set_attribute("gen_ai.response.model", str(result.get("model") or model))
+                            usage = result.get("usage", {})
+                            span.set_attribute("gen_ai.usage.input_tokens", int(usage.get("prompt_tokens", 0)))
+                            span.set_attribute("gen_ai.usage.output_tokens", int(usage.get("completion_tokens", 0)))
                             try:
                                 validate_tool_calls(result.get("tool_calls", []), payload.get("tools"),
                                                     reject_undeclared=False)
@@ -322,17 +390,29 @@ class GatewayService:
         raise failure
 
     async def stream_complete(self, route_name: str, payload: dict[str, Any], request_id: str | None = None,
-                              tenant_policy: dict[str, Any] | None = None):
+                              tenant_policy: dict[str, Any] | None = None,
+                              evaluation_context: dict[str, Any] | None = None):
         """Yield provider text deltas; retries/fallbacks stop once text was emitted."""
         route = self.routes[route_name]
         preferred = (route["provider"], route["model"])
-        candidates = await self._order_candidates(self.route_candidates(route_name, request_id, tenant_policy))
-        policy_exclusions = self.routing_policy_exclusions(route_name, request_id, tenant_policy)
+        feature_canary, feature_reason = await self._feature_flag_canary(route_name, request_id, evaluation_context)
+        candidates = await self._order_candidates(self.route_candidates(route_name, request_id, tenant_policy,
+            canary_enabled=feature_canary))
+        policy_exclusions = self.routing_policy_exclusions(route_name, request_id, tenant_policy,
+                                                           canary_enabled=feature_canary)
         canary_config = route.get("canary")
-        canary_selected = bool(canary_config and request_id is not None and
+        canary_candidate = ({"provider": canary_config.get("provider"), "model": canary_config.get("model")}
+                            if canary_config else None)
+        static_canary_selected = bool(canary_config and request_id is not None and
             int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 100 <
-            float(canary_config.get("traffic_percent", 0)) and
-            {"provider": canary_config.get("provider"), "model": canary_config.get("model")} in candidates)
+            float(canary_config.get("traffic_percent", 0)))
+        canary_selected = bool(canary_config and canary_candidate in candidates and
+                               (feature_canary is True or
+                                (feature_canary is None and static_canary_selected)))
+        if feature_reason:
+            policy_exclusions.append(self._decision(
+                canary_candidate,
+                "selected" if canary_selected else "skipped", feature_reason))
         if canary_selected:
             candidates = self._prioritize_canary(candidates, canary_config)
         cache_cfg = route.get("cache", {})

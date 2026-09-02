@@ -1,0 +1,44 @@
+groups:
+  - name: llm-gateway-slo
+    interval: 30s
+    rules:
+      - record: llm_gateway:availability_error_ratio:rate5m
+        expr: |
+          sum by (application, route) (rate(llm_gateway_slo_requests_total{outcome="failure"}[5m]))
+          /
+          sum by (application, route) (rate(llm_gateway_slo_requests_total[5m]))
+
+      - record: llm_gateway:latency_error_ratio:rate5m
+        expr: |
+          sum by (application, route) (rate(llm_gateway_slo_latency_requests_total{outcome="bad"}[5m]))
+          /
+          sum by (application, route) (rate(llm_gateway_slo_latency_requests_total[5m]))
+
+      - alert: LLMGatewayAvailabilityErrorBudgetBurn
+        expr: |
+          llm_gateway:availability_error_ratio:rate5m
+          /
+          on (application, route) (1 - llm_gateway_slo_availability_target_ratio)
+          > 14.4
+          and on (application, route) (llm_gateway_slo_availability_target_ratio < 1)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM gateway availability error budget is burning quickly"
+          description: "Application {{ $labels.application }} route {{ $labels.route }} is burning its availability error budget above 14.4x."
+
+      - alert: LLMGatewayLatencyErrorBudgetBurn
+        expr: |
+          llm_gateway:latency_error_ratio:rate5m
+          /
+          on (application, route)
+          (1 - llm_gateway_slo_latency_objective_ratio)
+          > 14.4
+          and on (application, route) (llm_gateway_slo_latency_objective_ratio < 1)
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM gateway latency error budget is burning quickly"
+          description: "Application {{ $labels.application }} route {{ $labels.route }} is exceeding its latency budget above 14.4x."

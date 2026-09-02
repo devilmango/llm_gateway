@@ -31,12 +31,21 @@ from .observability import (
     CACHE_HITS,
     COST,
     FALLBACKS,
+    GEN_AI_INPUT_TOKENS,
+    GEN_AI_OPERATION_DURATION,
+    GEN_AI_OUTPUT_TOKENS,
     IN_FLIGHT,
     LATENCY,
     REQUESTS,
+    SLO_AVAILABILITY_TARGET,
+    SLO_LATENCY_OBJECTIVE,
+    SLO_LATENCY_REQUESTS,
+    SLO_LATENCY_TARGET,
+    SLO_REQUESTS,
     TOKENS,
     TOOL_EXECUTIONS_OVERDUE,
     TOOL_EXECUTIONS_PENDING,
+    gen_ai_provider_name,
     initialize_tracing,
     metrics_response,
 )
@@ -189,6 +198,39 @@ def create_app(config: dict[str, Any] | None = None,
 
     def configured_tenants() -> dict[str, Any]:
         return cfg.get("tenants", cfg.get("security", {}).get("tenants", {}))
+
+    def slo_targets(application: str, route_name: str) -> dict[str, float]:
+        slo_cfg = cfg.get("slos", {})
+        targets = {"availability_target": 0.99, "latency_target_ms": 1000.0,
+                   "latency_objective": 0.95, **slo_cfg.get("default", {})}
+        targets.update(slo_cfg.get("routes", {}).get(route_name, {}))
+        targets.update(slo_cfg.get("applications", {}).get(application, {}))
+        targets["availability_target"] = min(1.0, max(0.0, float(targets["availability_target"])))
+        targets["latency_objective"] = min(1.0, max(0.0, float(targets["latency_objective"])))
+        targets["latency_target_ms"] = max(0.0, float(targets["latency_target_ms"]))
+        return targets
+
+    def record_request_telemetry(application: str, route_name: str, status: str, elapsed_ms: int,
+                                 provider_name: str | None, configured_model: str | None,
+                                 usage: dict[str, Any]) -> None:
+        targets = slo_targets(application, route_name)
+        SLO_AVAILABILITY_TARGET.labels(application=application, route=route_name).set(
+            targets["availability_target"])
+        SLO_LATENCY_TARGET.labels(application=application, route=route_name).set(
+            targets["latency_target_ms"] / 1000)
+        SLO_LATENCY_OBJECTIVE.labels(application=application, route=route_name).set(
+            targets["latency_objective"])
+        outcome = "success" if status == "success" else "failure"
+        SLO_REQUESTS.labels(application=application, route=route_name, outcome=outcome).inc()
+        latency_outcome = "good" if elapsed_ms <= targets["latency_target_ms"] else "bad"
+        SLO_LATENCY_REQUESTS.labels(application=application, route=route_name, outcome=latency_outcome).inc()
+        semantic_provider = (gen_ai_provider_name(cfg["providers"].get(provider_name, {}))
+                             if provider_name else "unknown")
+        labels = {"gen_ai_operation_name": "chat", "gen_ai_provider_name": semantic_provider,
+                  "gen_ai_request_model": configured_model or route_name}
+        GEN_AI_OPERATION_DURATION.labels(**labels).observe(elapsed_ms / 1000)
+        GEN_AI_INPUT_TOKENS.labels(**labels).inc(max(0, int(usage.get("prompt_tokens", 0))))
+        GEN_AI_OUTPUT_TOKENS.labels(**labels).inc(max(0, int(usage.get("completion_tokens", 0))))
 
     async def configured_secret(env_name: str | None, file_path: str | None) -> str:
         try:
@@ -402,6 +444,8 @@ def create_app(config: dict[str, Any] | None = None,
         IN_FLIGHT.inc()
         span = TRACER.start_span("llm.gateway.request")
         span.set_attribute("llm.gateway.request_id", request_id)
+        span.set_attribute("gen_ai.operation.name", "chat")
+        span.set_attribute("gen_ai.request.model", route_name)
         result: dict[str, Any] | None = None
         routing_decisions: list[dict[str, Any]] = []
         error_type: str | None = None
@@ -498,7 +542,8 @@ def create_app(config: dict[str, Any] | None = None,
                         yield frame
                         with trace.use_span(span, end_on_exit=False):
                             async for item in request.app.state.gateway.stream_complete(route_name, upstream_payload,
-                                                                                       request_id, tenant_cfg if tenant else None):
+                                                                                       request_id, tenant_cfg if tenant else None,
+                                {"application": app_name, "tenant_id": tenant.get("id") if tenant else None}):
                                 if item.get("usage_progress"):
                                     stream_usage = item["usage_progress"]
                                     continue
@@ -651,6 +696,17 @@ def create_app(config: dict[str, Any] | None = None,
                         if record["cached"]:
                             CACHE_HITS.labels(route=metric_route).inc()
                         LATENCY.labels(route=metric_route, status=status).observe(elapsed_ms / 1000)
+                        record_request_telemetry(ledger_app_name, metric_route, status, elapsed_ms,
+                            provider_name, configured_model, usage_data)
+                        span.set_attribute("gen_ai.usage.input_tokens", int(record["prompt_tokens"]))
+                        span.set_attribute("gen_ai.usage.output_tokens", int(record["completion_tokens"]))
+                        if provider_name:
+                            span.set_attribute("gen_ai.provider.name",
+                                gen_ai_provider_name(cfg["providers"].get(provider_name, {})))
+                        if configured_model:
+                            span.set_attribute("gen_ai.request.model", str(configured_model))
+                        if model_name:
+                            span.set_attribute("gen_ai.response.model", str(model_name))
                         if monthly_limit is not None:
                             thresholds = [float(value) for value in policy.get("alert_thresholds", [0.8, 1.0])]
                             alerts = await asyncio.to_thread(request.app.state.store.check_budget_alerts,
@@ -671,7 +727,8 @@ def create_app(config: dict[str, Any] | None = None,
                                          headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
             with trace.use_span(span, end_on_exit=False):
                 result = await request.app.state.gateway.complete(route_name, upstream_payload, request_id,
-                                                                  tenant_cfg if tenant else None)
+                    tenant_cfg if tenant else None,
+                    {"application": app_name, "tenant_id": tenant.get("id") if tenant else None})
             routing_decisions = result.get("routing_decisions", [])
             await audit_generated_tool_calls(result.get("tool_calls", []))
             try:
@@ -775,6 +832,17 @@ def create_app(config: dict[str, Any] | None = None,
                 if record["cached"]:
                     CACHE_HITS.labels(route=metric_route).inc()
                 LATENCY.labels(route=metric_route, status=record["status"]).observe(elapsed_ms / 1000)
+                record_request_telemetry(ledger_app_name, metric_route, record["status"], elapsed_ms,
+                    provider_name, configured_model, usage_data)
+                span.set_attribute("gen_ai.usage.input_tokens", int(record["prompt_tokens"]))
+                span.set_attribute("gen_ai.usage.output_tokens", int(record["completion_tokens"]))
+                if provider_name:
+                    span.set_attribute("gen_ai.provider.name",
+                        gen_ai_provider_name(cfg["providers"].get(provider_name, {})))
+                if configured_model:
+                    span.set_attribute("gen_ai.request.model", str(configured_model))
+                if model_name:
+                    span.set_attribute("gen_ai.response.model", str(model_name))
                 if monthly_limit is not None:
                     alert_thresholds = policy.get("alert_thresholds", [0.8, 1.0])
                     alerts = await asyncio.to_thread(request.app.state.store.check_budget_alerts,
@@ -799,6 +867,58 @@ def create_app(config: dict[str, Any] | None = None,
                                            cost_center, provider, route)
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Invalid report filters") from exc
+
+    @app.get("/v1/admin/slos", dependencies=[Depends(admin_dependency("report"))])
+    async def slo_report(request: Request,
+                         window_hours: int = Query(default=24, ge=1, le=720),
+                         application: str | None = Query(default=None),
+                         route: str | None = Query(default=None)) -> dict[str, Any]:
+        """Report availability and latency objective compliance for the requested window."""
+        end = datetime.now(UTC)
+        start = end - timedelta(hours=window_hours)
+        observations = await asyncio.to_thread(request.app.state.store.slo_observations,
+            start.isoformat(), end.isoformat())
+        groups: dict[tuple[str, str], dict[str, int]] = {}
+        for item in observations:
+            app_key, route_key = str(item["application"]), str(item["route"])
+            if application and app_key != application:
+                continue
+            if route and route_key != route:
+                continue
+            bucket = groups.setdefault((app_key, route_key), {"requests": 0, "failures": 0,
+                "latency_good": 0, "latency_bad": 0})
+            count = int(item["requests"])
+            bucket["requests"] += count
+            if item["status"] != "success":
+                bucket["failures"] += count
+            if int(item["latency_ms"]) <= slo_targets(app_key, route_key)["latency_target_ms"]:
+                bucket["latency_good"] += count
+            else:
+                bucket["latency_bad"] += count
+        reports = []
+        for (app_key, route_key), counts in sorted(groups.items()):
+            total = counts["requests"]
+            targets = slo_targets(app_key, route_key)
+            availability = (total - counts["failures"]) / total if total else 1.0
+            latency_compliance = counts["latency_good"] / total if total else 1.0
+            availability_budget = 1.0 - targets["availability_target"]
+            latency_budget = 1.0 - targets["latency_objective"]
+            availability_burn = (counts["failures"] / total / availability_budget
+                                 if availability_budget > 0 and total else 0.0)
+            latency_burn = (counts["latency_bad"] / total / latency_budget
+                            if latency_budget > 0 and total else 0.0)
+            reports.append({"application": app_key, "route": route_key, **counts,
+                "availability_target": targets["availability_target"],
+                "availability": availability,
+                "availability_error_budget_burn_rate": availability_burn,
+                "availability_error_budget_remaining_percent": (1.0 - availability_burn) * 100,
+                "latency_target_ms": targets["latency_target_ms"],
+                "latency_objective": targets["latency_objective"],
+                "latency_compliance": latency_compliance,
+                "latency_error_budget_burn_rate": latency_burn,
+                "latency_error_budget_remaining_percent": (1.0 - latency_burn) * 100})
+        return {"window_hours": window_hours, "start": start.isoformat(), "end": end.isoformat(),
+                "generated_at": end.isoformat(), "slos": reports}
 
     @app.get("/v1/admin/cost-anomalies", dependencies=[Depends(admin_dependency("report"))])
     async def cost_anomalies(request: Request,
