@@ -274,6 +274,8 @@ Each upstream attempt receives the gateway's generated request ID in `X-Gateway-
 
 Optional tool governance restricts declared and generated function names, caps generated calls per request, and can apply a per-tenant/application per-minute call limit. Configure global `tool_governance` and/or tenant `allowed_tools`, `default_policy.max_tool_calls_per_request`, and `default_policy.max_tool_calls_per_minute`; application policies can further narrow the allowlist and limits. Global and tenant allowlists intersect, and configured limits use the most restrictive value. Disallowed declarations are rejected before a provider call. Disallowed or excessive generated calls are withheld and recorded as denied metadata. Successful tool names are audited without arguments. Admins with the `audit` scope can inspect `/v1/admin/tool-audit?tenant_id=support-team`.
 
+For high-impact functions, add their names to `tool_governance.require_approval_tools` or a tenant's `require_approval_tools` / application policy. A generated call is then audited as `approval_required` and returned with its ID in `gateway.approval_required_tool_call_ids`. Before invoking the function, the application must query `GET /v1/tool-approvals/{request_id}/{tool_call_id}?application=...` and proceed only when the status is `approved`. An approver with the `tool_approvals` admin scope records `approved` or `denied` through `POST /v1/admin/tool-approvals`; the authenticated admin identity is stored as the actor in the audit trail. Decision records are immutable, and an execution outcome cannot be reported before approval. This gate communicates and audits the decision; the application and its downstream service must still enforce authorization immediately before the side effect.
+
 The application still executes tools itself. After execution, report only the outcome metadata; arguments, results, and exception text are not accepted or stored. The gateway verifies the request, tool-call ID, application, and tenant against the generated-call audit record. Repeating the same outcome is idempotent; changing an already recorded outcome is rejected.
 
 Set `tool_governance.execution_timeout_seconds` to control when an unreported outcome is considered overdue (default: 300 seconds). Admins with the `audit` scope can inspect pending calls at `/v1/admin/tool-executions/pending`; the endpoint returns age, timeout, pending count, and overdue count. `/metrics` refreshes `llm_gateway_tool_executions_pending` and `llm_gateway_tool_executions_overdue` on each scrape, so Prometheus can alert when the overdue gauge is above zero.
@@ -322,6 +324,8 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/v1/admin/providers` | Provider circuit state and consecutive failure counts. |
 | `GET` | `/v1/admin/audit` | Recent authenticated admin API access events. |
 | `GET` | `/v1/admin/tool-audit` | Metadata-only tool-call decisions, optionally filtered by tenant. |
+| `POST` | `/v1/admin/tool-approvals` | Record an immutable external approval or denial for a gated tool call. Requires the `tool_approvals` scope. |
+| `GET` | `/v1/tool-approvals/{request_id}/{tool_call_id}` | Query approval state before the application executes a gated tool call. |
 | `POST` | `/v1/tool-executions` | Report a caller-executed tool outcome for an authorized generated call. |
 | `GET` | `/v1/admin/tool-executions` | Inspect reported execution outcomes, optionally filtered by tenant. |
 | `GET` | `/v1/admin/tool-executions/pending` | Inspect generated tool calls without outcomes and identify overdue calls. |
@@ -334,7 +338,7 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/metrics` | Prometheus metrics in exposition format. |
 | `GET` | `/docs` | FastAPI Swagger UI. |
 
-When tenant credentials are configured, `/v1/chat/completions`, `/v1/routes`, and `/v1/tool-executions` require a tenant key, while `/v1/admin/*` requires a `GATEWAY_API_KEY`, scoped admin key, or configured OIDC bearer token. Without tenant configuration, `GATEWAY_API_KEY` optionally protects `/v1` endpoints.
+When tenant credentials are configured, `/v1/chat/completions`, `/v1/routes`, `/v1/tool-approvals/*`, and `/v1/tool-executions` require a tenant key, while `/v1/admin/*` requires a `GATEWAY_API_KEY`, scoped admin key, or configured OIDC bearer token. Without tenant configuration, `GATEWAY_API_KEY` optionally protects `/v1` endpoints.
 
 ## Cost and reliability reporting
 
@@ -591,6 +595,8 @@ Suggested next milestones, ordered by production value:
 - [x] Add OpenTelemetry GenAI semantic attributes and token/duration metrics without message content.
 - [x] Support optional context-aware canary selection through OpenFeature OFREP with fail-closed defaults.
 - [x] Report route/application SLOs and provide Prometheus recording and alert rules.
+- [x] Require external approval for configured high-impact tool calls and retain approver decisions in the audit trail.
+- [x] Add a provider adapter conformance suite for streaming, tool calls, structured output, usage, and request ID propagation.
 
 ## Contributing
 

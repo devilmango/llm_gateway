@@ -41,6 +41,7 @@ slos:
 #   max_tool_calls_per_request: 8
 #   max_tool_calls_per_minute: 60
 #   execution_timeout_seconds: 300
+#   require_approval_tools: [delete_account, issue_refund]
 
 security:
   redact_pii: true

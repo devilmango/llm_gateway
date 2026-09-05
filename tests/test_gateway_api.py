@@ -499,6 +499,66 @@ async def test_tool_execution_outcomes_are_idempotent_and_admin_visible(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_high_impact_tool_requires_recorded_approval_before_execution(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("SUPPORT_TENANT_KEY", "support-secret")
+    monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+    tool_response = success_response().json()
+    tool_response["choices"][0] = {"message": {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call-delete-1", "type": "function", "function": {
+            "name": "delete_account", "arguments": '{"account_id":"A-17"}'}}
+    ]}, "finish_reason": "tool_calls"}
+    cfg = config(str(tmp_path / "tool-approval.sqlite3"))
+    cfg["tool_governance"] = {"require_approval_tools": ["delete_account"]}
+    cfg["tenants"] = {"support": {"api_key_env": "SUPPORT_TENANT_KEY", "allowed_routes": ["simple"],
+        "allowed_tools": ["delete_account"], "applications": {"support-router": {}}}}
+    async with gateway_client(cfg,
+            httpx.MockTransport(lambda _: httpx.Response(200, json=tool_response))) as client:
+        completion = await client.post("/v1/chat/completions",
+            headers={"Authorization": "Bearer support-secret"}, json={
+                "model": "simple", "application": "support-router",
+                "messages": [{"role": "user", "content": "delete account"}],
+                "tools": [{"type": "function", "function": {"name": "delete_account",
+                    "parameters": {"type": "object"}}}],
+            })
+        assert completion.status_code == 200
+        request_id = completion.json()["id"]
+        assert completion.json()["gateway"]["approval_required_tool_call_ids"] == ["call-delete-1"]
+        approval_url = f"/v1/tool-approvals/{request_id}/call-delete-1?application=support-router"
+        headers = {"Authorization": "Bearer support-secret"}
+        status = await client.get(approval_url, headers=headers)
+        assert status.json()["status"] == "pending"
+        outcome = {"request_id": request_id, "tool_call_id": "call-delete-1",
+            "application": "support-router", "outcome": "succeeded"}
+        blocked = await client.post("/v1/tool-executions", headers=headers, json=outcome)
+        assert blocked.status_code == 409
+        approved = await client.post("/v1/admin/tool-approvals", headers={
+            "Authorization": "Bearer admin-secret"}, json={"request_id": request_id,
+                "tool_call_id": "call-delete-1", "decision": "approved"})
+        assert approved.status_code == 200
+        assert approved.json()["actor"] == "gateway-api-key"
+        duplicate = await client.post("/v1/admin/tool-approvals", headers={
+            "Authorization": "Bearer admin-secret"}, json={"request_id": request_id,
+                "tool_call_id": "call-delete-1", "decision": "approved"})
+        assert duplicate.json()["duplicate"] is True
+        conflicting = await client.post("/v1/admin/tool-approvals", headers={
+            "Authorization": "Bearer admin-secret"}, json={"request_id": request_id,
+                "tool_call_id": "call-delete-1", "decision": "denied"})
+        assert conflicting.status_code == 409
+        status = await client.get(approval_url, headers=headers)
+        assert status.json()["status"] == "approved"
+        executed = await client.post("/v1/tool-executions", headers=headers, json=outcome)
+        assert executed.status_code == 200
+        audit = await client.get("/v1/admin/tool-audit?tenant_id=support", headers={
+            "Authorization": "Bearer admin-secret"})
+        events = audit.json()["events"]
+        assert any(event["outcome"] == "approval_required" for event in events)
+        assert any(event["outcome"] == "approved" and event["actor"] == "gateway-api-key"
+                   for event in events)
+        assert all("arguments" not in event for event in events)
+
+
+@pytest.mark.asyncio
 async def test_pending_tool_calls_show_overdue_and_export_alert_metrics(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
     monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")

@@ -22,7 +22,8 @@ def generated_tool_names(tool_calls: list[dict[str, Any]] | None) -> list[str]:
 
 
 def effective_tool_policy(global_policy: dict[str, Any], tenant: dict[str, Any],
-                          application_policy: dict[str, Any]) -> tuple[set[str] | None, int | None, int | None]:
+                          application_policy: dict[str, Any]) -> tuple[set[str] | None, int | None, int | None,
+                                                                      set[str]]:
     allowlists = [value for value in (global_policy.get("allowed_tools"), tenant.get("allowed_tools"),
         tenant.get("default_policy", {}).get("allowed_tools"), application_policy.get("allowed_tools"))
         if value is not None]
@@ -35,4 +36,8 @@ def effective_tool_policy(global_policy: dict[str, Any], tenant: dict[str, Any],
         tenant.get("default_policy", {}).get("max_tool_calls_per_minute"),
         application_policy.get("max_tool_calls_per_minute")) if value is not None]
     minute_limit = min(int(value) for value in minute_limits) if minute_limits else None
-    return allowed, request_limit, minute_limit
+    approval_lists = [value for value in (global_policy.get("require_approval_tools"),
+        tenant.get("require_approval_tools"), tenant.get("default_policy", {}).get("require_approval_tools"),
+        application_policy.get("require_approval_tools")) if value is not None]
+    require_approval = set().union(*(set(value) for value in approval_lists)) if approval_lists else set()
+    return allowed, request_limit, minute_limit, require_approval

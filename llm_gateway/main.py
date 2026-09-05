@@ -59,6 +59,7 @@ from .schemas import (
     CostReconciliationRequest,
     EvaluationCompareRequest,
     EvaluationReportCreate,
+    ToolApprovalDecisionRequest,
     ToolExecutionOutcomeRequest,
     Usage,
 )
@@ -454,11 +455,12 @@ def create_app(config: dict[str, Any] | None = None,
         monthly_limit: float | None = None
         stream_response_started = False
         tool_audit_records: list[dict[str, Any]] = []
+        approval_required_tool_calls: list[str] = []
         try:
             budget_cfg = cfg.get("budgets", {})
             policy = {**budget_cfg.get("default", {}), **budget_cfg.get("applications", {}).get(app_name, {}),
                       **tenant_cfg.get("default_policy", {}), **tenant_apps.get(app_name, {})}
-            allowed_tools, max_tool_calls, max_tool_calls_per_minute = effective_tool_policy(
+            allowed_tools, max_tool_calls, max_tool_calls_per_minute, require_approval_tools = effective_tool_policy(
                 cfg.get("tool_governance", {}), tenant_cfg, policy)
 
             async def audit_generated_tool_calls(calls: list[dict[str, Any]]) -> None:
@@ -500,7 +502,12 @@ def create_app(config: dict[str, Any] | None = None,
                                                   for index, _ in enumerate(names))
                         raise ToolGovernanceError("Tenant tool-call rate limit exceeded", 429,
                                                   "max_tool_calls_per_minute") from exc
-                tool_audit_records.extend(event(index, "allowed") for index, _ in enumerate(names))
+                for index, name in enumerate(names):
+                    if name in require_approval_tools:
+                        approval_required_tool_calls.append(str(calls[index].get("id") or ""))
+                        tool_audit_records.append(event(index, "approval_required", "external_approval_pending"))
+                    else:
+                        tool_audit_records.append(event(index, "allowed"))
 
             requested_names = requested_tool_names(body.tools)
             forbidden_requested = ([name for name in requested_names
@@ -563,6 +570,13 @@ def create_app(config: dict[str, Any] | None = None,
                                         except ValueError as exc:
                                             raise ProviderError(f"Provider returned invalid tool calls: {exc}") from exc
                                         tool_calls_validated = True
+                                        if approval_required_tool_calls:
+                                            approval_event = "event: tool_approval\ndata: " + json.dumps({
+                                                "request_id": request_id,
+                                                "required_tool_call_ids": approval_required_tool_calls,
+                                                "status": "pending"}) + "\n\n"
+                                            stream_frames.append(approval_event)
+                                            yield approval_event
                                         for tool_frame in pending_tool_frames:
                                             stream_frames.append(tool_frame)
                                             yield tool_frame
@@ -755,7 +769,8 @@ def create_app(config: dict[str, Any] | None = None,
                     finish_reason=result.get("finish_reason"))],
                 usage=Usage(**usage), gateway={"provider": provider, "upstream_model": model,
                     "fallback_used": result["fallback_used"], "cached": result["cached"],
-                    "canary_used": result.get("canary_used", False), "cost_usd": round(cost, 8)})
+                    "canary_used": result.get("canary_used", False), "cost_usd": round(cost, 8),
+                    "approval_required_tool_call_ids": approval_required_tool_calls})
             if idempotency_claimed and idempotency_scope and idempotency_fingerprint:
                 await request.app.state.idempotency.complete(idempotency_scope, idempotency_fingerprint,
                     {"kind": "json", "body": output.model_dump(mode="json"), "status_code": 200})
@@ -1047,6 +1062,32 @@ def create_app(config: dict[str, Any] | None = None,
         events = await asyncio.to_thread(request.app.state.store.tool_call_audit_events, tenant_id, limit)
         return {"events": events}
 
+    @app.post("/v1/admin/tool-approvals", dependencies=[Depends(admin_dependency("tool_approvals"))])
+    async def decide_tool_approval(body: ToolApprovalDecisionRequest, request: Request) -> dict[str, Any]:
+        """Record an external approval decision; the authenticated admin identity is the approver."""
+        actor = request.state.admin_actor
+        try:
+            return await asyncio.to_thread(request.app.state.store.record_tool_approval,
+                body.request_id, body.tool_call_id, body.decision, actor)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/v1/tool-approvals/{request_id}/{tool_call_id}")
+    async def tool_approval_status(request_id: str, tool_call_id: str, request: Request,
+                                   application: str = Query(min_length=1, max_length=120),
+                                   tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
+        tenant_id = tenant["id"] if tenant else None
+        scoped_application = application
+        if tenant:
+            if application not in tenant["config"].get("applications", {}):
+                raise HTTPException(status_code=403, detail="Tenant is not permitted to use this application")
+            scoped_application = f"{tenant_id}:{application}"
+        try:
+            return await asyncio.to_thread(request.app.state.store.tool_approval_status,
+                request_id, tool_call_id, tenant_id, scoped_application)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.post("/v1/tool-executions")
     async def report_tool_execution(body: ToolExecutionOutcomeRequest, request: Request,
                                     tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
@@ -1061,6 +1102,8 @@ def create_app(config: dict[str, Any] | None = None,
             return await asyncio.to_thread(request.app.state.store.record_tool_execution_outcome,
                 body.request_id, body.tool_call_id, tenant_id, application, body.outcome, body.error_code)
         except ValueError as exc:
+            if "requires recorded external approval" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/v1/admin/tool-executions", dependencies=[Depends(admin_dependency("audit"))])

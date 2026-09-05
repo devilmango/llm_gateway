@@ -73,6 +73,12 @@ class ToolExecutionOutcomeRequest(BaseModel):
         return self
 
 
+class ToolApprovalDecisionRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=120)
+    tool_call_id: str = Field(min_length=1, max_length=200)
+    decision: Literal["approved", "denied"]
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | list[dict[str, Any]] | None = None
