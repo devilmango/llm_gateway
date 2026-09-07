@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import struct
+import zlib
 from typing import Any
 
 import httpx
@@ -12,7 +14,7 @@ from llm_gateway.capabilities import provider_capabilities
 from llm_gateway.providers import ProviderCapabilityError, ProviderClient
 
 ADAPTERS = ("openai", "vllm", "azure_openai", "anthropic", "gemini", "vertex", "bedrock")
-STREAMING_ADAPTERS = tuple(kind for kind in ADAPTERS if kind != "bedrock")
+STREAMING_ADAPTERS = ADAPTERS
 TOOL = {"type": "function", "function": {"name": "lookup_order", "description": "Look up an order",
     "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
                    "required": ["order_id"]}}}
@@ -64,6 +66,15 @@ def completion_response(kind: str) -> dict[str, Any]:
 
 
 def stream_response(kind: str) -> bytes:
+    if kind == "bedrock":
+        return b"".join(eventstream_frame(event_type, payload) for event_type, payload in [
+            ("contentBlockStart", {"contentBlockIndex": 1, "start": {"toolUse": {
+                "toolUseId": "tool-1", "name": "lookup_order"}}}),
+            ("contentBlockDelta", {"contentBlockIndex": 1, "delta": {"toolUse": {"input": '{"order_id":"A-17"}'}}}),
+            ("contentBlockDelta", {"contentBlockIndex": 0, "delta": {"text": "hello"}}),
+            ("metadata", {"metadata": {"usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5}}}),
+            ("messageStop", {"stopReason": "end_turn"}),
+        ])
     if kind in {"openai", "vllm", "azure_openai"}:
         events = [
             {"choices": [{"delta": {"content": "hello"}, "finish_reason": None}]},
@@ -83,6 +94,17 @@ def stream_response(kind: str) -> bytes:
             "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 3,
                 "candidatesTokenCount": 2, "totalTokenCount": 5}}]
     return ("".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n").encode()
+
+
+def eventstream_frame(event_type: str, payload: dict[str, Any]) -> bytes:
+    name = b":event-type"
+    value = event_type.encode()
+    headers = bytes([len(name)]) + name + b"\x07" + struct.pack(">H", len(value)) + value
+    headers += b"\x0d:message-type\x07" + struct.pack(">H", 5) + b"event"
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    total = 12 + len(headers) + len(body) + 4
+    prelude = struct.pack(">II", total, len(headers))
+    return prelude + struct.pack(">I", zlib.crc32(prelude)) + headers + body + struct.pack(">I", zlib.crc32(prelude + struct.pack(">I", zlib.crc32(prelude)) + headers + body))
 
 
 @pytest.fixture(autouse=True)
@@ -154,21 +176,22 @@ async def test_streaming_and_streaming_usage_contract(kind: str):
     assert {item.get("delta") for item in items if "delta" in item} == {"hello"}
     assert any(item.get("usage_progress", {}).get("total_tokens") == 5 for item in items)
     assert items[-1]["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    if kind == "bedrock":
+        tool_deltas = [item["tool_call_delta"] for item in items if "tool_call_delta" in item]
+        assert tool_deltas[0]["id"] == "tool-1"
+        assert tool_deltas[0]["function"]["name"] == "lookup_order"
+        arguments = "".join(delta["function"].get("arguments", "") for delta in tool_deltas)
+        assert json.loads(arguments) == {"order_id": "A-17"}
     assert sent[0].headers["X-Contract-Request"] == "gw_stream_1"
     body = json.loads(sent[0].content)
     assert body["metadata"]["gateway_request_id"] == "gw_stream_1"
-    assert body.get("stream") is True or kind in {"gemini", "vertex"}
+    assert body.get("stream") is True or kind in {"gemini", "vertex", "bedrock"}
 
 
 @pytest.mark.parametrize("kind", ADAPTERS)
 def test_capability_contract_matches_declared_adapter_matrix(kind: str):
     capabilities = provider_capabilities(adapter_config(kind))
     assert capabilities["tools"] is True
-    assert capabilities["streaming"] is (kind != "bedrock")
-    assert capabilities["streaming_tools"] is (kind != "bedrock")
+    assert capabilities["streaming"] is True
+    assert capabilities["streaming_tools"] is True
     assert capabilities["structured_output"] is (kind != "bedrock")
-    if kind == "bedrock":
-        with pytest.raises(ProviderCapabilityError, match="does not support streaming"):
-            ProviderClient.validate_capabilities(
-                ProviderClient(None, {"adapter": adapter_config(kind)}, 1), "adapter",
-                {"messages": [{"role": "user", "content": "hello"}]}, streaming=True)

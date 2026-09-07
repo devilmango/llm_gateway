@@ -510,7 +510,7 @@ class GatewayService:
                         if unsupported_capability and not emitted:
                             break
                         # Once a delta is visible to the caller, retrying could duplicate text.
-                        if emitted or not exc.retryable or attempt >= max_retries:
+                        if emitted or not exc.retryable:
                             routing_decisions.append(self._decision(candidate, "skipped",
                                 "stream_failed_after_output" if emitted else candidate_failure or "provider_error",
                                 attempt_count))
@@ -519,6 +519,10 @@ class GatewayService:
                             routing_decisions.extend(policy_exclusions)
                             exc.routing_decisions = routing_decisions
                             raise
+                        if attempt >= max_retries:
+                            # Retries are exhausted for this candidate, but no caller-visible
+                            # delta has been emitted, so the next configured candidate is safe.
+                            break
                         PROVIDER_RETRIES.labels(provider=name).inc()
                         await asyncio.sleep(min(base_delay * (2 ** attempt), 4.0))
                     except RateLimitBackendUnavailable as exc:

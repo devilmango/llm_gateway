@@ -17,17 +17,28 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
     governance = config.get("tool_governance", {})
     if not isinstance(governance, dict):
         raise TypeError("tool_governance must be an object")
-    for limit_name in ("max_tool_calls_per_request", "max_tool_calls_per_minute", "execution_timeout_seconds"):
+    for limit_name in ("max_tool_calls_per_request", "max_tool_calls_per_minute", "execution_timeout_seconds",
+                       "approval_ttl_seconds"):
         limit = governance.get(limit_name)
         if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool)
-                or limit < (1 if limit_name == "execution_timeout_seconds" else 0)):
-            qualifier = "positive" if limit_name == "execution_timeout_seconds" else "non-negative"
+                or limit < (1 if limit_name in {"execution_timeout_seconds", "approval_ttl_seconds"} else 0)):
+            qualifier = "positive" if limit_name in {"execution_timeout_seconds", "approval_ttl_seconds"} else "non-negative"
             raise ValueError(f"tool_governance.{limit_name} must be a {qualifier} integer")
     for names_key in ("allowed_tools", "require_approval_tools"):
         names = governance.get(names_key)
         if names is not None and (not isinstance(names, list)
                 or any(not isinstance(item, str) or not item for item in names)):
             raise ValueError(f"tool_governance.{names_key} must be a list of names")
+    approval_webhooks = governance.get("approval_webhooks", {})
+    if not isinstance(approval_webhooks, dict):
+        raise TypeError("tool_governance.approval_webhooks must be an application map")
+    for application, webhook in approval_webhooks.items():
+        if (not application or not isinstance(webhook, dict) or not isinstance(webhook.get("url"), str)
+                or not webhook["url"].startswith(("https://", "http://"))):
+            raise ValueError("tool_governance.approval_webhooks entries require an HTTP(S) url")
+        secret_env = webhook.get("secret_env")
+        if secret_env is not None and (not isinstance(secret_env, str) or not secret_env):
+            raise ValueError("tool_governance.approval_webhooks secret_env must be a non-empty string")
     tenants = config.get("tenants", config.get("security", {}).get("tenants", {}))
     for tenant_id, tenant in tenants.items():
         if not isinstance(tenant, dict):
@@ -100,6 +111,34 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
                 or any(not part for part in body_path.split("."))):
             raise ValueError(f"Provider {provider_name!r} request_id_body_field must be a dot-separated path")
         provider_capabilities(provider)
+    for route_name, route in config["routes"].items():
+        shadow = route.get("shadow")
+        if shadow is None:
+            continue
+        if not isinstance(shadow, dict):
+            raise TypeError(f"Route {route_name!r} shadow must be an object")
+        if shadow.get("provider") not in config["providers"] or not isinstance(shadow.get("model"), str) or not shadow["model"]:
+            raise ValueError(f"Route {route_name!r} shadow must reference a configured provider and model")
+        if (shadow["provider"], shadow["model"]) == (route.get("provider"), route.get("model")):
+            raise ValueError(f"Route {route_name!r} shadow candidate must differ from its primary model")
+        sampling = shadow.get("traffic_percent", 0)
+        if isinstance(sampling, bool) or not isinstance(sampling, (int, float)) or not 0 <= sampling <= 100:
+            raise ValueError(f"Route {route_name!r} shadow.traffic_percent must be between 0 and 100")
+        gates = shadow.get("promotion", {})
+        if not isinstance(gates, dict):
+            raise TypeError(f"Route {route_name!r} shadow.promotion must be an object")
+        for key in ("min_samples", "max_quality_loss", "max_cost_regression_percent",
+                    "max_latency_regression_percent", "max_failure_rate"):
+            value = gates.get(key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0):
+                raise ValueError(f"Route {route_name!r} shadow.promotion.{key} must be non-negative")
+        if gates.get("min_samples") is not None and int(gates["min_samples"]) != gates["min_samples"]:
+            raise ValueError(f"Route {route_name!r} shadow.promotion.min_samples must be an integer")
+        if gates.get("min_samples") is not None and gates["min_samples"] < 1:
+            raise ValueError(f"Route {route_name!r} shadow.promotion.min_samples must be positive")
+        for key in ("max_quality_loss", "max_failure_rate"):
+            if gates.get(key) is not None and gates[key] > 1:
+                raise ValueError(f"Route {route_name!r} shadow.promotion.{key} must be between 0 and 1")
     validate_tenant_policies(config)
     oidc = config.get("security", {}).get("oidc", {})
     if oidc.get("enabled") and not all(oidc.get(field) for field in ("issuer", "audience", "jwks_url")):

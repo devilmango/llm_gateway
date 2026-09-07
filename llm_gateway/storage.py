@@ -83,6 +83,8 @@ class UsageStore:
                 db.execute("ALTER TABLE tool_call_audits ADD COLUMN tool_call_id TEXT")
             if "actor" not in audit_columns:
                 db.execute("ALTER TABLE tool_call_audits ADD COLUMN actor TEXT")
+            if "expires_at" not in audit_columns:
+                db.execute("ALTER TABLE tool_call_audits ADD COLUMN expires_at TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS idx_tool_audit_execution ON tool_call_audits(request_id, tool_call_id, outcome)")
             db.execute("""CREATE TABLE IF NOT EXISTS tool_execution_outcomes (
                 request_id TEXT NOT NULL, tool_call_id TEXT NOT NULL, tenant_id TEXT,
@@ -114,6 +116,16 @@ class UsageStore:
                 candidate_run_id TEXT NOT NULL, report TEXT NOT NULL, created_at TEXT NOT NULL
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_evaluation_comparisons_time ON evaluation_comparisons(created_at)")
+            db.execute("""CREATE TABLE IF NOT EXISTS shadow_observations (
+                request_id TEXT PRIMARY KEY, occurred_at TEXT NOT NULL, application TEXT NOT NULL, route TEXT NOT NULL,
+                baseline_provider TEXT NOT NULL, baseline_model TEXT NOT NULL,
+                candidate_provider TEXT NOT NULL, candidate_model TEXT NOT NULL,
+                baseline_quality INTEGER NOT NULL, candidate_quality INTEGER NOT NULL,
+                baseline_cost_usd REAL NOT NULL, candidate_cost_usd REAL NOT NULL,
+                baseline_latency_ms INTEGER NOT NULL, candidate_latency_ms INTEGER NOT NULL,
+                candidate_status TEXT NOT NULL, failure_type TEXT
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_shadow_report ON shadow_observations(occurred_at, application, route)")
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.database, timeout=10)
@@ -312,15 +324,15 @@ class UsageStore:
         with self._lock, self._connect() as db:
             if tenant_id is None:
                 rows = db.execute("""SELECT request_id, tenant_id, application, occurred_at,
-                    tool_call_id, tool_name, outcome, reason, actor FROM tool_call_audits ORDER BY id DESC LIMIT ?""", (limit,))
+                    tool_call_id, tool_name, outcome, reason, actor, expires_at FROM tool_call_audits ORDER BY id DESC LIMIT ?""", (limit,))
             else:
                 rows = db.execute("""SELECT request_id, tenant_id, application, occurred_at,
-                    tool_call_id, tool_name, outcome, reason, actor FROM tool_call_audits WHERE tenant_id = ?
+                    tool_call_id, tool_name, outcome, reason, actor, expires_at FROM tool_call_audits WHERE tenant_id = ?
                     ORDER BY id DESC LIMIT ?""", (tenant_id, limit))
             return [dict(row) for row in rows.fetchall()]
 
     def record_tool_approval(self, request_id: str, tool_call_id: str, decision: str,
-                             actor: str) -> dict[str, Any]:
+                             actor: str, expires_at: str | None = None) -> dict[str, Any]:
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -329,22 +341,37 @@ class UsageStore:
                 ORDER BY id DESC LIMIT 1""", (request_id, tool_call_id)).fetchone()
             if required is None:
                 raise ValueError("No tool call requiring external approval matches this request")
-            prior = db.execute("""SELECT outcome, actor FROM tool_call_audits
-                WHERE request_id=? AND tool_call_id=? AND outcome IN ('approved','denied')
+            prior = db.execute("""SELECT outcome, actor, expires_at FROM tool_call_audits
+                WHERE request_id=? AND tool_call_id=? AND outcome IN ('approved','denied','revoked')
                 ORDER BY id DESC LIMIT 1""", (request_id, tool_call_id)).fetchone()
             if prior:
-                if prior["outcome"] != decision:
+                if decision == "revoked":
+                    if prior["outcome"] == "revoked":
+                        return {"request_id": request_id, "tool_call_id": tool_call_id,
+                            "tool_name": required["tool_name"], "application": required["application"],
+                            "decision": decision, "actor": prior["actor"], "duplicate": True}
+                    if prior["outcome"] != "approved":
+                        raise ValueError("Only an approved tool call can be revoked")
+                    if prior["expires_at"] and prior["expires_at"] <= now:
+                        raise ValueError("An expired approval cannot be revoked")
+                elif prior["outcome"] == decision:
+                    if decision != "approved" or not prior["expires_at"] or prior["expires_at"] > now:
+                        return {"request_id": request_id, "tool_call_id": tool_call_id,
+                            "tool_name": required["tool_name"], "application": required["application"],
+                            "decision": decision, "actor": prior["actor"], "expires_at": prior["expires_at"],
+                            "duplicate": True}
+                else:
                     raise ValueError("A different approval decision is already recorded")
-                return {"request_id": request_id, "tool_call_id": tool_call_id,
-                    "tool_name": required["tool_name"], "decision": decision,
-                    "actor": prior["actor"], "duplicate": True}
             db.execute("""INSERT INTO tool_call_audits
                 (request_id, tenant_id, application, occurred_at, tool_call_id, tool_name,
-                 outcome, reason, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 outcome, reason, actor, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (request_id, required["tenant_id"], required["application"], now, tool_call_id,
-                 required["tool_name"], decision, "external_approval", actor))
+                 required["tool_name"], decision, "external_approval", actor,
+                 expires_at if decision == "approved" else None))
         return {"request_id": request_id, "tool_call_id": tool_call_id,
-            "tool_name": required["tool_name"], "decision": decision, "actor": actor, "duplicate": False}
+            "tool_name": required["tool_name"], "application": required["application"],
+            "decision": decision, "actor": actor,
+            "expires_at": expires_at if decision == "approved" else None, "duplicate": False}
 
     def tool_approval_status(self, request_id: str, tool_call_id: str, tenant_id: str | None,
                              application: str) -> dict[str, Any]:
@@ -359,15 +386,18 @@ class UsageStore:
             if source is None or source["tenant_id"] != tenant_id or source["application"] != application:
                 raise ValueError("No authorized generated tool call matches this request")
             if required:
-                decision = db.execute("""SELECT outcome, actor, occurred_at FROM tool_call_audits
-                    WHERE request_id=? AND tool_call_id=? AND outcome IN ('approved','denied')
+                decision = db.execute("""SELECT outcome, actor, occurred_at, expires_at FROM tool_call_audits
+                    WHERE request_id=? AND tool_call_id=? AND outcome IN ('approved','denied','revoked')
                     ORDER BY id DESC LIMIT 1""", (request_id, tool_call_id)).fetchone()
             else:
                 decision = None
         status = decision["outcome"] if decision else ("pending" if required else "not_required")
+        if status == "approved" and decision["expires_at"] and decision["expires_at"] <= datetime.now(UTC).isoformat():
+            status = "expired"
         return {"request_id": request_id, "tool_call_id": tool_call_id, "tool_name": source["tool_name"],
             "status": status, "actor": decision["actor"] if decision else None,
-            "decided_at": decision["occurred_at"] if decision else None}
+            "decided_at": decision["occurred_at"] if decision else None,
+            "expires_at": decision["expires_at"] if decision else None}
 
     def pending_tool_execution_calls(self, timeout_seconds: int, tenant_id: str | None = None,
                                      limit: int = 100, now: datetime | None = None) -> dict[str, Any]:
@@ -382,17 +412,25 @@ class UsageStore:
                 ON o.request_id=a.request_id AND o.tool_call_id=a.tool_call_id
                 WHERE (a.outcome='allowed' OR (a.outcome='approval_required' AND EXISTS (
                     SELECT 1 FROM tool_call_audits approval WHERE approval.request_id=a.request_id
-                    AND approval.tool_call_id=a.tool_call_id AND approval.outcome='approved')))
+                    AND approval.tool_call_id=a.tool_call_id AND approval.outcome='approved'
+                    AND (approval.expires_at IS NULL OR approval.expires_at > ?)
+                    AND approval.id=(SELECT MAX(latest.id) FROM tool_call_audits latest
+                        WHERE latest.request_id=a.request_id AND latest.tool_call_id=a.tool_call_id
+                        AND latest.outcome IN ('approved','denied','revoked')))))
                     AND a.tool_call_id IS NOT NULL AND o.request_id IS NULL{tenant_clause}""",
-                (cutoff, *values)).fetchone()
+                (cutoff, current.isoformat(), *values)).fetchone()
             rows = db.execute(f"""SELECT a.request_id, a.tool_call_id, a.tenant_id, a.application,
                 a.occurred_at, a.tool_name FROM tool_call_audits a LEFT JOIN tool_execution_outcomes o
                 ON o.request_id=a.request_id AND o.tool_call_id=a.tool_call_id
                 WHERE (a.outcome='allowed' OR (a.outcome='approval_required' AND EXISTS (
                     SELECT 1 FROM tool_call_audits approval WHERE approval.request_id=a.request_id
-                    AND approval.tool_call_id=a.tool_call_id AND approval.outcome='approved')))
+                    AND approval.tool_call_id=a.tool_call_id AND approval.outcome='approved'
+                    AND (approval.expires_at IS NULL OR approval.expires_at > ?)
+                    AND approval.id=(SELECT MAX(latest.id) FROM tool_call_audits latest
+                        WHERE latest.request_id=a.request_id AND latest.tool_call_id=a.tool_call_id
+                        AND latest.outcome IN ('approved','denied','revoked')))))
                     AND a.tool_call_id IS NOT NULL AND o.request_id IS NULL{tenant_clause}
-                ORDER BY a.occurred_at ASC LIMIT ?""", (*values, limit)).fetchall()
+                ORDER BY a.occurred_at ASC LIMIT ?""", (current.isoformat(), *values, limit)).fetchall()
         calls = []
         for row in rows:
             call = dict(row)
@@ -413,10 +451,11 @@ class UsageStore:
             if audit is None or audit["tenant_id"] != tenant_id or audit["application"] != application:
                 raise ValueError("No authorized generated tool call matches this request")
             if audit["outcome"] == "approval_required":
-                approval = db.execute("""SELECT outcome FROM tool_call_audits
-                    WHERE request_id=? AND tool_call_id=? AND outcome IN ('approved','denied')
+                approval = db.execute("""SELECT outcome, expires_at FROM tool_call_audits
+                    WHERE request_id=? AND tool_call_id=? AND outcome IN ('approved','denied','revoked')
                     ORDER BY id DESC LIMIT 1""", (request_id, tool_call_id)).fetchone()
-                if approval is None or approval["outcome"] != "approved":
+                if (approval is None or approval["outcome"] != "approved"
+                        or (approval["expires_at"] and approval["expires_at"] <= now)):
                     raise ValueError("Tool execution requires recorded external approval")
             existing = db.execute("""SELECT outcome, error_code FROM tool_execution_outcomes
                 WHERE request_id=? AND tool_call_id=?""", (request_id, tool_call_id)).fetchone()
@@ -506,6 +545,49 @@ class UsageStore:
                 report, created_at FROM evaluation_comparisons ORDER BY created_at DESC LIMIT ?""",
                 (limit,)).fetchall()
             return [{**dict(row), "report": json.loads(row["report"])} for row in rows]
+
+    def evaluation_comparison(self, comparison_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as db:
+            row = db.execute("""SELECT comparison_id, baseline_run_id, candidate_run_id, report, created_at
+                FROM evaluation_comparisons WHERE comparison_id=?""", (comparison_id,)).fetchone()
+            return {**dict(row), "report": json.loads(row["report"])} if row else None
+
+    def record_shadow_observation(self, observation: dict[str, Any]) -> None:
+        with self._lock, self._connect() as db:
+            db.execute("""INSERT OR IGNORE INTO shadow_observations
+                (request_id, occurred_at, application, route, baseline_provider, baseline_model,
+                 candidate_provider, candidate_model, baseline_quality, candidate_quality,
+                 baseline_cost_usd, candidate_cost_usd, baseline_latency_ms, candidate_latency_ms,
+                 candidate_status, failure_type)
+                VALUES (:request_id, :occurred_at, :application, :route, :baseline_provider, :baseline_model,
+                 :candidate_provider, :candidate_model, :baseline_quality, :candidate_quality,
+                 :baseline_cost_usd, :candidate_cost_usd, :baseline_latency_ms, :candidate_latency_ms,
+                 :candidate_status, :failure_type)""", observation)
+
+    def shadow_report(self, application: str, route: str, start: str, end: str) -> dict[str, Any]:
+        with self._lock, self._connect() as db:
+            row = db.execute("""SELECT COUNT(*) AS samples,
+                SUM(baseline_quality) AS baseline_quality_passes,
+                SUM(candidate_quality) AS candidate_quality_passes,
+                AVG(baseline_cost_usd) AS baseline_cost_usd, AVG(candidate_cost_usd) AS candidate_cost_usd,
+                AVG(baseline_latency_ms) AS baseline_latency_ms, AVG(candidate_latency_ms) AS candidate_latency_ms,
+                SUM(CASE WHEN candidate_status!='success' THEN 1 ELSE 0 END) AS failures
+                FROM shadow_observations WHERE application=? AND route=? AND occurred_at>=? AND occurred_at<?""",
+                (application, route, start, end)).fetchone()
+        samples = int(row["samples"] or 0)
+        baseline_cost, candidate_cost = float(row["baseline_cost_usd"] or 0), float(row["candidate_cost_usd"] or 0)
+        baseline_latency = float(row["baseline_latency_ms"] or 0)
+        candidate_latency = float(row["candidate_latency_ms"] or 0)
+        return {"application": application, "route": route, "samples": samples,
+            "baseline": {"quality_pass_rate": (row["baseline_quality_passes"] or 0) / samples if samples else 0,
+                "average_cost_usd": baseline_cost, "average_latency_ms": baseline_latency},
+            "candidate": {"quality_pass_rate": (row["candidate_quality_passes"] or 0) / samples if samples else 0,
+                "average_cost_usd": candidate_cost, "average_latency_ms": candidate_latency,
+                "failure_rate": float(row["failures"] or 0) / samples if samples else 0},
+            "cost_regression_percent": ((candidate_cost - baseline_cost) / baseline_cost * 100
+                if baseline_cost else (0.0 if candidate_cost == 0 else 100.0)),
+            "latency_regression_percent": ((candidate_latency - baseline_latency) / baseline_latency * 100
+                if baseline_latency else (0.0 if candidate_latency == 0 else 100.0))}
 
     @staticmethod
     def _filters(start: str | None, end: str | None, application: str | None,

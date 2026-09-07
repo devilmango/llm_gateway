@@ -37,7 +37,7 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Capability | What it does |
 |---|---|
 | Provider-neutral chat API | Accepts a common chat-completions request and translates it for OpenAI-compatible APIs, Anthropic Messages, Gemini, Azure OpenAI, Vertex AI, and Amazon Bedrock Converse. |
-| Provider adapters | Supports OpenAI-compatible, Azure OpenAI, Anthropic, Gemini, Vertex AI, Amazon Bedrock Converse, and vLLM-native/OpenAI-compatible endpoints. |
+| Provider adapters | Supports OpenAI-compatible, Azure OpenAI, Anthropic, Gemini, Vertex AI, Amazon Bedrock Converse/ConverseStream, and vLLM-native/OpenAI-compatible endpoints. |
 | Provider capability registry | Advertises and enforces streaming, streaming tools, tools, structured output, images, and audio input/output per provider, with optional provider-level capability overrides. |
 | Configurable model routes | Map a logical route to a provider and model in YAML. |
 | Retry and fallback | Retry timeouts, network errors, HTTP 429, and upstream 5xx responses with bounded exponential backoff; then try configured fallbacks in order. |
@@ -52,7 +52,7 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Canary routing and evaluation | Deterministically send a configured share of requests to a candidate provider/model; evaluate JSONL prompt sets by pass rate, latency, and estimated cost using `llm-gateway-eval`. |
 | Context-aware canary flags | Optionally evaluate an OpenFeature Remote Evaluation Protocol boolean flag with application and tenant context. Evaluation errors fail closed to the normal route. |
 | Route and application SLOs | Report availability and latency objective compliance and error-budget burn; ship example Prometheus recording and alerting rules. |
-| Streaming | Stream OpenAI-compatible, Azure, Anthropic, Gemini, and Vertex output as server-sent events, including tool-call and audio deltas where supported; account usage at completion. |
+| Streaming | Stream OpenAI-compatible, Azure, Anthropic, Gemini, Vertex, and Bedrock output as server-sent events, including tool-call and audio deltas where supported; account usage at completion. Fallback stops as soon as caller-visible content is emitted. |
 | Tenant data policies | Restrict tenants to allowed routes, providers, models, and tagged processing regions; automatically expire tenant usage metadata on a per-tenant retention schedule. |
 | Dynamic credential rotation | Re-read mounted provider, tenant, gateway, and scoped-admin secret files on each use so CSI/agent-managed secret rotations take effect without restarting the gateway. |
 | Tool calling and structured outputs | Pass OpenAI-style function definitions and JSON response schemas; adapters translate them for OpenAI-compatible, Anthropic, and Gemini providers. Tool execution stays in the calling application. |
@@ -67,6 +67,8 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Routing decision history | Inspect selected, fallback, and skipped provider/model candidates with safe reason codes, retry counts, and report aggregates. |
 | Saved evaluation comparisons | Compare persisted evaluation runs by route, including pass-rate confidence intervals, cost and latency regressions, failure rates, and optional promotion gates. |
 | Tool execution timeout visibility | Inspect generated tool calls without reported outcomes, flag overdue calls, and scrape pending/overdue counts for Prometheus alerting. |
+| Tool approval workflow | Set approval TTLs, revoke active approvals, notify configured applications through the signed webhook outbox, and use the Python client helper to check approval immediately before execution. |
+| Shadow evaluation and promotion | Sample live requests to a non-returned candidate, compare validity-based quality, cost, latency, and failures, then combine shadow thresholds with saved evaluation and live SLO gates. |
 | Provider billing correlation metadata | Map the gateway request ID into provider-specific headers and nested request-body fields for invoice matching. |
 | Multimodal image input | Accept OpenAI-style image content parts and translate data URIs or image URLs for supported providers. |
 | Audio input and output | Accept base64 audio input parts and request generated audio for providers whose capability registry enables it. |
@@ -274,7 +276,23 @@ Each upstream attempt receives the gateway's generated request ID in `X-Gateway-
 
 Optional tool governance restricts declared and generated function names, caps generated calls per request, and can apply a per-tenant/application per-minute call limit. Configure global `tool_governance` and/or tenant `allowed_tools`, `default_policy.max_tool_calls_per_request`, and `default_policy.max_tool_calls_per_minute`; application policies can further narrow the allowlist and limits. Global and tenant allowlists intersect, and configured limits use the most restrictive value. Disallowed declarations are rejected before a provider call. Disallowed or excessive generated calls are withheld and recorded as denied metadata. Successful tool names are audited without arguments. Admins with the `audit` scope can inspect `/v1/admin/tool-audit?tenant_id=support-team`.
 
-For high-impact functions, add their names to `tool_governance.require_approval_tools` or a tenant's `require_approval_tools` / application policy. A generated call is then audited as `approval_required` and returned with its ID in `gateway.approval_required_tool_call_ids`. Before invoking the function, the application must query `GET /v1/tool-approvals/{request_id}/{tool_call_id}?application=...` and proceed only when the status is `approved`. An approver with the `tool_approvals` admin scope records `approved` or `denied` through `POST /v1/admin/tool-approvals`; the authenticated admin identity is stored as the actor in the audit trail. Decision records are immutable, and an execution outcome cannot be reported before approval. This gate communicates and audits the decision; the application and its downstream service must still enforce authorization immediately before the side effect.
+For high-impact functions, add their names to `tool_governance.require_approval_tools` or a tenant's `require_approval_tools` / application policy. A generated call is audited as `approval_required` and returned with its ID in `gateway.approval_required_tool_call_ids`. Before invoking it, query `GET /v1/tool-approvals/{request_id}/{tool_call_id}?application=...`; only `approved` and `not_required` allow execution. Approvers with the `tool_approvals` scope submit `approved`, `denied`, or `revoked` to `POST /v1/admin/tool-approvals`. Approval expires after `tool_governance.approval_ttl_seconds` (default 3,600 seconds), or the request's `expires_in_seconds`; expiry and revocation immediately block new execution reports. Each decision is retained as an audit event with the authenticated actor. Configure `tool_governance.approval_webhooks.<application>.url` to notify an application through the durable, optionally HMAC-signed webhook outbox.
+
+The Python helper checks approval immediately before calling the application's async tool function and reports its outcome without sending tool arguments to the gateway:
+
+```python
+from llm_gateway.client import execute_tool_with_approval
+
+result = await execute_tool_with_approval(
+    gateway_client,
+    request_id=request_id,
+    tool_call_id=tool_call_id,
+    application="support-router",
+    execute=lambda: delete_account(account_id),
+)
+```
+
+The gateway returns tool calls for the application to execute; the application and downstream service must still authorize the side effect. The helper supports async callables and requires `gateway_client` to have the gateway base URL and tenant authorization configured.
 
 The application still executes tools itself. After execution, report only the outcome metadata; arguments, results, and exception text are not accepted or stored. The gateway verifies the request, tool-call ID, application, and tenant against the generated-call audit record. Repeating the same outcome is idempotent; changing an already recorded outcome is rejected.
 
@@ -324,7 +342,7 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/v1/admin/providers` | Provider circuit state and consecutive failure counts. |
 | `GET` | `/v1/admin/audit` | Recent authenticated admin API access events. |
 | `GET` | `/v1/admin/tool-audit` | Metadata-only tool-call decisions, optionally filtered by tenant. |
-| `POST` | `/v1/admin/tool-approvals` | Record an immutable external approval or denial for a gated tool call. Requires the `tool_approvals` scope. |
+| `POST` | `/v1/admin/tool-approvals` | Record approval, denial, or revocation for a gated tool call. Requires the `tool_approvals` scope. |
 | `GET` | `/v1/tool-approvals/{request_id}/{tool_call_id}` | Query approval state before the application executes a gated tool call. |
 | `POST` | `/v1/tool-executions` | Report a caller-executed tool outcome for an authorized generated call. |
 | `GET` | `/v1/admin/tool-executions` | Inspect reported execution outcomes, optionally filtered by tenant. |
@@ -333,6 +351,8 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/v1/admin/evaluations` | List saved evaluation reports by dataset and version. |
 | `POST` | `/v1/admin/evaluations/compare` | Compare two saved runs by route and persist cost, latency, pass-rate, and failure gates. |
 | `GET` | `/v1/admin/evaluations/comparisons` | List saved comparisons. |
+| `GET` | `/v1/admin/shadow-reports` | Compare sampled candidate quality, cost, latency, failures, and shadow promotion gates. |
+| `POST` | `/v1/admin/promotions/evaluate` | Combine a saved evaluation comparison, shadow gates, and current route/application SLOs. |
 | `GET` | `/v1/admin/webhooks` | Inspect pending, delivered, and dead-letter budget alert events. |
 | `POST` | `/v1/admin/webhooks/{event_id}/redrive` | Retry a dead-letter alert event. |
 | `GET` | `/metrics` | Prometheus metrics in exposition format. |
@@ -450,6 +470,20 @@ llm-gateway-eval prompts.jsonl --compare simple reasoning \
 
 The candidate is evaluated against the dataset's `expected_contains` and `expected_not_contains` checks. Cost and average latency regression are measured against the baseline; the failure-rate gate counts gateway/API errors. The command exits nonzero when a candidate check or configured gate fails. These deterministic checks are useful for rollout regression control, but do not replace semantic evaluation by a human or a separately managed judge.
 
+### Shadow traffic and promotion gates
+
+Configure a route's `shadow` candidate and `traffic_percent` to sample requests using a stable request-ID hash. The gateway sends a separate non-streaming request to the candidate after the primary response is selected; the shadow response is never returned to the caller and response content is not persisted. Reports compare paired output validity (non-empty output plus valid declared tool arguments or requested JSON shape), estimated cost, latency, and failure rate. This quality signal is a format/validity check, not a semantic judge.
+
+`GET /v1/admin/shadow-reports?application=support-router&route=simple` returns the sample report and configured shadow gates. Configure `shadow.promotion.min_samples`, `max_quality_loss`, `max_cost_regression_percent`, `max_latency_regression_percent`, and `max_failure_rate` on the route. Candidate promotion combines those results with a saved evaluation comparison and live application/route SLOs:
+
+```bash
+curl -X POST http://localhost:8000/v1/admin/promotions/evaluate \
+  -H 'Authorization: Bearer gateway-secret' -H 'Content-Type: application/json' \
+  -d '{"comparison_id":"comparison-id","application":"support-router","route":"simple","window_hours":24}'
+```
+
+Promotion is fail-closed: it requires a passing saved evaluation comparison for the route, enough shadow samples with all configured gates passing, and observed requests meeting the current availability and latency objectives. Shadow observations contain only IDs, dimensions, counts, estimated costs, latency, and validity/failure metadata.
+
 ### Idempotent requests
 
 Send an `Idempotency-Key` header to prevent caller retries from generating another completion or charge:
@@ -506,7 +540,7 @@ With `stream: true` and `tools`, tool-call chunks use OpenAI-compatible `delta.t
 
 ### Provider adapter configuration
 
-Use `kind: azure_openai` with an Azure resource `base_url`, deployment name as the route model, `api_key_env`, and optional `api_version`. Use `kind: bedrock` with `region`; requests are signed with AWS Signature Version 4 using `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optional `AWS_SESSION_TOKEN`. Use `kind: vertex` with `project_id`, `region`, and an access-token environment variable (default `GOOGLE_CLOUD_ACCESS_TOKEN`). Use `kind: vllm` for a vLLM OpenAI-compatible endpoint. Bedrock supports Converse requests but not streaming; capability checks allow compatible fallbacks to serve unsupported requests.
+Use `kind: azure_openai` with an Azure resource `base_url`, deployment name as the route model, `api_key_env`, and optional `api_version`. Use `kind: bedrock` with `region`; requests are signed with AWS Signature Version 4 using `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optional `AWS_SESSION_TOKEN`. Use `kind: vertex` with `project_id`, `region`, and an access-token environment variable (default `GOOGLE_CLOUD_ACCESS_TOKEN`). Use `kind: vllm` for a vLLM OpenAI-compatible endpoint. Bedrock supports Converse and ConverseStream requests, including normalized streaming tool calls and usage. If a streaming provider fails before any caller-visible text, tool, or audio delta, the gateway can use the next configured provider; after output begins, it stops rather than risk duplicated or conflicting content.
 
 Provider capabilities appear in `GET /v1/routes` and `GET /v1/admin/providers`. A provider-level override can capture a known limitation, for example `capabilities: {audio_output: false}`. Keep overrides conservative and verify them against the selected upstream model.
 
@@ -523,7 +557,7 @@ When Redis is configured, circuit states and the single half-open recovery probe
 ## Security and privacy
 
 - Set `GATEWAY_API_KEY` to protect all `/v1` endpoints with bearer authentication.
-- Configure `security.admin_api_keys` for scoped admin access. Supported scopes are `report`, `budgets`, `providers`, `webhooks`, and `audit`. Rotate by enabling a replacement key before disabling the old entry; changing the configured key list requires a restart, while changing a referenced secret file takes effect on the next request.
+- Configure `security.admin_api_keys` for scoped admin access. Supported scopes include `report`, `budgets`, `providers`, `webhooks`, `audit`, and `tool_approvals`. Rotate by enabling a replacement key before disabling the old entry; changing the configured key list requires a restart, while changing a referenced secret file takes effect on the next request.
 - Configure `security.oidc` with issuer, audience, and JWKS URL to validate signed JWTs. Admin tokens need `llm-gateway:<scope>` or `admin:*`; client access uses the `client` scope when OIDC is enabled without tenant keys. Access tokens are validated offline, so revocation takes effect when the token expires unless the identity provider issues a replacement or rejection is reflected by a new JWKS key set.
 - Authenticated admin calls are recorded in the audit table and exposed at `/v1/admin/audit`. The audit log stores actor, path, status, and time; it omits tokens, prompts, and request bodies.
 - When using tenant credentials, configure separate admin credentials; tenant keys are restricted to allowed routes and applications.
@@ -552,7 +586,7 @@ For persistent data, mount a durable volume at the configured database directory
 
 ## Current limits
 
-- Bedrock streaming is not implemented. Gemini image URL inputs must use provider-supported file URIs or inline data URIs.
+- Gemini image URL inputs must use provider-supported file URIs or inline data URIs.
 - Without Redis, rate limits, cache, concurrency limits, and circuit-breaker health are process-local.
 - PostgreSQL supports shared usage storage and monthly budget reservations across replicas. SQLite remains intended for a single instance and modest event volume.
 - The gateway accepts text, image, and supported audio messages, but not video payloads. It returns tool calls for the application to execute and does not run them itself.
@@ -597,6 +631,9 @@ Suggested next milestones, ordered by production value:
 - [x] Report route/application SLOs and provide Prometheus recording and alert rules.
 - [x] Require external approval for configured high-impact tool calls and retain approver decisions in the audit trail.
 - [x] Add a provider adapter conformance suite for streaming, tool calls, structured output, usage, and request ID propagation.
+- [x] Stream Bedrock ConverseStream text, tool-call, and usage events; test fallback boundaries before and after caller-visible output.
+- [x] Add expiring and revocable tool approvals, application webhooks, and a Python helper that checks approval before execution.
+- [x] Sample shadow traffic and compare output validity, cost, latency, and failures; combine shadow, evaluation, and SLO gates for promotion.
 
 ## Contributing
 

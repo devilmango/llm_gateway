@@ -15,8 +15,8 @@ CAPABILITIES: dict[str, dict[str, bool]] = {
                "audio_input": True, "audio_output": True, "streaming_tools": True},
     "vertex": {"streaming": True, "tools": True, "structured_output": True, "images": True,
                "audio_input": True, "audio_output": True, "streaming_tools": True},
-    "bedrock": {"streaming": False, "tools": True, "structured_output": False, "images": True,
-                "audio_input": False, "audio_output": False, "streaming_tools": False},
+    "bedrock": {"streaming": True, "tools": True, "structured_output": False, "images": True,
+                "audio_input": False, "audio_output": False, "streaming_tools": True},
 }
 
 

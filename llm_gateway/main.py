@@ -59,12 +59,14 @@ from .schemas import (
     CostReconciliationRequest,
     EvaluationCompareRequest,
     EvaluationReportCreate,
+    PromotionEvaluateRequest,
     ToolApprovalDecisionRequest,
     ToolExecutionOutcomeRequest,
     Usage,
 )
 from .secrets import SecretUnavailable, resolve_secret
 from .service import GatewayService
+from .shadow import promotion_gates, quality_passed, should_sample
 from .storage import BudgetExceeded, create_usage_store
 from .tool_governance import (
     ToolGovernanceError,
@@ -146,6 +148,45 @@ async def _tenant_retention_loop(app: FastAPI, tenants: dict[str, Any]) -> None:
         await asyncio.sleep(24 * 60 * 60)
 
 
+async def _record_shadow_observation(app: FastAPI, *, request_id: str, application: str,
+                                     route_name: str, payload: dict[str, Any], baseline: dict[str, Any],
+                                     baseline_quality: bool, baseline_cost: float, baseline_latency_ms: int) -> None:
+    shadow = app.state.config["routes"][route_name]["shadow"]
+    provider_name, model = shadow["provider"], shadow["model"]
+    started = time.perf_counter()
+    status, failure_type, candidate_quality = "failure", None, False
+    usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    candidate_cost = 0.0
+    try:
+        gateway = app.state.gateway
+        provider_cfg = gateway.providers[provider_name]
+        await gateway.limiter.acquire(provider_name, int(provider_cfg.get("requests_per_minute", 600)))
+        async with gateway._concurrency():
+            result = await gateway.client.complete(provider_name, model, payload,
+                request_id=f"shadow_{request_id}"[:120])
+        usage = result.get("usage", usage)
+        price = provider_cfg.get("models", {}).get(model, {})
+        candidate_cost = (usage.get("prompt_tokens", 0) * float(price.get("input_cost_per_1m", 0)) +
+            usage.get("completion_tokens", 0) * float(price.get("output_cost_per_1m", 0))) / 1_000_000
+        candidate_quality = quality_passed(result, payload)
+        status = "success" if candidate_quality else "invalid_output"
+        if not candidate_quality:
+            failure_type = "quality_check_failed"
+    except asyncio.CancelledError:
+        raise
+    except (ProviderError, RateLimitExceeded, ValueError, TypeError, KeyError) as exc:
+        failure_type = type(exc).__name__
+    observation = {"request_id": request_id, "occurred_at": datetime.now(UTC).isoformat(),
+        "application": application, "route": route_name, "baseline_provider": baseline["provider"],
+        "baseline_model": baseline["model"], "candidate_provider": provider_name, "candidate_model": model,
+        "baseline_quality": int(baseline_quality), "candidate_quality": int(candidate_quality),
+        "baseline_cost_usd": baseline_cost, "candidate_cost_usd": candidate_cost,
+        "baseline_latency_ms": baseline_latency_ms,
+        "candidate_latency_ms": int((time.perf_counter() - started) * 1000),
+        "candidate_status": status, "failure_type": failure_type}
+    await asyncio.to_thread(app.state.store.record_shadow_observation, observation)
+
+
 def create_app(config: dict[str, Any] | None = None,
                http_transport: httpx.AsyncBaseTransport | None = None,
                shared_redis: Any | None = None) -> FastAPI:
@@ -158,6 +199,8 @@ def create_app(config: dict[str, Any] | None = None,
         app.state.http = httpx.AsyncClient(timeout=timeout, transport=http_transport)
         app.state.webhook_task = None
         app.state.retention_task = None
+        app.state.config = cfg
+        app.state.shadow_tasks = set()
         redis_client = shared_redis
         owns_redis = False
         app.state.store = None
@@ -180,7 +223,7 @@ def create_app(config: dict[str, Any] | None = None,
                 _tenant_retention_loop(app, cfg.get("tenants", cfg.get("security", {}).get("tenants", {}))))
             yield
         finally:
-            for task in (app.state.webhook_task, app.state.retention_task):
+            for task in (*app.state.shadow_tasks, app.state.webhook_task, app.state.retention_task):
                 if task:
                     task.cancel()
                     try:
@@ -196,6 +239,28 @@ def create_app(config: dict[str, Any] | None = None,
             TRACER_PROVIDER.force_flush()
 
     app = FastAPI(title="LLM Gateway", version="0.1.0", lifespan=lifespan)
+
+    def schedule_shadow(request: Request, request_id: str, application: str, route_name: str,
+                        payload: dict[str, Any], baseline: dict[str, Any], baseline_quality: bool,
+                        baseline_cost: float, baseline_latency_ms: int,
+                        tenant_policy: dict[str, Any] | None) -> None:
+        shadow = cfg["routes"].get(route_name, {}).get("shadow")
+        if not shadow or not should_sample(request_id, float(shadow.get("traffic_percent", 0))):
+            return
+        candidate = {"provider": shadow["provider"], "model": shadow["model"]}
+        if tenant_policy and not request.app.state.gateway._tenant_allows(candidate, tenant_policy):
+            return
+        task = asyncio.create_task(_record_shadow_observation(request.app, request_id=request_id,
+            application=application, route_name=route_name, payload=payload, baseline=baseline,
+            baseline_quality=baseline_quality, baseline_cost=baseline_cost,
+            baseline_latency_ms=baseline_latency_ms))
+        request.app.state.shadow_tasks.add(task)
+        def shadow_task_done(done: asyncio.Task) -> None:
+            request.app.state.shadow_tasks.discard(done)
+            if not done.cancelled() and (error := done.exception()) is not None:
+                logger.error("shadow_observation_failed request_id=%s error=%s",
+                    request_id, type(error).__name__)
+        task.add_done_callback(shadow_task_done)
 
     def configured_tenants() -> dict[str, Any]:
         return cfg.get("tenants", cfg.get("security", {}).get("tenants", {}))
@@ -685,6 +750,14 @@ def create_app(config: dict[str, Any] | None = None,
                                                      stream_provider.get("canary_used"))),
                             "error_type": stream_error}
                         await asyncio.to_thread(request.app.state.store.record, record)
+                        if (stream_completed and stream_result and provider_name and configured_model
+                                and not stream_result.get("cached")):
+                            baseline_output = {"text": stream_result.get("text", ""),
+                                "tool_calls": list(stream_tool_calls.values())}
+                            schedule_shadow(request, request_id, ledger_app_name, route_name, upstream_payload,
+                                {"provider": provider_name, "model": configured_model},
+                                quality_passed(baseline_output, upstream_payload), cost_value, elapsed_ms,
+                                tenant_cfg if tenant else None)
                         if stream_routing_decisions:
                             await asyncio.to_thread(request.app.state.store.record_routing_decisions,
                                 request_id, ledger_app_name, route_name, stream_routing_decisions)
@@ -739,10 +812,12 @@ def create_app(config: dict[str, Any] | None = None,
                 stream_response_started = True
                 return StreamingResponse(event_stream(), media_type="text/event-stream",
                                          headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+            provider_started = time.perf_counter()
             with trace.use_span(span, end_on_exit=False):
                 result = await request.app.state.gateway.complete(route_name, upstream_payload, request_id,
                     tenant_cfg if tenant else None,
                     {"application": app_name, "tenant_id": tenant.get("id") if tenant else None})
+            provider_latency_ms = int((time.perf_counter() - provider_started) * 1000)
             routing_decisions = result.get("routing_decisions", [])
             await audit_generated_tool_calls(result.get("tool_calls", []))
             try:
@@ -755,6 +830,11 @@ def create_app(config: dict[str, Any] | None = None,
             price = cfg["providers"][provider].get("models", {}).get(result.get("configured_model", model), {})
             cost = (usage["prompt_tokens"] * float(price.get("input_cost_per_1m", 0)) +
                     usage["completion_tokens"] * float(price.get("output_cost_per_1m", 0))) / 1_000_000
+            if not result.get("cached"):
+                schedule_shadow(request, request_id, ledger_app_name, route_name, upstream_payload,
+                    {"provider": provider, "model": result.get("configured_model", model)},
+                    quality_passed(result, upstream_payload), cost, provider_latency_ms,
+                    tenant_cfg if tenant else None)
             status = "success"
             span.set_attribute("llm.gateway.provider", provider)
             span.set_attribute("llm.gateway.model", model)
@@ -1066,11 +1146,30 @@ def create_app(config: dict[str, Any] | None = None,
     async def decide_tool_approval(body: ToolApprovalDecisionRequest, request: Request) -> dict[str, Any]:
         """Record an external approval decision; the authenticated admin identity is the approver."""
         actor = request.state.admin_actor
+        if body.decision != "approved" and body.expires_in_seconds is not None:
+            raise HTTPException(status_code=422, detail="expires_in_seconds only applies to approvals")
+        ttl_seconds = body.expires_in_seconds or int(cfg.get("tool_governance", {}).get("approval_ttl_seconds", 3600))
+        expires_at = (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat() \
+            if body.decision == "approved" else None
         try:
-            return await asyncio.to_thread(request.app.state.store.record_tool_approval,
-                body.request_id, body.tool_call_id, body.decision, actor)
+            result = await asyncio.to_thread(request.app.state.store.record_tool_approval,
+                body.request_id, body.tool_call_id, body.decision, actor, expires_at)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raw_application = result["application"].split(":", 1)[-1]
+        webhooks = cfg.get("tool_governance", {}).get("approval_webhooks", {})
+        webhook = webhooks.get(result["application"], webhooks.get(raw_application))
+        if webhook:
+            occurred_at = datetime.now(UTC).isoformat()
+            event_id = hashlib.sha256((f"{body.request_id}:{body.tool_call_id}:{body.decision}:"
+                f"{result.get('expires_at') or ''}").encode()).hexdigest()
+            event = {"alert_id": event_id, "type": "tool_approval.updated", "occurred_at": occurred_at,
+                "application": result["application"], "request_id": body.request_id,
+                "tool_call_id": body.tool_call_id, "decision": body.decision,
+                "actor": result.get("actor", actor), "expires_at": result.get("expires_at")}
+            await asyncio.to_thread(request.app.state.store.enqueue_webhook,
+                event, webhook["url"], webhook.get("secret_env"))
+        return result
 
     @app.get("/v1/tool-approvals/{request_id}/{tool_call_id}")
     async def tool_approval_status(request_id: str, tool_call_id: str, request: Request,
@@ -1162,6 +1261,66 @@ def create_app(config: dict[str, Any] | None = None,
                                      limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
         comparisons = await asyncio.to_thread(request.app.state.store.evaluation_comparisons, limit)
         return {"comparisons": comparisons}
+
+    @app.get("/v1/admin/shadow-reports", dependencies=[Depends(admin_dependency("report"))])
+    async def shadow_reports(request: Request, application: str = Query(min_length=1, max_length=120),
+                             route: str = Query(min_length=1, max_length=120),
+                             window_hours: int = Query(default=24, ge=1, le=720)) -> dict[str, Any]:
+        shadow = cfg["routes"].get(route, {}).get("shadow")
+        if not shadow:
+            raise HTTPException(status_code=404, detail="No shadow candidate is configured for this route")
+        end = datetime.now(UTC)
+        start = end - timedelta(hours=window_hours)
+        result = await asyncio.to_thread(request.app.state.store.shadow_report,
+            application, route, start.isoformat(), end.isoformat())
+        result["candidate_provider"] = shadow["provider"]
+        result["candidate_model"] = shadow["model"]
+        result["window_hours"] = window_hours
+        result["promotion"] = promotion_gates(result, shadow.get("promotion", {}))
+        return result
+
+    @app.post("/v1/admin/promotions/evaluate", dependencies=[Depends(admin_dependency("report"))])
+    async def evaluate_promotion(body: PromotionEvaluateRequest, request: Request) -> dict[str, Any]:
+        route_config = cfg["routes"].get(body.route)
+        if not route_config or not route_config.get("shadow"):
+            raise HTTPException(status_code=404, detail="No shadow candidate is configured for this route")
+        comparison = await asyncio.to_thread(request.app.state.store.evaluation_comparison, body.comparison_id)
+        if comparison is None:
+            raise HTTPException(status_code=404, detail="Evaluation comparison was not found")
+        evaluation_report = comparison["report"]
+        evaluation_route = evaluation_report.get("routes", {}).get(body.route)
+        evaluation_passed = (evaluation_report.get("promotion_passed") is True and evaluation_route is not None
+                             and evaluation_route.get("change") == "compared")
+        end = datetime.now(UTC)
+        start = end - timedelta(hours=body.window_hours)
+        shadow_report = await asyncio.to_thread(request.app.state.store.shadow_report,
+            body.application, body.route, start.isoformat(), end.isoformat())
+        shadow_result = promotion_gates(shadow_report, route_config["shadow"].get("promotion", {}))
+        targets = slo_targets(body.application, body.route)
+        observations = await asyncio.to_thread(request.app.state.store.slo_observations,
+            start.isoformat(), end.isoformat())
+        matching = [item for item in observations
+                    if item["application"] == body.application and item["route"] == body.route]
+        total = sum(int(item["requests"]) for item in matching)
+        failures = sum(int(item["requests"]) for item in matching if item["status"] != "success")
+        within_latency = sum(int(item["requests"]) for item in matching
+            if int(item["latency_ms"]) <= targets["latency_target_ms"])
+        availability = (total - failures) / total if total else 0.0
+        latency_compliance = within_latency / total if total else 0.0
+        slo = {"requests": total, "availability": availability,
+            "availability_target": targets["availability_target"],
+            "latency_compliance": latency_compliance,
+            "latency_objective": targets["latency_objective"],
+            "passed": bool(total and availability >= targets["availability_target"]
+                            and latency_compliance >= targets["latency_objective"])}
+        gates = {"evaluation": {"passed": evaluation_passed, "comparison_id": body.comparison_id},
+            "shadow": shadow_result, "slo": slo}
+        return {"application": body.application, "route": body.route,
+            "candidate_provider": route_config["shadow"]["provider"],
+            "candidate_model": route_config["shadow"]["model"],
+            "window_hours": body.window_hours, "promotion_passed": (
+                gates["evaluation"]["passed"] and gates["shadow"]["passed"] and gates["slo"]["passed"]),
+            "gates": gates}
 
     @app.get("/v1/admin/webhooks", dependencies=[Depends(admin_dependency("webhooks"))])
     async def webhook_events(request: Request, status: str | None = Query(default=None),

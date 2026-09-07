@@ -59,6 +59,13 @@ class EvaluationCompareRequest(BaseModel):
     max_failure_rate: float | None = Field(default=None, ge=0, le=1)
 
 
+class PromotionEvaluateRequest(BaseModel):
+    comparison_id: str = Field(min_length=1, max_length=120)
+    application: str = Field(min_length=1, max_length=120)
+    route: str = Field(min_length=1, max_length=120)
+    window_hours: int = Field(default=24, ge=1, le=720)
+
+
 class ToolExecutionOutcomeRequest(BaseModel):
     request_id: str = Field(min_length=1, max_length=120)
     tool_call_id: str = Field(min_length=1, max_length=200)
@@ -76,7 +83,8 @@ class ToolExecutionOutcomeRequest(BaseModel):
 class ToolApprovalDecisionRequest(BaseModel):
     request_id: str = Field(min_length=1, max_length=120)
     tool_call_id: str = Field(min_length=1, max_length=200)
-    decision: Literal["approved", "denied"]
+    decision: Literal["approved", "denied", "revoked"]
+    expires_in_seconds: int | None = Field(default=None, ge=1, le=604800)
 
 
 class ChatMessage(BaseModel):

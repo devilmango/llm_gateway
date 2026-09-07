@@ -5,7 +5,9 @@ import hashlib
 import hmac
 import json
 import os
+import struct
 import sys
+import zlib
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import ModuleType, SimpleNamespace
@@ -15,6 +17,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+from llm_gateway.client import ToolApprovalError, execute_tool_with_approval
 from llm_gateway.evaluation import compare_routes, evaluate_cases
 from llm_gateway.main import _deliver_webhook_batch, create_app
 from llm_gateway.providers import ProviderClient
@@ -57,6 +60,19 @@ def success_response() -> httpx.Response:
         "choices": [{"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
     })
+
+
+def bedrock_stream_frame(event_type: str, payload: dict) -> bytes:
+    event_name = b":event-type"
+    event_value = event_type.encode()
+    headers = bytes([len(event_name)]) + event_name + b"\x07" + struct.pack(">H", len(event_value)) + event_value
+    message_name = b":message-type"
+    headers += bytes([len(message_name)]) + message_name + b"\x07" + struct.pack(">H", 5) + b"event"
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    total_length = 12 + len(headers) + len(body) + 4
+    prelude = struct.pack(">II", total_length, len(headers))
+    frame = prelude + struct.pack(">I", zlib.crc32(prelude)) + headers + body
+    return frame + struct.pack(">I", zlib.crc32(frame))
 
 
 @pytest.mark.asyncio
@@ -510,6 +526,8 @@ async def test_high_impact_tool_requires_recorded_approval_before_execution(tmp_
     ]}, "finish_reason": "tool_calls"}
     cfg = config(str(tmp_path / "tool-approval.sqlite3"))
     cfg["tool_governance"] = {"require_approval_tools": ["delete_account"]}
+    cfg["tool_governance"]["approval_webhooks"] = {"support-router": {
+        "url": "https://app.test/tool-approval-events"}}
     cfg["tenants"] = {"support": {"api_key_env": "SUPPORT_TENANT_KEY", "allowed_routes": ["simple"],
         "allowed_tools": ["delete_account"], "applications": {"support-router": {}}}}
     async with gateway_client(cfg,
@@ -526,17 +544,29 @@ async def test_high_impact_tool_requires_recorded_approval_before_execution(tmp_
         assert completion.json()["gateway"]["approval_required_tool_call_ids"] == ["call-delete-1"]
         approval_url = f"/v1/tool-approvals/{request_id}/call-delete-1?application=support-router"
         headers = {"Authorization": "Bearer support-secret"}
+        client.headers.update(headers)
         status = await client.get(approval_url, headers=headers)
         assert status.json()["status"] == "pending"
         outcome = {"request_id": request_id, "tool_call_id": "call-delete-1",
             "application": "support-router", "outcome": "succeeded"}
         blocked = await client.post("/v1/tool-executions", headers=headers, json=outcome)
         assert blocked.status_code == 409
+        invoked = False
+
+        async def invoke_delete():
+            nonlocal invoked
+            invoked = True
+
+        with pytest.raises(ToolApprovalError, match="pending"):
+            await execute_tool_with_approval(client, request_id=request_id,
+                tool_call_id="call-delete-1", application="support-router", execute=invoke_delete)
+        assert not invoked
         approved = await client.post("/v1/admin/tool-approvals", headers={
             "Authorization": "Bearer admin-secret"}, json={"request_id": request_id,
-                "tool_call_id": "call-delete-1", "decision": "approved"})
+                "tool_call_id": "call-delete-1", "decision": "approved", "expires_in_seconds": 3600})
         assert approved.status_code == 200
         assert approved.json()["actor"] == "gateway-api-key"
+        assert approved.json()["expires_at"]
         duplicate = await client.post("/v1/admin/tool-approvals", headers={
             "Authorization": "Bearer admin-secret"}, json={"request_id": request_id,
                 "tool_call_id": "call-delete-1", "decision": "approved"})
@@ -547,8 +577,15 @@ async def test_high_impact_tool_requires_recorded_approval_before_execution(tmp_
         assert conflicting.status_code == 409
         status = await client.get(approval_url, headers=headers)
         assert status.json()["status"] == "approved"
+        await execute_tool_with_approval(client, request_id=request_id,
+            tool_call_id="call-delete-1", application="support-router", execute=invoke_delete)
+        assert invoked
         executed = await client.post("/v1/tool-executions", headers=headers, json=outcome)
-        assert executed.status_code == 200
+        assert executed.status_code == 200 and executed.json()["duplicate"] is True
+        app = client._transport.app
+        await _deliver_webhook_batch(app)
+        webhook_events = await asyncio.to_thread(app.state.store.webhook_events, "delivered")
+        assert any(event["application"] == "support:support-router" for event in webhook_events)
         audit = await client.get("/v1/admin/tool-audit?tenant_id=support", headers={
             "Authorization": "Bearer admin-secret"})
         events = audit.json()["events"]
@@ -556,6 +593,29 @@ async def test_high_impact_tool_requires_recorded_approval_before_execution(tmp_
         assert any(event["outcome"] == "approved" and event["actor"] == "gateway-api-key"
                    for event in events)
         assert all("arguments" not in event for event in events)
+
+
+def test_tool_approvals_expire_and_can_be_revoked(tmp_path):
+    store = create_usage_store(str(tmp_path / "tool-approval-expiry.sqlite3"))
+    now = datetime.now(UTC)
+    for tool_call_id in ("expired-call", "revoked-call"):
+        store.record_tool_call_audits("approval-request", None, "app", [{
+            "tool_call_id": tool_call_id, "tool_name": "delete_account",
+            "outcome": "approval_required", "reason": "external_approval_pending"}])
+    store.record_tool_approval("approval-request", "expired-call", "approved", "approver",
+                                (now - timedelta(seconds=1)).isoformat())
+    expired = store.tool_approval_status("approval-request", "expired-call", None, "app")
+    assert expired["status"] == "expired"
+    with pytest.raises(ValueError, match="requires recorded external approval"):
+        store.record_tool_execution_outcome("approval-request", "expired-call", None, "app", "succeeded")
+
+    store.record_tool_approval("approval-request", "revoked-call", "approved", "approver",
+                                (now + timedelta(hours=1)).isoformat())
+    store.record_tool_approval("approval-request", "revoked-call", "revoked", "security-admin")
+    revoked = store.tool_approval_status("approval-request", "revoked-call", None, "app")
+    assert revoked["status"] == "revoked"
+    with pytest.raises(ValueError, match="requires recorded external approval"):
+        store.record_tool_execution_outcome("approval-request", "revoked-call", None, "app", "succeeded")
 
 
 @pytest.mark.asyncio
@@ -689,7 +749,7 @@ def test_gemini_audio_input_translation_and_capability_registry():
     assert converted["contents"][0]["parts"][0]["inlineData"] == {
         "mimeType": "audio/wav", "data": "aGVsbG8="}
     assert provider_capabilities({"kind": "azure_openai"})["audio_output"] is True
-    assert provider_capabilities({"kind": "bedrock"})["streaming"] is False
+    assert provider_capabilities({"kind": "bedrock"})["streaming"] is True
     assert provider_capabilities({"kind": "vllm"})["tools"] is True
 
 
@@ -1813,3 +1873,129 @@ def test_tenant_usage_retention_must_preserve_current_month_budget_window(tmp_pa
     cfg["tenants"] = {"short": {"data_policy": {"usage_retention_days": 7}}}
     with pytest.raises(ValueError, match="at least 35"):
         create_app(cfg, http_transport=httpx.MockTransport(lambda request: success_response()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_after_output", [False, True])
+async def test_bedrock_stream_falls_back_only_before_output_is_emitted(tmp_path, monkeypatch, fail_after_output):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+    cfg = config(str(tmp_path / f"bedrock-stream-{fail_after_output}.sqlite3"))
+    cfg["server"]["max_retries"] = 0
+    cfg["providers"]["primary"] = {"kind": "bedrock", "base_url": "https://bedrock.test",
+        "region": "us-east-1", "models": {"primary-model": {}}}
+    hosts = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        if request.url.host == "backup.test":
+            events = [
+                {"choices": [{"delta": {"content": "backup-answer"}, "finish_reason": None}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                {"choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}},
+            ]
+            return httpx.Response(200,
+                content=("".join(f"data: {json.dumps(item)}\n\n" for item in events) + "data: [DONE]\n\n").encode(),
+                headers={"content-type": "text/event-stream"})
+        if not fail_after_output:
+            return httpx.Response(503)
+        body = bedrock_stream_frame("contentBlockDelta", {
+            "contentBlockIndex": 0, "delta": {"text": "bedrock-answer"}})
+        body += bedrock_stream_frame("internalServerException", {"message": "upstream failed"})
+        return httpx.Response(200, content=body,
+            headers={"content-type": "application/vnd.amazon.eventstream"})
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", json={"model": "simple", "stream": True,
+            "messages": [{"role": "user", "content": "hello"}]})
+        assert response.status_code == 200
+        if fail_after_output:
+            assert "bedrock-answer" in response.text
+            assert "backup-answer" not in response.text
+            assert hosts == ["bedrock.test"]
+        else:
+            assert "backup-answer" in response.text
+            assert "bedrock-answer" not in response.text
+            assert hosts == ["bedrock.test", "backup.test"]
+
+
+@pytest.mark.asyncio
+async def test_shadow_sample_records_comparison_and_combines_promotion_gates(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    cfg = config(str(tmp_path / "shadow.sqlite3"))
+    cfg["routes"]["simple"]["shadow"] = {"provider": "backup", "model": "backup-model",
+        "traffic_percent": 100, "promotion": {"min_samples": 1, "max_quality_loss": 0,
+            "max_cost_regression_percent": 0, "max_latency_regression_percent": 100,
+            "max_failure_rate": 0}}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        body = success_response().json()
+        if request.url.host == "backup.test":
+            body["model"] = "backup-model"
+            body["choices"][0]["message"]["content"] = "candidate answer"
+        return httpx.Response(200, json=body)
+
+    app = create_app(cfg, http_transport=httpx.MockTransport(upstream))
+    async with app.router.lifespan_context(app), httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
+        response = await client.post("/v1/chat/completions", json={"model": "simple",
+            "application": "support-router", "messages": [{"role": "user", "content": "hello"}]})
+        assert response.status_code == 200
+        tasks = tuple(app.state.shadow_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
+        report = await client.get("/v1/admin/shadow-reports", params={
+            "application": "support-router", "route": "simple"})
+        assert report.status_code == 200
+        assert report.json()["samples"] == 1
+        assert report.json()["candidate"]["quality_pass_rate"] == 1
+        assert report.json()["promotion"]["passed"] is True
+
+        baseline = await client.post("/v1/admin/evaluations", json={"dataset_name": "smoke",
+            "dataset_version": "baseline", "dataset_sha256": "a" * 64, "case_count": 1,
+            "report": {"routes": {"simple": {"requests": 1, "graded_cases": 1,
+                "pass_rate": 1.0, "average_latency_ms": 10, "estimated_cost_usd": 0.01, "failures": 0}},
+                "results": [{"route": "simple", "passed": True}]}})
+        candidate = await client.post("/v1/admin/evaluations", json={"dataset_name": "smoke",
+            "dataset_version": "candidate", "dataset_sha256": "b" * 64, "case_count": 1,
+            "report": {"routes": {"simple": {"requests": 1, "graded_cases": 1,
+                "pass_rate": 1.0, "average_latency_ms": 10, "estimated_cost_usd": 0.01, "failures": 0}},
+                "results": [{"route": "simple", "passed": True}]}})
+        comparison = await client.post("/v1/admin/evaluations/compare", json={
+            "baseline_run_id": baseline.json()["run_id"],
+            "candidate_run_id": candidate.json()["run_id"], "min_pass_rate": 0.9,
+            "max_cost_regression_percent": 0, "max_latency_regression_percent": 0, "max_failure_rate": 0})
+        assert comparison.json()["report"]["promotion_passed"] is True
+        promotion = await client.post("/v1/admin/promotions/evaluate", json={
+            "comparison_id": comparison.json()["comparison_id"], "application": "support-router",
+            "route": "simple", "window_hours": 24})
+        assert promotion.status_code == 200
+        assert promotion.json()["promotion_passed"] is True
+
+
+@pytest.mark.asyncio
+async def test_shadow_candidate_obeys_tenant_provider_policy(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    monkeypatch.setenv("RESTRICTED_TENANT_KEY", "restricted-secret")
+    cfg = config(str(tmp_path / "tenant-shadow.sqlite3"))
+    cfg["routes"]["simple"]["shadow"] = {"provider": "backup", "model": "backup-model",
+        "traffic_percent": 100}
+    cfg["tenants"] = {"restricted": {"api_key_env": "RESTRICTED_TENANT_KEY",
+        "allowed_routes": ["simple"], "allowed_providers": ["primary"],
+        "applications": {"support-router": {}}}}
+    hosts = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return success_response()
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        response = await client.post("/v1/chat/completions", headers={
+            "Authorization": "Bearer restricted-secret"}, json={"model": "simple",
+                "application": "support-router", "messages": [{"role": "user", "content": "hello"}]})
+        assert response.status_code == 200
+        assert hosts == ["primary.test"]

@@ -5,7 +5,9 @@ import hmac
 import json
 import os
 import re
+import struct
 import time
+import zlib
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
@@ -222,7 +224,9 @@ class ProviderClient:
         kind = cfg["kind"]
         self.validate_capabilities(provider_name, payload, streaming=True)
         if kind == "bedrock":
-            raise ProviderError("Bedrock streaming is not available for this adapter", retryable=False)
+            async for item in self._stream_bedrock(provider_name, model, payload, request_id):
+                yield item
+            return
         try:
             key = await resolve_secret(cfg.get("api_key_env"), cfg.get("api_key_file")) or None
         except SecretUnavailable as exc:
@@ -400,6 +404,161 @@ class ProviderClient:
             PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
             PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
             raise
+
+    async def _stream_bedrock(self, provider_name: str, model: str, payload: dict[str, Any],
+                              request_id: str | None = None):
+        cfg = self.providers[provider_name]
+        region = cfg.get("region") or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+        if not region:
+            raise ProviderError("Bedrock provider requires region or AWS_REGION")
+        base = (cfg.get("base_url") or f"https://bedrock-runtime.{region}.amazonaws.com").rstrip("/")
+        url = f"{base}/model/{quote(model, safe='-_.~')}/converse-stream"
+        request_payload = self._bedrock_payload(payload)
+        try:
+            access_key = await resolve_secret(cfg.get("access_key_env", "AWS_ACCESS_KEY_ID"),
+                                              cfg.get("access_key_file"))
+            secret_key = await resolve_secret(cfg.get("secret_key_env", "AWS_SECRET_ACCESS_KEY"),
+                                              cfg.get("secret_key_file"))
+            session_token = await resolve_secret(cfg.get("session_token_env", "AWS_SESSION_TOKEN"),
+                                                 cfg.get("session_token_file"))
+        except SecretUnavailable as exc:
+            raise ProviderError("Bedrock credential is unavailable") from exc
+        headers = {"Content-Type": "application/json", "Accept": "application/vnd.amazon.eventstream"}
+        self._apply_request_correlation(cfg, headers, request_payload, request_id)
+        self._sign_aws_request(url, request_payload, headers, region, access_key, secret_key, session_token)
+        body = json.dumps(request_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        started = time.perf_counter()
+        outcome = "network_error"
+        try:
+            async with self.http.stream("POST", url, content=body, headers=headers, timeout=self.timeout) as response:
+                if response.status_code >= 400:
+                    outcome = "rate_limited" if response.status_code == 429 else "upstream_error"
+                    raise ProviderError(f"Upstream returned HTTP {response.status_code}",
+                                        retryable=response.status_code == 429 or response.status_code >= 500,
+                                        status_code=response.status_code)
+                saw_delta = False
+                usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                finish_reason = None
+                tool_indices: dict[int, int] = {}
+                next_tool_index = 0
+                async for event in self._bedrock_event_stream(response.aiter_bytes()):
+                    event_type = event.get(":event-type", "")
+                    if event.get(":message-type") == "exception" or event_type.endswith("Exception"):
+                        raise ProviderError(f"Bedrock stream returned {event_type or 'an exception'}",
+                                            retryable=event_type in {"throttlingException", "serviceUnavailableException"})
+                    if event_type == "contentBlockStart":
+                        block = event.get("start", {})
+                        tool = block.get("toolUse")
+                        if tool:
+                            block_index = int(event.get("contentBlockIndex", 0))
+                            tool_indices[block_index] = next_tool_index
+                            yield {"tool_call_delta": {"index": next_tool_index,
+                                "id": tool.get("toolUseId"), "type": "function",
+                                "function": {"name": tool.get("name", ""), "arguments": ""}}}
+                            next_tool_index += 1
+                            saw_delta = True
+                    elif event_type == "contentBlockDelta":
+                        block_index = int(event.get("contentBlockIndex", 0))
+                        delta = event.get("delta", {})
+                        if isinstance(delta.get("text"), str) and delta["text"]:
+                            yield {"delta": delta["text"]}
+                            saw_delta = True
+                        tool_delta = delta.get("toolUse")
+                        if tool_delta and block_index in tool_indices:
+                            yield {"tool_call_delta": {"index": tool_indices[block_index], "type": "function",
+                                "function": {"arguments": tool_delta.get("input", "")}}}
+                            saw_delta = True
+                    elif event_type == "messageStop":
+                        finish_reason = event.get("stopReason") or finish_reason
+                    elif event_type == "metadata":
+                        metadata = event.get("metadata", {})
+                        token_usage = metadata.get("usage", {})
+                        if token_usage:
+                            prompt = int(token_usage.get("inputTokens", 0) or 0)
+                            completion = int(token_usage.get("outputTokens", 0) or 0)
+                            usage = {"prompt_tokens": prompt, "completion_tokens": completion,
+                                "total_tokens": int(token_usage.get("totalTokens", prompt + completion) or prompt + completion)}
+                            yield {"usage_progress": dict(usage)}
+                if not saw_delta:
+                    raise ProviderError("Provider returned no text completion", retryable=False)
+                PROVIDER_REQUESTS.labels(provider=provider_name, outcome="success").inc()
+                PROVIDER_LATENCY.labels(provider=provider_name, outcome="success").observe(time.perf_counter() - started)
+                yield {"usage": usage, "finish_reason": finish_reason, "model": model}
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
+            raise ProviderError(f"{type(exc).__name__}: upstream request failed", retryable=True) from exc
+        except ProviderError as exc:
+            outcome = "rate_limited" if exc.status_code == 429 else "upstream_error"
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
+            raise
+
+    @staticmethod
+    async def _bedrock_event_stream(chunks):
+        """Decode AWS EventStream frames and validate their CRCs before parsing JSON events."""
+        buffer = bytearray()
+        async for chunk in chunks:
+            buffer.extend(chunk)
+            while len(buffer) >= 12:
+                total_length, headers_length = struct.unpack_from(">II", buffer)
+                if total_length < 16 or headers_length > total_length - 16:
+                    raise ProviderError("Bedrock returned an invalid EventStream frame", retryable=False)
+                if len(buffer) < total_length:
+                    break
+                frame = bytes(buffer[:total_length])
+                del buffer[:total_length]
+                if zlib.crc32(frame[:8]) != struct.unpack_from(">I", frame, 8)[0]:
+                    raise ProviderError("Bedrock EventStream prelude checksum failed", retryable=False)
+                if zlib.crc32(frame[:-4]) != struct.unpack_from(">I", frame, total_length - 4)[0]:
+                    raise ProviderError("Bedrock EventStream message checksum failed", retryable=False)
+                headers: dict[str, Any] = {}
+                cursor = 12
+                headers_end = 12 + headers_length
+                while cursor < headers_end:
+                    name_length = frame[cursor]
+                    cursor += 1
+                    name = frame[cursor:cursor + name_length].decode("utf-8")
+                    cursor += name_length
+                    value_type = frame[cursor]
+                    cursor += 1
+                    if value_type == 0:
+                        value = True
+                    elif value_type == 1:
+                        value = False
+                    elif value_type == 2:
+                        value = struct.unpack_from(">b", frame, cursor)[0]
+                        cursor += 1
+                    elif value_type == 3:
+                        value = struct.unpack_from(">h", frame, cursor)[0]
+                        cursor += 2
+                    elif value_type == 4:
+                        value = struct.unpack_from(">i", frame, cursor)[0]
+                        cursor += 4
+                    elif value_type in {5, 8}:
+                        value = struct.unpack_from(">q", frame, cursor)[0]
+                        cursor += 8
+                    elif value_type in {6, 7}:
+                        value_length = struct.unpack_from(">H", frame, cursor)[0]
+                        cursor += 2
+                        raw = frame[cursor:cursor + value_length]
+                        cursor += value_length
+                        value = raw if value_type == 6 else raw.decode("utf-8")
+                    elif value_type == 9:
+                        value = frame[cursor:cursor + 16]
+                        cursor += 16
+                    else:
+                        raise ProviderError("Bedrock EventStream used an unknown header type", retryable=False)
+                    headers[name] = value
+                try:
+                    payload = json.loads(frame[headers_end:-4] or b"{}")
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ProviderError("Bedrock returned invalid EventStream JSON", retryable=False) from exc
+                if not isinstance(payload, dict):
+                    raise ProviderError("Bedrock EventStream event must be a JSON object", retryable=False)
+                yield {**headers, **payload}
+        if buffer:
+            raise ProviderError("Bedrock returned a truncated EventStream frame", retryable=True)
 
     @staticmethod
     def _content_text(content: Any) -> str:

@@ -42,6 +42,11 @@ slos:
 #   max_tool_calls_per_minute: 60
 #   execution_timeout_seconds: 300
 #   require_approval_tools: [delete_account, issue_refund]
+#   approval_ttl_seconds: 3600
+#   approval_webhooks:
+#     support-router:
+#       url: https://support.example.com/tool-approval-events
+#       secret_env: SUPPORT_APPROVAL_WEBHOOK_SECRET
 
 security:
   redact_pii: true
@@ -186,6 +191,17 @@ routes:
     provider: openai
     # Optional deterministic canary sample. Canary traffic bypasses response cache.
     # canary: {provider: anthropic, model: claude-3-5-haiku-latest, traffic_percent: 5}
+    # Optional sampled shadow calls. Candidate output is never returned.
+    # shadow:
+    #   provider: anthropic
+    #   model: claude-3-5-haiku-latest
+    #   traffic_percent: 2
+    #   promotion:
+    #     min_samples: 30
+    #     max_quality_loss: 0.02
+    #     max_cost_regression_percent: 10
+    #     max_latency_regression_percent: 20
+    #     max_failure_rate: 0.01
     fallbacks:
       - provider: gemini
         model: gemini-2.0-flash
