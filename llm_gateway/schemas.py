@@ -186,6 +186,35 @@ class ChatRequest(BaseModel):
         return self
 
 
+class EmbeddingsRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=120)
+    input: str | list[str]
+    application: str = Field(default="default", max_length=120)
+    cost_center: str | None = Field(default=None, max_length=120)
+
+    @model_validator(mode="after")
+    def validate_input(self) -> EmbeddingsRequest:
+        values = [self.input] if isinstance(self.input, str) else self.input
+        if not values or len(values) > 2048 or any(not value.strip() or len(value) > 100_000 for value in values):
+            raise ValueError("input must contain between 1 and 2048 non-empty strings of at most 100000 characters")
+        return self
+
+
+class RerankRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=120)
+    query: str = Field(min_length=1, max_length=100_000)
+    documents: list[str] = Field(min_length=1, max_length=1000)
+    top_n: int | None = Field(default=None, ge=1, le=1000)
+    application: str = Field(default="default", max_length=120)
+    cost_center: str | None = Field(default=None, max_length=120)
+
+    @model_validator(mode="after")
+    def validate_documents(self) -> RerankRequest:
+        if any(not document.strip() or len(document) > 100_000 for document in self.documents):
+            raise ValueError("documents must be non-empty strings of at most 100000 characters")
+        return self
+
+
 class Usage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0

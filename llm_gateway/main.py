@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -57,9 +58,11 @@ from .schemas import (
     ChatResponse,
     CostReconciliationImportRequest,
     CostReconciliationRequest,
+    EmbeddingsRequest,
     EvaluationCompareRequest,
     EvaluationReportCreate,
     PromotionEvaluateRequest,
+    RerankRequest,
     ToolApprovalDecisionRequest,
     ToolExecutionOutcomeRequest,
     Usage,
@@ -278,7 +281,7 @@ def create_app(config: dict[str, Any] | None = None,
 
     def record_request_telemetry(application: str, route_name: str, status: str, elapsed_ms: int,
                                  provider_name: str | None, configured_model: str | None,
-                                 usage: dict[str, Any]) -> None:
+                                 usage: dict[str, Any], operation: str = "chat") -> None:
         targets = slo_targets(application, route_name)
         SLO_AVAILABILITY_TARGET.labels(application=application, route=route_name).set(
             targets["availability_target"])
@@ -292,7 +295,7 @@ def create_app(config: dict[str, Any] | None = None,
         SLO_LATENCY_REQUESTS.labels(application=application, route=route_name, outcome=latency_outcome).inc()
         semantic_provider = (gen_ai_provider_name(cfg["providers"].get(provider_name, {}))
                              if provider_name else "unknown")
-        labels = {"gen_ai_operation_name": "chat", "gen_ai_provider_name": semantic_provider,
+        labels = {"gen_ai_operation_name": operation, "gen_ai_provider_name": semantic_provider,
                   "gen_ai_request_model": configured_model or route_name}
         GEN_AI_OPERATION_DURATION.labels(**labels).observe(elapsed_ms / 1000)
         GEN_AI_INPUT_TOKENS.labels(**labels).inc(max(0, int(usage.get("prompt_tokens", 0))))
@@ -417,7 +420,9 @@ def create_app(config: dict[str, Any] | None = None,
     @app.get("/v1/routes")
     async def routes(request: Request,
                      tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
-        allowed_routes = set(tenant["config"].get("allowed_routes", [])) if tenant else set(cfg["routes"])
+        tenant_allowed_routes = tenant["config"].get("allowed_routes") if tenant else None
+        allowed_routes = (set(tenant_allowed_routes) if tenant_allowed_routes is not None else
+                          set(cfg["routes"]) | set(cfg.get("embedding_routes", {})))
         visible = {}
         for name, route in cfg["routes"].items():
             if name not in allowed_routes:
@@ -434,7 +439,206 @@ def create_app(config: dict[str, Any] | None = None,
                 "fallbacks": [{**candidate,
                     "capabilities": provider_capabilities(cfg["providers"][candidate["provider"]])}
                     for candidate in fallbacks], "cache": route.get("cache", {})}
+        visible_embedding_routes = {}
+        for name, route in cfg.get("embedding_routes", {}).items():
+            if tenant and tenant["config"].get("allowed_routes") is not None and name not in allowed_routes:
+                continue
+            candidates = [route, *route.get("fallbacks", [])]
+            policy = tenant["config"] if tenant else {}
+            policy_providers = policy.get("allowed_providers")
+            policy_models = policy.get("allowed_models")
+            policy_regions = policy.get("allowed_regions")
+            allowed_provider_names = set(policy_providers) if policy_providers is not None else set(cfg["providers"])
+            candidates = [candidate for candidate in candidates
+                if candidate["provider"] in allowed_provider_names
+                and (policy_models is None or candidate["model"] in policy_models)
+                and (policy_regions is None or cfg["providers"][candidate["provider"]].get(
+                    "data_region", "global") in policy_regions)]
+            if not candidates:
+                continue
+            primary, *fallbacks = candidates
+            visible_embedding_routes[name] = {**primary,
+                "capabilities": provider_capabilities(cfg["providers"][primary["provider"]]),
+                "fallbacks": [{**candidate,
+                    "capabilities": provider_capabilities(cfg["providers"][candidate["provider"]])}
+                    for candidate in fallbacks]}
+        if visible_embedding_routes:
+            visible["embedding_routes"] = visible_embedding_routes
         return visible
+
+    async def run_retrieval(request: Request, model_name: str, inputs: list[str], application: str,
+                            cost_center: str | None, operation: str,
+                            tenant: dict[str, Any] | None) -> tuple[list[list[float]], dict[str, Any]]:
+        request_id = str(uuid.uuid4())
+        tenant_id = tenant["id"] if tenant else None
+        tenant_cfg = tenant["config"] if tenant else {}
+        ledger_application = f"{tenant_id}:{application}" if tenant_id else application
+        retrieval_routes = cfg.get("embedding_routes", {})
+        route = retrieval_routes.get(model_name)
+        if route is None:
+            raise HTTPException(status_code=400, detail=f"Unknown embedding route {model_name!r}")
+        if tenant and tenant_cfg.get("allowed_routes") is not None and model_name not in tenant_cfg["allowed_routes"]:
+            raise HTTPException(status_code=403, detail="Tenant policy does not allow this embedding route")
+        configured_candidates = [route, *route.get("fallbacks", [])]
+        provider_policy = tenant_cfg.get("allowed_providers") if tenant else None
+        model_policy = tenant_cfg.get("allowed_models") if tenant else None
+        region_policy = tenant_cfg.get("allowed_regions") if tenant else None
+        allowed_providers = set(provider_policy) if provider_policy is not None else set(cfg["providers"])
+        allowed_models = set(model_policy) if model_policy is not None else None
+        allowed_regions = set(region_policy) if region_policy is not None else None
+        candidates = [item for item in configured_candidates if item["provider"] in allowed_providers
+            and (allowed_models is None or item["model"] in allowed_models)
+            and (allowed_regions is None or cfg["providers"][item["provider"]].get("data_region", "global") in allowed_regions)]
+        routing_decisions = [{"provider": item["provider"], "model": item["model"],
+            "decision": "skipped", "reason": "tenant_policy", "attempt_count": 0}
+            for item in configured_candidates if item not in candidates]
+        if not candidates:
+            raise HTTPException(status_code=403, detail="Tenant policy does not allow an embedding provider/model")
+        policy = {**cfg.get("budgets", {}).get("default", {}),
+            **cfg.get("budgets", {}).get("applications", {}).get(application, {}),
+            **tenant_cfg.get("default_policy", {}),
+            **tenant_cfg.get("applications", {}).get(application, {})}
+        encoded_size = sum(len(value.encode("utf-8")) for value in inputs)
+        max_bytes = int(policy.get("max_input_bytes", cfg.get("retrieval", {}).get("max_input_bytes", 2_000_000)))
+        rate = policy.get("max_requests_per_minute")
+        prices = [cfg["providers"][item["provider"]].get("models", {}).get(item["model"], {})
+                  for item in candidates]
+        input_price = max((float(price.get("input_cost_per_1m", 0)) for price in prices), default=0.0)
+        reservation = encoded_size * input_price / 1_000_000
+        monthly_limit = policy.get("monthly_limit_usd")
+        started = time.perf_counter()
+        usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        vectors: list[list[float]] = []
+        provider_name: str | None = None
+        configured_model: str | None = None
+        error_type: str | None = None
+        fallback_used = False
+        status = "failure"
+        cost = 0.0
+        try:
+            if encoded_size > max_bytes:
+                status, error_type = "rejected", "request_limit_exceeded"
+                raise HTTPException(status_code=400,
+                    detail=f"Request exceeds application input limit of {max_bytes} bytes")
+            if rate is not None:
+                try:
+                    await request.app.state.gateway.acquire_application_quota(ledger_application, int(rate))
+                except RateLimitExceeded as exc:
+                    status, error_type = "rejected", "application_rate_limit_exceeded"
+                    raise HTTPException(status_code=429, detail="Application request quota exceeded") from exc
+            if monthly_limit is not None:
+                try:
+                    await asyncio.to_thread(request.app.state.store.reserve_budget, request_id,
+                        ledger_application, reservation, float(monthly_limit))
+                except BudgetExceeded as exc:
+                    status, error_type = "rejected", "monthly_budget_exceeded"
+                    raise HTTPException(status_code=429, detail="Application monthly spend limit reached") from exc
+            for index, candidate in enumerate(candidates):
+                provider_name, configured_model = candidate["provider"], candidate["model"]
+                provider_cfg = cfg["providers"][provider_name]
+                if not provider_capabilities(provider_cfg).get("embeddings", False):
+                    routing_decisions.append({"provider": provider_name, "model": configured_model,
+                        "decision": "skipped", "reason": "embeddings_capability_unavailable", "attempt_count": 0})
+                    continue
+                try:
+                    await request.app.state.gateway.limiter.acquire(provider_name,
+                        int(provider_cfg.get("requests_per_minute", 600)))
+                    async with request.app.state.gateway._concurrency():
+                        result = await request.app.state.gateway.client.embed(provider_name,
+                            configured_model, inputs, request_id)
+                    vectors, usage = result["data"], result["usage"]
+                    fallback_used = (provider_name, configured_model) != (
+                        configured_candidates[0]["provider"], configured_candidates[0]["model"])
+                    routing_decisions.append({"provider": provider_name, "model": configured_model,
+                        "decision": "fallback" if fallback_used else "selected",
+                        "reason": "provider_error" if fallback_used else "primary_candidate", "attempt_count": 1})
+                    for remaining in candidates[index + 1:]:
+                        routing_decisions.append({"provider": remaining["provider"], "model": remaining["model"],
+                            "decision": "skipped", "reason": "not_needed_after_prior_success", "attempt_count": 0})
+                    price = provider_cfg.get("models", {}).get(configured_model, {})
+                    cost = usage["prompt_tokens"] * float(price.get("input_cost_per_1m", 0)) / 1_000_000
+                    status = "success"
+                    break
+                except RateLimitExceeded as exc:
+                    status, error_type = "rejected", "provider_rate_limit_exceeded"
+                    raise HTTPException(status_code=429, detail="Provider request quota exceeded") from exc
+                except ProviderError as exc:
+                    error_type = type(exc).__name__
+                    routing_decisions.append({"provider": provider_name, "model": configured_model,
+                        "decision": "skipped", "reason": "provider_error", "attempt_count": 1})
+                    if not exc.retryable and index == len(candidates) - 1:
+                        break
+            if status != "success":
+                raise HTTPException(status_code=502, detail="All configured embedding providers failed")
+            return vectors, {"request_id": request_id, "usage": usage, "provider": provider_name,
+                "model": configured_model, "cost_usd": cost, "application": ledger_application,
+                "cost_center": cost_center, "fallback_used": fallback_used}
+        finally:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            record = {"request_id": request_id, "occurred_at": datetime.now(UTC).isoformat(),
+                "application": ledger_application, "route": model_name, "provider": provider_name,
+                "model": configured_model, "pricing_catalog": cfg["providers"].get(provider_name, {}).get("pricing_catalog", "default") if provider_name else "default",
+                "pricing_version": cfg["providers"].get(provider_name, {}).get("models", {}).get(configured_model, {}).get("pricing_version", "unversioned") if provider_name else "unversioned",
+                "prompt_tokens": usage["prompt_tokens"], "completion_tokens": 0,
+                "total_tokens": usage["total_tokens"], "cost_usd": cost,
+                "status": status, "latency_ms": elapsed_ms, "fallback_used": int(fallback_used),
+                "cached": 0, "error_type": error_type, "cost_center": cost_center,
+                "canary_used": 0, "operation": operation}
+            await asyncio.to_thread(request.app.state.store.record, record)
+            if routing_decisions:
+                await asyncio.to_thread(request.app.state.store.record_routing_decisions,
+                    request_id, ledger_application, model_name, routing_decisions)
+            metric_route = model_name
+            REQUESTS.labels(route=metric_route, status=status).inc()
+            TOKENS.labels(route=metric_route, kind="prompt").inc(usage["prompt_tokens"])
+            COST.labels(route=metric_route).inc(cost)
+            if fallback_used:
+                FALLBACKS.labels(route=metric_route).inc()
+            LATENCY.labels(route=metric_route, status=status).observe(elapsed_ms / 1000)
+            record_request_telemetry(ledger_application, metric_route, status, elapsed_ms,
+                provider_name, configured_model, usage, operation=operation)
+            if monthly_limit is not None and status == "success":
+                thresholds = [float(value) for value in policy.get("alert_thresholds", [0.8, 1.0])]
+                alerts = await asyncio.to_thread(request.app.state.store.check_budget_alerts,
+                    ledger_application, float(monthly_limit), thresholds)
+                await publish_budget_alerts(request, alerts, policy, ledger_application, request_id)
+
+    @app.post("/v1/embeddings")
+    async def embeddings(body: EmbeddingsRequest, request: Request,
+                         tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
+        inputs = [body.input] if isinstance(body.input, str) else body.input
+        vectors, info = await run_retrieval(request, body.model, inputs,
+            body.application, body.cost_center, "embeddings", tenant)
+        return {"object": "list", "data": [{"object": "embedding", "index": index,
+            "embedding": vector} for index, vector in enumerate(vectors)], "model": body.model,
+            "usage": {"prompt_tokens": info["usage"]["prompt_tokens"],
+                "total_tokens": info["usage"]["total_tokens"]},
+            "gateway": {"request_id": info["request_id"], "provider": info["provider"],
+                "upstream_model": info["model"], "fallback_used": info["fallback_used"],
+                "cost_usd": round(info["cost_usd"], 8)}}
+
+    @app.post("/v1/rerank")
+    async def rerank(body: RerankRequest, request: Request,
+                     tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
+        route = cfg.get("embedding_routes", {}).get(body.model)
+        if route is None:
+            raise HTTPException(status_code=400, detail=f"Unknown embedding route {body.model!r}")
+        if not provider_capabilities(cfg["providers"][route["provider"]]).get("reranking", False):
+            raise HTTPException(status_code=400, detail="Embedding route does not support reranking")
+        vectors, info = await run_retrieval(request, body.model, [body.query, *body.documents],
+            body.application, body.cost_center, "rerank", tenant)
+        query_vector, document_vectors = vectors[0], vectors[1:]
+        query_norm = math.sqrt(sum(value * value for value in query_vector)) or 1.0
+        ranked = []
+        for index, vector in enumerate(document_vectors):
+            norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+            score = sum(left * right for left, right in zip(query_vector, vector)) / (query_norm * norm)
+            ranked.append({"index": index, "relevance_score": score, "document": body.documents[index]})
+        ranked.sort(key=lambda item: (-item["relevance_score"], item["index"]))
+        return {"model": body.model, "results": ranked[:body.top_n], "usage": info["usage"],
+            "gateway": {"request_id": info["request_id"], "provider": info["provider"],
+                "upstream_model": info["model"], "cost_usd": round(info["cost_usd"], 8),
+                "fallback_used": info["fallback_used"], "reranker": "cosine_similarity"}}
 
     @app.post("/v1/chat/completions", response_model=None)
     async def chat(body: ChatRequest, request: Request,
@@ -963,6 +1167,39 @@ def create_app(config: dict[str, Any] | None = None,
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Invalid report filters") from exc
 
+    @app.get("/v1/admin/tenants/{tenant_id}/data-export",
+             dependencies=[Depends(admin_dependency("tenant_data"))])
+    async def export_tenant_data(tenant_id: str, request: Request) -> dict[str, Any]:
+        tenant_cfg = configured_tenants().get(tenant_id)
+        if tenant_cfg is None:
+            raise HTTPException(status_code=404, detail="Unknown tenant")
+        retention_days = tenant_cfg.get("data_policy", {}).get("usage_retention_days")
+        if retention_days is None:
+            raise HTTPException(status_code=409, detail="Tenant data export requires a configured usage retention policy")
+        actor = getattr(request.state, "admin_actor", "unknown-admin")
+        exported = await asyncio.to_thread(request.app.state.store.export_tenant_data, tenant_id, actor)
+        counts = {name: len(rows) for name, rows in exported.items() if name != "audit_history"}
+        return {"tenant_id": tenant_id, "retention_days": int(retention_days),
+            "exported_at": datetime.now(UTC).isoformat(), "record_counts": counts, "data": exported}
+
+    @app.delete("/v1/admin/tenants/{tenant_id}/data",
+                dependencies=[Depends(admin_dependency("tenant_data"))])
+    async def delete_tenant_data(tenant_id: str, request: Request,
+                                 confirm_tenant_id: str = Query(..., min_length=1, max_length=120)) -> dict[str, Any]:
+        tenant_cfg = configured_tenants().get(tenant_id)
+        if tenant_cfg is None:
+            raise HTTPException(status_code=404, detail="Unknown tenant")
+        retention_days = tenant_cfg.get("data_policy", {}).get("usage_retention_days")
+        if retention_days is None:
+            raise HTTPException(status_code=409, detail="Tenant data deletion requires a configured usage retention policy")
+        if not hmac.compare_digest(confirm_tenant_id, tenant_id):
+            raise HTTPException(status_code=400, detail="confirm_tenant_id must match the requested tenant")
+        actor = getattr(request.state, "admin_actor", "unknown-admin")
+        counts = await asyncio.to_thread(request.app.state.store.delete_tenant_data, tenant_id, actor)
+        return {"tenant_id": tenant_id, "deleted_at": datetime.now(UTC).isoformat(),
+            "retention_days": int(retention_days), "deleted_record_counts": counts,
+            "audit_record_retained": True}
+
     @app.get("/v1/admin/slos", dependencies=[Depends(admin_dependency("report"))])
     async def slo_report(request: Request,
                          window_hours: int = Query(default=24, ge=1, le=720),
@@ -1067,7 +1304,7 @@ def create_app(config: dict[str, Any] | None = None,
                                         cost_center, provider, route, limit)
         output = StringIO()
         fields = ["request_id", "occurred_at", "application", "cost_center", "route", "provider", "model",
-                  "pricing_catalog", "pricing_version",
+                  "operation", "pricing_catalog", "pricing_version",
                   "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status", "latency_ms",
                   "fallback_used", "cached", "canary_used", "actual_cost_usd",
                   "cost_reconciliation_id", "cost_reconciled_at", "error_type"]

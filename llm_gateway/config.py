@@ -93,8 +93,30 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
             raise ValueError(f"Missing required configuration section: {key}")
     if not config["providers"] or not config["routes"]:
         raise ValueError("At least one provider and route must be configured")
+    retrieval_routes = config.get("embedding_routes", {})
+    if not isinstance(retrieval_routes, dict):
+        raise TypeError("embedding_routes must be an object")
+    for route_name, route in retrieval_routes.items():
+        if not isinstance(route, dict) or route.get("provider") not in config["providers"]:
+            raise ValueError(f"Embedding route {route_name!r} must reference a configured provider")
+        if not isinstance(route.get("model"), str) or not route["model"]:
+            raise ValueError(f"Embedding route {route_name!r} requires a model")
+        if not isinstance(route.get("fallbacks", []), list):
+            raise TypeError(f"Embedding route {route_name!r} fallbacks must be a list")
+        candidates = [route, *route.get("fallbacks", [])]
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise TypeError(f"Embedding route {route_name!r} candidates must be objects")
+            provider_name = candidate.get("provider")
+            if provider_name not in config["providers"]:
+                raise ValueError(f"Embedding route {route_name!r} refers to unknown provider {provider_name!r}")
+            if not provider_capabilities(config["providers"][provider_name]).get("embeddings", False):
+                raise ValueError(f"Embedding route {route_name!r} provider {provider_name!r} lacks embeddings capability")
+            if not isinstance(candidate.get("model"), str) or not candidate["model"]:
+                raise ValueError(f"Embedding route {route_name!r} candidates require a model")
+    all_routes = set(config["routes"]) | set(retrieval_routes)
     for tenant_id, tenant in config.get("tenants", config.get("security", {}).get("tenants", {})).items():
-        unknown_routes = set(tenant.get("allowed_routes", [])) - set(config["routes"])
+        unknown_routes = set(tenant.get("allowed_routes", [])) - all_routes
         unknown_providers = set(tenant.get("allowed_providers", [])) - set(config["providers"])
         if unknown_routes:
             raise ValueError(f"Tenant {tenant_id!r} refers to unknown route(s): {', '.join(sorted(unknown_routes))}")

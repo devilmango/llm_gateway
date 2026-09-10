@@ -34,7 +34,8 @@ class UsageStore:
                 cached INTEGER NOT NULL DEFAULT 0, error_type TEXT,
                 canary_used INTEGER NOT NULL DEFAULT 0, actual_cost_usd REAL,
                 cost_reconciliation_id TEXT, cost_reconciled_at TEXT,
-                pricing_catalog TEXT NOT NULL DEFAULT 'default', pricing_version TEXT NOT NULL DEFAULT 'unversioned'
+                pricing_catalog TEXT NOT NULL DEFAULT 'default', pricing_version TEXT NOT NULL DEFAULT 'unversioned',
+                operation TEXT NOT NULL DEFAULT 'chat'
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_requests_time ON requests(occurred_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_requests_application ON requests(application)")
@@ -49,6 +50,8 @@ class UsageStore:
                                         ("pricing_version", "TEXT NOT NULL DEFAULT 'unversioned'")):
                 if column not in columns:
                     db.execute(f"ALTER TABLE requests ADD COLUMN {column} {declaration}")
+            if "operation" not in columns:
+                db.execute("ALTER TABLE requests ADD COLUMN operation TEXT NOT NULL DEFAULT 'chat'")
             db.execute("CREATE INDEX IF NOT EXISTS idx_requests_anomaly_dimensions ON requests(occurred_at, application, provider, model, pricing_version)")
             db.execute("""CREATE TABLE IF NOT EXISTS budget_reservations (
                 request_id TEXT PRIMARY KEY, application TEXT NOT NULL,
@@ -126,6 +129,12 @@ class UsageStore:
                 candidate_status TEXT NOT NULL, failure_type TEXT
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_shadow_report ON shadow_observations(occurred_at, application, route)")
+            db.execute("""CREATE TABLE IF NOT EXISTS tenant_data_audits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL,
+                tenant_id TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
+                record_counts TEXT NOT NULL
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_tenant_data_audit ON tenant_data_audits(tenant_id, occurred_at)")
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.database, timeout=10)
@@ -156,8 +165,8 @@ class UsageStore:
     def record(self, record: dict[str, Any]) -> None:
         columns = ("request_id", "occurred_at", "application", "route", "provider", "model",
                    "pricing_catalog", "pricing_version", "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status",
-                   "latency_ms", "fallback_used", "cached", "error_type", "cost_center", "canary_used")
-        defaults = {"canary_used": 0, "pricing_catalog": "default", "pricing_version": "unversioned"}
+                   "latency_ms", "fallback_used", "cached", "error_type", "cost_center", "canary_used", "operation")
+        defaults = {"canary_used": 0, "pricing_catalog": "default", "pricing_version": "unversioned", "operation": "chat"}
         values = [record.get(c, defaults.get(c)) for c in columns]
         assignments = ",".join(f"{column}=excluded.{column}" for column in columns[1:])
         with self._lock, self._connect() as db:
@@ -204,9 +213,69 @@ class UsageStore:
         cutoff = (now - timedelta(days=int(retention_days))).isoformat()
         prefix = f"{tenant_id}:"
         with self._lock, self._connect() as db:
-            cursor = db.execute("DELETE FROM requests WHERE substr(application,1,length(?))=? AND occurred_at < ?",
-                                (prefix, prefix, cutoff))
-            return cursor.rowcount
+            db.execute("BEGIN IMMEDIATE")
+            deleted = 0
+            for table in ("requests", "routing_decisions", "shadow_observations"):
+                cursor = db.execute(f"DELETE FROM {table} WHERE substr(application,1,length(?))=? AND occurred_at < ?",
+                                    (prefix, prefix, cutoff))
+                deleted += cursor.rowcount
+            for table in ("tool_call_audits", "tool_execution_outcomes"):
+                cursor = db.execute(f"DELETE FROM {table} WHERE tenant_id=? AND occurred_at < ?", (tenant_id, cutoff))
+                deleted += cursor.rowcount
+            return deleted
+
+    def record_tenant_data_audit(self, tenant_id: str, actor: str, action: str,
+                                 record_counts: dict[str, int]) -> None:
+        with self._lock, self._connect() as db:
+            db.execute("INSERT INTO tenant_data_audits (occurred_at, tenant_id, actor, action, record_counts) VALUES (?, ?, ?, ?, ?)",
+                (datetime.now(UTC).isoformat(), tenant_id, actor, action,
+                 json.dumps(record_counts, sort_keys=True)))
+
+    def tenant_data_audits(self, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as db:
+            rows = db.execute("SELECT occurred_at, tenant_id, actor, action, record_counts FROM tenant_data_audits WHERE tenant_id=? ORDER BY id DESC LIMIT ?",
+                              (tenant_id, limit)).fetchall()
+            return [{**dict(row), "record_counts": json.loads(row["record_counts"])} for row in rows]
+
+    def export_tenant_data(self, tenant_id: str, actor: str | None = None) -> dict[str, list[dict[str, Any]]]:
+        prefix = f"{tenant_id}:"
+        with self._lock, self._connect() as db:
+            result: dict[str, list[dict[str, Any]]] = {}
+            for table in ("requests", "routing_decisions", "shadow_observations"):
+                result[table] = [dict(row) for row in db.execute(
+                    f"SELECT * FROM {table} WHERE substr(application,1,length(?))=? ORDER BY occurred_at",
+                    (prefix, prefix)).fetchall()]
+            for table in ("tool_call_audits", "tool_execution_outcomes"):
+                result[table] = [dict(row) for row in db.execute(
+                    f"SELECT * FROM {table} WHERE tenant_id=? ORDER BY occurred_at", (tenant_id,)).fetchall()]
+            if actor:
+                counts = {name: len(rows) for name, rows in result.items()}
+                db.execute("INSERT INTO tenant_data_audits (occurred_at, tenant_id, actor, action, record_counts) VALUES (?, ?, ?, ?, ?)",
+                    (datetime.now(UTC).isoformat(), tenant_id, actor, "export", json.dumps(counts, sort_keys=True)))
+            audits = db.execute("SELECT occurred_at, tenant_id, actor, action, record_counts FROM tenant_data_audits WHERE tenant_id=? ORDER BY id DESC LIMIT 100",
+                                (tenant_id,)).fetchall()
+            result["audit_history"] = [{**dict(row), "record_counts": json.loads(row["record_counts"])}
+                                       for row in audits]
+            return result
+
+    def delete_tenant_data(self, tenant_id: str, actor: str | None = None) -> dict[str, int]:
+        prefix = f"{tenant_id}:"
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            counts: dict[str, int] = {}
+            for table in ("requests", "routing_decisions", "shadow_observations"):
+                cursor = db.execute(f"DELETE FROM {table} WHERE substr(application,1,length(?))=?", (prefix, prefix))
+                counts[table] = cursor.rowcount
+            for table in ("tool_call_audits", "tool_execution_outcomes"):
+                cursor = db.execute(f"DELETE FROM {table} WHERE tenant_id=?", (tenant_id,))
+                counts[table] = cursor.rowcount
+            for table in ("budget_reservations", "budget_alerts", "webhook_outbox"):
+                cursor = db.execute(f"DELETE FROM {table} WHERE substr(application,1,length(?))=?", (prefix, prefix))
+                counts[table] = cursor.rowcount
+            if actor:
+                db.execute("INSERT INTO tenant_data_audits (occurred_at, tenant_id, actor, action, record_counts) VALUES (?, ?, ?, ?, ?)",
+                    (datetime.now(UTC).isoformat(), tenant_id, actor, "delete", json.dumps(counts, sort_keys=True)))
+            return counts
 
     def reconcile_costs(self, records: list[dict[str, Any]], source: str,
                         reconciled_at: datetime | None = None) -> dict[str, Any]:
@@ -639,6 +708,7 @@ class UsageStore:
             by_model = [dict(row) for row in db.execute(f"SELECT COALESCE(model,'unknown') AS model, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd, {variance} FROM requests{where} GROUP BY model ORDER BY cost_usd DESC", values).fetchall()]
             by_pricing_catalog = [dict(row) for row in db.execute(f"SELECT COALESCE(provider,'unknown') AS provider, COALESCE(model,'unknown') AS model, pricing_catalog, pricing_version, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd, {variance} FROM requests{where} GROUP BY provider, model, pricing_catalog, pricing_version ORDER BY cost_usd DESC", values).fetchall()]
             by_route = [dict(row) for row in db.execute(f"SELECT route, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd FROM requests{where} GROUP BY route ORDER BY cost_usd DESC", values).fetchall()]
+            by_operation = [dict(row) for row in db.execute(f"SELECT operation, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(AVG(cost_usd),0) AS avg_cost_usd, SUM(status != 'success') AS failures FROM requests{where} GROUP BY operation ORDER BY cost_usd DESC", values).fetchall()]
             by_cost_center = [dict(row) for row in db.execute(f"SELECT COALESCE(cost_center,'unassigned') AS cost_center, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd FROM requests{where} GROUP BY cost_center ORDER BY cost_usd DESC", values).fetchall()]
         summary["failure_rate"] = summary["failures"] / summary["requests"] if summary["requests"] else 0
         summary["fallback_rate"] = summary["fallbacks"] / summary["requests"] if summary["requests"] else 0
@@ -648,6 +718,7 @@ class UsageStore:
         summary["by_model"] = by_model
         summary["by_pricing_catalog"] = by_pricing_catalog
         summary["by_route"] = by_route
+        summary["by_operation"] = by_operation
         summary["by_cost_center"] = by_cost_center
         decision_filters, decision_values = [], []
         if start:

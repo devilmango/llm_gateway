@@ -61,7 +61,7 @@ security:
   #     scopes: [report]
   #   - id: platform-operations
   #     api_key_env: GATEWAY_OPERATIONS_KEY
-  #     scopes: [budgets, providers, webhooks, audit]
+  #     scopes: [budgets, providers, webhooks, audit, tenant_data]
   #     enabled: true
   # OIDC/JWT admin and client authentication (requires issuer, audience and JWKS URL).
   # oidc:
@@ -131,6 +131,9 @@ providers:
       gpt-4o:
         input_cost_per_1m: 2.50
         output_cost_per_1m: 10.00
+      text-embedding-3-small:
+        pricing_version: "2026-10-13"
+        input_cost_per_1m: 0.02
   anthropic:
     kind: anthropic
     base_url: https://api.anthropic.com
@@ -218,6 +221,13 @@ routes:
       enabled: false
   local:
     model: llama3.1:8b
+
+# Optional retrieval routes use provider adapters with `embeddings: true`.
+# `/v1/rerank` embeds the query and documents and orders them by cosine similarity.
+embedding_routes:
+  retrieval:
+    provider: openai
+    model: text-embedding-3-small
     provider: local
     fallbacks: []
     cache:

@@ -1876,6 +1876,105 @@ def test_tenant_usage_retention_must_preserve_current_month_budget_window(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_embeddings_and_rerank_are_billed_and_reported_by_operation(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    cfg = config(str(tmp_path / "retrieval.sqlite3"))
+    cfg["providers"]["primary"]["models"]["embed-model"] = {
+        "input_cost_per_1m": 2.0, "pricing_version": "prices-v1"}
+    cfg["providers"]["backup"]["models"]["embed-model"] = {"input_cost_per_1m": 2.0}
+    cfg["embedding_routes"] = {"retrieval": {"provider": "primary", "model": "embed-model",
+        "fallbacks": [{"provider": "backup", "model": "embed-model"}]}}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/embeddings")
+        if request.url.host == "primary.test":
+            return httpx.Response(503)
+        items = json.loads(request.content)["input"]
+        vectors = [[1.0, 0.0] if value in {"query", "best"} else [0.0, 1.0] for value in items]
+        return httpx.Response(200, json={"model": "embed-model", "data": [
+            {"index": index, "embedding": vector} for index, vector in enumerate(vectors)],
+            "usage": {"prompt_tokens": len(items) * 3, "total_tokens": len(items) * 3}})
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        catalog = (await client.get("/v1/routes")).json()
+        assert catalog["embedding_routes"]["retrieval"]["capabilities"]["embeddings"] is True
+        embedding = await client.post("/v1/embeddings", json={"model": "retrieval",
+            "input": ["query", "best"], "application": "search"})
+        assert embedding.status_code == 200
+        assert embedding.json()["data"][1]["embedding"] == [1.0, 0.0]
+        assert embedding.json()["gateway"]["fallback_used"] is True
+        ranked = await client.post("/v1/rerank", json={"model": "retrieval", "query": "query",
+            "documents": ["other", "best"], "application": "search"})
+        assert ranked.status_code == 200
+        assert [item["index"] for item in ranked.json()["results"]] == [1, 0]
+        assert ranked.json()["usage"]["prompt_tokens"] == 9
+        report = (await client.get("/v1/admin/report", params={"application": "search"})).json()
+        by_operation = {item["operation"]: item for item in report["by_operation"]}
+        assert by_operation["embeddings"]["requests"] == 1
+        assert by_operation["rerank"]["requests"] == 1
+        assert report["total_tokens"] == 15
+        assert report["cost_usd"] == pytest.approx(0.00003)
+        assert report["fallbacks"] == 2
+        assert any(item["decision"] == "fallback" for item in report["by_routing_decision"])
+
+
+@pytest.mark.asyncio
+async def test_tenant_export_and_delete_preserve_audit_record(tmp_path, monkeypatch):
+    monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+    cfg = config(str(tmp_path / "tenant-export.sqlite3"))
+    cfg["tenants"] = {"tenant-a": {"api_key_env": "TENANT_A_KEY",
+        "data_policy": {"usage_retention_days": 90}}}
+    store = create_usage_store(cfg["server"]["database"])
+    store.record({"request_id": "tenant-request", "occurred_at": datetime.now(UTC).isoformat(),
+        "application": "tenant-a:search", "route": "retrieval", "provider": "primary",
+        "model": "embed-model", "prompt_tokens": 4, "completion_tokens": 0, "total_tokens": 4,
+        "cost_usd": 0.00001, "status": "success", "latency_ms": 10, "fallback_used": 0,
+        "cached": 0, "operation": "embeddings"})
+    store.record_tool_call_audits("tenant-request", "tenant-a", "tenant-a:search", [
+        {"tool_name": "lookup", "outcome": "allowed"}])
+    async with gateway_client(cfg, httpx.MockTransport(lambda request: success_response())) as client:
+        headers = {"Authorization": "Bearer admin-secret"}
+        exported = await client.get("/v1/admin/tenants/tenant-a/data-export", headers=headers)
+        assert exported.status_code == 200
+        assert len(exported.json()["data"]["requests"]) == 1
+        assert exported.json()["data"]["audit_history"][-1]["action"] == "export"
+        denied = await client.delete("/v1/admin/tenants/tenant-a/data", headers=headers,
+            params={"confirm_tenant_id": "tenant-b"})
+        assert denied.status_code == 400
+        deleted = await client.delete("/v1/admin/tenants/tenant-a/data", headers=headers,
+            params={"confirm_tenant_id": "tenant-a"})
+        assert deleted.status_code == 200
+        assert deleted.json()["audit_record_retained"] is True
+        assert deleted.json()["deleted_record_counts"]["requests"] == 1
+        assert store.report(None, None, "tenant-a:search")["requests"] == 0
+        audits = store.tenant_data_audits("tenant-a")
+        assert [item["action"] for item in audits] == ["delete", "export"]
+
+
+@pytest.mark.asyncio
+async def test_retrieval_application_request_quota_is_enforced(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    cfg = config(str(tmp_path / "retrieval-quota.sqlite3"))
+    cfg["providers"]["primary"]["models"]["embed-model"] = {"input_cost_per_1m": 1.0}
+    cfg["embedding_routes"] = {"retrieval": {"provider": "primary", "model": "embed-model"}}
+    cfg["budgets"]["applications"]["search"] = {"max_requests_per_minute": 1}
+    upstream_calls = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_calls.append(request)
+        return httpx.Response(200, json={"data": [{"index": 0, "embedding": [0.1, 0.2]}],
+            "usage": {"prompt_tokens": 2, "total_tokens": 2}})
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        payload = {"model": "retrieval", "input": "query", "application": "search"}
+        assert (await client.post("/v1/embeddings", json=payload)).status_code == 200
+        limited = await client.post("/v1/embeddings", json=payload)
+        assert limited.status_code == 429
+        assert len(upstream_calls) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fail_after_output", [False, True])
 async def test_bedrock_stream_falls_back_only_before_output_is_emitted(tmp_path, monkeypatch, fail_after_output):
     monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")

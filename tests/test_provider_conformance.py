@@ -195,3 +195,31 @@ def test_capability_contract_matches_declared_adapter_matrix(kind: str):
     assert capabilities["streaming"] is True
     assert capabilities["streaming_tools"] is True
     assert capabilities["structured_output"] is (kind != "bedrock")
+    assert capabilities.get("embeddings", False) is (kind in {"openai", "vllm", "azure_openai", "gemini"})
+
+
+@pytest.mark.asyncio
+async def test_gemini_embeddings_adapter_normalizes_vectors_usage_and_request_id(monkeypatch):
+    monkeypatch.setenv("CONFORMANCE_API_KEY", "test-key")
+    sent: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"embeddings": [{"values": [0.25, 0.75]},
+            {"values": [0.5, 0.5]}], "usageMetadata": {"promptTokenCount": 7}})
+
+    providers = {"adapter": adapter_config("gemini")}
+    http = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    client = ProviderClient(http, providers, 2)
+    try:
+        result = await client.embed("adapter", "test-model", ["first", "second"], "gw_embed_1")
+    finally:
+        await http.aclose()
+
+    assert result == {"data": [[0.25, 0.75], [0.5, 0.5]], "model": "test-model",
+        "usage": {"prompt_tokens": 7, "completion_tokens": 0, "total_tokens": 7}}
+    assert "batchEmbedContents" in str(sent[0].url)
+    assert sent[0].headers["X-Contract-Request"] == "gw_embed_1"
+    body = json.loads(sent[0].content)
+    assert [item["content"]["parts"][0]["text"] for item in body["requests"]] == ["first", "second"]
+    assert provider_capabilities(providers["adapter"])["embeddings"] is True

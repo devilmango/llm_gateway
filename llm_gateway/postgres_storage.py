@@ -35,7 +35,8 @@ class PostgresUsageStore:
                 cached INTEGER NOT NULL DEFAULT 0, error_type TEXT,
                 canary_used INTEGER NOT NULL DEFAULT 0, actual_cost_usd DOUBLE PRECISION,
                 cost_reconciliation_id TEXT, cost_reconciled_at TEXT,
-                pricing_catalog TEXT NOT NULL DEFAULT 'default', pricing_version TEXT NOT NULL DEFAULT 'unversioned'
+                pricing_catalog TEXT NOT NULL DEFAULT 'default', pricing_version TEXT NOT NULL DEFAULT 'unversioned',
+                operation TEXT NOT NULL DEFAULT 'chat'
             )""",
             "CREATE INDEX IF NOT EXISTS idx_requests_time ON requests(occurred_at)",
             "CREATE INDEX IF NOT EXISTS idx_requests_application ON requests(application)",
@@ -46,6 +47,7 @@ class PostgresUsageStore:
             "ALTER TABLE requests ADD COLUMN IF NOT EXISTS cost_reconciled_at TEXT",
             "ALTER TABLE requests ADD COLUMN IF NOT EXISTS pricing_catalog TEXT NOT NULL DEFAULT 'default'",
             "ALTER TABLE requests ADD COLUMN IF NOT EXISTS pricing_version TEXT NOT NULL DEFAULT 'unversioned'",
+            "ALTER TABLE requests ADD COLUMN IF NOT EXISTS operation TEXT NOT NULL DEFAULT 'chat'",
             "CREATE INDEX IF NOT EXISTS idx_requests_anomaly_dimensions ON requests(occurred_at, application, provider, model, pricing_version)",
             """CREATE TABLE IF NOT EXISTS budget_reservations (
                 request_id TEXT PRIMARY KEY, application TEXT NOT NULL,
@@ -119,6 +121,11 @@ class PostgresUsageStore:
                 candidate_status TEXT NOT NULL, failure_type TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS idx_shadow_report ON shadow_observations(occurred_at, application, route)",
+            """CREATE TABLE IF NOT EXISTS tenant_data_audits (
+                id BIGSERIAL PRIMARY KEY, occurred_at TEXT NOT NULL, tenant_id TEXT NOT NULL,
+                actor TEXT NOT NULL, action TEXT NOT NULL, record_counts JSONB NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_tenant_data_audit ON tenant_data_audits(tenant_id, occurred_at)",
         ]
         with self.pool.connection() as conn, conn.cursor() as cursor:
             for statement in statements:
@@ -152,13 +159,13 @@ class PostgresUsageStore:
     def record(self, record: dict[str, Any]) -> None:
         columns = ("request_id", "occurred_at", "application", "route", "provider", "model",
                    "pricing_catalog", "pricing_version", "prompt_tokens", "completion_tokens", "total_tokens", "cost_usd", "status",
-                   "latency_ms", "fallback_used", "cached", "error_type", "cost_center", "canary_used")
+                   "latency_ms", "fallback_used", "cached", "error_type", "cost_center", "canary_used", "operation")
         assignments = ", ".join(f"{column}=EXCLUDED.{column}" for column in columns[1:])
         placeholders = ", ".join("%s" for _ in columns)
         with self.pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute(f"INSERT INTO requests ({','.join(columns)}) VALUES ({placeholders}) ON CONFLICT (request_id) DO UPDATE SET {assignments}",
-                           [record.get(column, {"canary_used": 0, "pricing_catalog": "default",
-                                                "pricing_version": "unversioned"}.get(column))
+                            [record.get(column, {"canary_used": 0, "pricing_catalog": "default",
+                                                "pricing_version": "unversioned", "operation": "chat"}.get(column))
                             for column in columns])
             cursor.execute("DELETE FROM budget_reservations WHERE request_id = %s", (record["request_id"],))
 
@@ -213,9 +220,72 @@ class PostgresUsageStore:
         cutoff = (now - timedelta(days=int(retention_days))).isoformat()
         prefix = f"{tenant_id}:"
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
-            cursor.execute("DELETE FROM requests WHERE left(application, length(%s))=%s AND occurred_at < %s",
-                           (prefix, prefix, cutoff))
-            return cursor.rowcount
+            deleted = 0
+            for table in ("requests", "routing_decisions", "shadow_observations"):
+                cursor.execute(f"DELETE FROM {table} WHERE left(application, length(%s))=%s AND occurred_at < %s",
+                               (prefix, prefix, cutoff))
+                deleted += cursor.rowcount
+            for table in ("tool_call_audits", "tool_execution_outcomes"):
+                cursor.execute(f"DELETE FROM {table} WHERE tenant_id=%s AND occurred_at < %s", (tenant_id, cutoff))
+                deleted += cursor.rowcount
+            return deleted
+
+    def record_tenant_data_audit(self, tenant_id: str, actor: str, action: str,
+                                 record_counts: dict[str, int]) -> None:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("INSERT INTO tenant_data_audits (occurred_at, tenant_id, actor, action, record_counts) VALUES (%s, %s, %s, %s, %s)",
+                           (datetime.now(UTC).isoformat(), tenant_id, actor, action,
+                            json.dumps(record_counts, sort_keys=True)))
+
+    def tenant_data_audits(self, tenant_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT occurred_at, tenant_id, actor, action, record_counts FROM tenant_data_audits WHERE tenant_id=%s ORDER BY id DESC LIMIT %s",
+                           (tenant_id, limit))
+            rows = cursor.fetchall()
+            for row in rows:
+                if isinstance(row["record_counts"], str):
+                    row["record_counts"] = json.loads(row["record_counts"])
+            return rows
+
+    def export_tenant_data(self, tenant_id: str, actor: str | None = None) -> dict[str, list[dict[str, Any]]]:
+        prefix = f"{tenant_id}:"
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            result: dict[str, list[dict[str, Any]]] = {}
+            for table in ("requests", "routing_decisions", "shadow_observations"):
+                cursor.execute(f"SELECT * FROM {table} WHERE left(application, length(%s))=%s ORDER BY occurred_at",
+                               (prefix, prefix))
+                result[table] = cursor.fetchall()
+            for table in ("tool_call_audits", "tool_execution_outcomes"):
+                cursor.execute(f"SELECT * FROM {table} WHERE tenant_id=%s ORDER BY occurred_at", (tenant_id,))
+                result[table] = cursor.fetchall()
+            if actor:
+                counts = {name: len(rows) for name, rows in result.items()}
+                cursor.execute("INSERT INTO tenant_data_audits (occurred_at, tenant_id, actor, action, record_counts) VALUES (%s, %s, %s, %s, %s::jsonb)",
+                    (datetime.now(UTC).isoformat(), tenant_id, actor, "export", json.dumps(counts, sort_keys=True)))
+            cursor.execute("SELECT occurred_at, tenant_id, actor, action, record_counts FROM tenant_data_audits WHERE tenant_id=%s ORDER BY id DESC LIMIT 100", (tenant_id,))
+            result["audit_history"] = cursor.fetchall()
+            for row in result["audit_history"]:
+                if isinstance(row["record_counts"], str):
+                    row["record_counts"] = json.loads(row["record_counts"])
+        return result
+
+    def delete_tenant_data(self, tenant_id: str, actor: str | None = None) -> dict[str, int]:
+        prefix = f"{tenant_id}:"
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            counts: dict[str, int] = {}
+            for table in ("requests", "routing_decisions", "shadow_observations"):
+                cursor.execute(f"DELETE FROM {table} WHERE left(application, length(%s))=%s", (prefix, prefix))
+                counts[table] = cursor.rowcount
+            for table in ("tool_call_audits", "tool_execution_outcomes"):
+                cursor.execute(f"DELETE FROM {table} WHERE tenant_id=%s", (tenant_id,))
+                counts[table] = cursor.rowcount
+            for table in ("budget_reservations", "budget_alerts", "webhook_outbox"):
+                cursor.execute(f"DELETE FROM {table} WHERE left(application, length(%s))=%s", (prefix, prefix))
+                counts[table] = cursor.rowcount
+            if actor:
+                cursor.execute("INSERT INTO tenant_data_audits (occurred_at, tenant_id, actor, action, record_counts) VALUES (%s, %s, %s, %s, %s::jsonb)",
+                    (datetime.now(UTC).isoformat(), tenant_id, actor, "delete", json.dumps(counts, sort_keys=True)))
+            return counts
 
     def check_budget_alerts(self, application: str, monthly_limit_usd: float,
                             thresholds: list[float] | None = None,
@@ -651,6 +721,8 @@ class PostgresUsageStore:
             for dimension in ("provider", "model", "route", "cost_center"):
                 cursor.execute(f"SELECT COALESCE({dimension}::text,'unassigned') AS {dimension}, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(SUM(actual_cost_usd),0) AS actual_cost_usd, COALESCE(SUM(CASE WHEN actual_cost_usd IS NOT NULL THEN actual_cost_usd-cost_usd ELSE 0 END),0) AS cost_variance_usd FROM requests{where} GROUP BY {dimension} ORDER BY cost_usd DESC", values)
                 breakdowns[f"by_{dimension}"] = cursor.fetchall()
+            cursor.execute(f"SELECT operation, COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd, COALESCE(AVG(cost_usd),0) AS avg_cost_usd, SUM(CASE WHEN status <> 'success' THEN 1 ELSE 0 END) AS failures FROM requests{where} GROUP BY operation ORDER BY cost_usd DESC", values)
+            breakdowns["by_operation"] = cursor.fetchall()
             cursor.execute(f"""SELECT COALESCE(provider,'unknown') AS provider,
                 COALESCE(model,'unknown') AS model, pricing_catalog, pricing_version,
                 COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, SUM(cost_usd) AS cost_usd,

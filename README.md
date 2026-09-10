@@ -4,7 +4,7 @@
 
 ### One API for LLM providers, with cost and reliability controls built in.
 
-Route application requests across OpenAI, Anthropic, Gemini, and local OpenAI-compatible models. Track token usage, estimated spend, failures, and fallbacks by application.
+Route chat and retrieval requests across supported providers. Track token usage, estimated spend, failures, and fallbacks by application.
 
 </div>
 
@@ -202,7 +202,7 @@ tenants:
 
 Each route has a primary `provider` and `model`, an ordered optional `fallbacks` list, and optional cache settings. A route can also define a `canary` with `provider`, `model`, and `traffic_percent` from 0 to 100. A request ID hash makes sampling stable for that request; selected canary traffic bypasses route caching and falls back to the configured primary/fallback candidates if needed. Provider `kind` values include `openai`, `azure_openai`, `vllm`, `anthropic`, `gemini`, `vertex`, and `bedrock`.
 
-`allowed_providers`, `allowed_models`, and `allowed_regions` are optional tenant restrictions and apply to the route's primary, canary, and fallback candidates. Set each provider's `data_region` to the region where that deployment processes tenant data; untagged providers are treated as `global`. The gateway uses these tags as operator-supplied policy metadata and does not independently verify provider residency. Tenant `data_policy.usage_retention_days` removes old usage metadata every 24 hours. The minimum is 35 days to preserve full current-month budget accounting; prompt and completion content is not stored in the ledger.
+`allowed_providers`, `allowed_models`, and `allowed_regions` are optional tenant restrictions and apply to the route's primary, canary, and fallback candidates. Set each provider's `data_region` to the region where that deployment processes tenant data; untagged providers are treated as `global`. The gateway uses these tags as operator-supplied policy metadata and does not independently verify provider residency. Tenant `data_policy.usage_retention_days` removes expired usage and tenant audit metadata every 24 hours. The minimum is 35 days to preserve full current-month budget accounting; prompt and completion content is not stored in the ledger. Operators with the `tenant_data` admin scope can export retained records from `/v1/admin/tenants/{tenant_id}/data-export` or explicitly delete tenant usage and associated audit metadata with `DELETE /v1/admin/tenants/{tenant_id}/data?confirm_tenant_id={tenant_id}`. Both workflows require a configured retention policy. Each operation writes a durable tenant data audit record; deletion preserves its audit event and does not erase that operation history.
 
 ### Pricing configuration
 
@@ -268,6 +268,28 @@ The response includes the normalized completion, usage, actual provider/model se
 
 Supported request fields include `model`, `messages`, `application`, `cost_center`, `temperature`, `max_tokens`, `top_p`, `tools`, `tool_choice`, `response_format`, `modalities`, `audio`, and `stream`. `user` and `metadata` are accepted for compatibility but are not forwarded or persisted.
 
+### Retrieval endpoints
+
+Configure logical vector routes under `embedding_routes`; each candidate provider must advertise the `embeddings` capability. OpenAI, Azure OpenAI, vLLM, and Gemini adapters are supported. Route fallbacks use the same capability checks. The gateway records provider-reported input tokens, model pricing, request status, latency, and an `embeddings` or `rerank` operation in the regular usage ledger. Application request quotas, monthly budget reservations, alerts, and tenant provider/model/region restrictions apply.
+
+```yaml
+embedding_routes:
+  retrieval:
+    provider: openai
+    model: text-embedding-3-small
+    fallbacks:
+      - provider: vllm
+        model: bge-small-en
+```
+
+`POST /v1/embeddings` accepts a string or list of strings in `input`, and `model` names the configured logical embedding route. The response uses the OpenAI embeddings list shape with a `gateway` object for provider, upstream model, request ID, and cost. `POST /v1/rerank` accepts `model`, `query`, `documents`, and optional `top_n`; it returns the original document/index and cosine similarity score ordered from most to least similar. Reranking currently uses the route's embedding model rather than a cross-encoder.
+
+Example request:
+
+```json
+{"model":"retrieval","application":"support-router","input":["reset my password","update billing details"]}
+```
+
 For tool calling, send OpenAI-style function declarations. The gateway returns normalized assistant `tool_calls`; the application remains responsible for authorizing and executing the functions, then sending their results as `role: "tool"` messages in a follow-up request.
 
 Generated tool-call argument strings must parse as JSON objects and satisfy the declared function's JSON Schema before they are returned. The gateway checks local schema references only; remote `$ref` values are rejected to prevent implicit network fetches. For streaming responses, tool-call chunks are withheld until their complete arguments pass schema validation.
@@ -330,6 +352,8 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/health` | Public liveness response. |
 | `GET` | `/v1/routes` | Configured route names, providers, models, fallbacks, and cache policy. |
 | `POST` | `/v1/chat/completions` | Make a routed chat completion. |
+| `POST` | `/v1/embeddings` | Create normalized vectors through an embedding route. |
+| `POST` | `/v1/rerank` | Rank documents against a query using normalized embeddings and cosine similarity. |
 | `GET` | `/admin` | Operations dashboard shell; data loads through authenticated admin APIs. |
 | `GET` | `/v1/admin/report` | Aggregate token, cost, and reliability data. |
 | `GET` | `/v1/admin/slos` | Report route/application availability and latency objectives with error-budget burn. |
@@ -341,6 +365,8 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/v1/admin/budgets` | Current-month spend, limit, and utilization for configured applications. |
 | `GET` | `/v1/admin/providers` | Provider circuit state and consecutive failure counts. |
 | `GET` | `/v1/admin/audit` | Recent authenticated admin API access events. |
+| `GET` | `/v1/admin/tenants/{tenant_id}/data-export` | Export retained usage and tenant audit metadata; requires `tenant_data` scope and configured retention. |
+| `DELETE` | `/v1/admin/tenants/{tenant_id}/data?confirm_tenant_id=...` | Remove tenant usage and associated audit metadata while retaining the deletion audit event. |
 | `GET` | `/v1/admin/tool-audit` | Metadata-only tool-call decisions, optionally filtered by tenant. |
 | `POST` | `/v1/admin/tool-approvals` | Record approval, denial, or revocation for a gated tool call. Requires the `tool_approvals` scope. |
 | `GET` | `/v1/tool-approvals/{request_id}/{tool_call_id}` | Query approval state before the application executes a gated tool call. |

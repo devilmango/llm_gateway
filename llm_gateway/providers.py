@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import struct
@@ -216,6 +217,85 @@ class ProviderClient:
         PROVIDER_REQUESTS.labels(provider=provider_name, outcome="success").inc()
         PROVIDER_LATENCY.labels(provider=provider_name, outcome="success").observe(time.perf_counter() - started)
         return result
+
+    async def embed(self, provider_name: str, model: str, inputs: list[str],
+                    request_id: str | None = None) -> dict[str, Any]:
+        """Return normalized vectors and usage for supported embedding adapters."""
+        cfg = self.providers[provider_name]
+        kind = cfg["kind"]
+        capabilities = provider_capabilities(cfg)
+        if not capabilities.get("embeddings", False):
+            raise ProviderCapabilityError(f"Provider {provider_name!r} does not support embeddings")
+        try:
+            key = await resolve_secret(cfg.get("api_key_env"), cfg.get("api_key_file")) or None
+        except SecretUnavailable as exc:
+            raise ProviderError(f"Provider {provider_name!r} credential is unavailable") from exc
+        if kind != "gemini" and not key and not cfg.get("api_key_optional", False):
+            raise ProviderError(f"Provider {provider_name!r} has no API key configured")
+        base = (cfg.get("base_url") or "").rstrip("/")
+        headers = {"Content-Type": "application/json"}
+        params = None
+        if kind in {"openai", "vllm"}:
+            url = f"{base}/embeddings"
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            payload: dict[str, Any] = {"model": model, "input": inputs}
+        elif kind == "azure_openai":
+            url = f"{base}/openai/deployments/{model}/embeddings"
+            params = {"api-version": cfg.get("api_version", "2024-10-21")}
+            if key:
+                headers["api-key"] = key
+            payload = {"input": inputs}
+        elif kind == "gemini":
+            url = f"{base}/models/{model}:batchEmbedContents"
+            params = {"key": key} if key else None
+            payload = {"requests": [{"model": f"models/{model}",
+                "content": {"parts": [{"text": value}]}} for value in inputs]}
+        else:
+            raise ProviderCapabilityError(f"Provider kind {kind!r} has no embeddings adapter")
+        self._apply_request_correlation(cfg, headers, payload, request_id)
+        started = time.perf_counter()
+        try:
+            response = await self.http.post(url, json=payload, headers=headers, params=params,
+                                            timeout=self.timeout)
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome="network_error").inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome="network_error").observe(time.perf_counter() - started)
+            raise ProviderError(f"{type(exc).__name__}: upstream request failed", retryable=True) from exc
+        if response.status_code >= 400:
+            outcome = "rate_limited" if response.status_code == 429 else "upstream_error"
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
+            raise ProviderError(f"Upstream returned HTTP {response.status_code}",
+                retryable=response.status_code == 429 or response.status_code >= 500,
+                status_code=response.status_code)
+        try:
+            body = response.json()
+            if kind == "gemini":
+                raw_vectors = [item["values"] for item in body["embeddings"]]
+                usage_raw = body.get("usageMetadata", {})
+                prompt_tokens = int(usage_raw.get("promptTokenCount", 0) or 0)
+            else:
+                raw_vectors = [item["embedding"] for item in sorted(body["data"], key=lambda item: item["index"])]
+                usage_raw = body.get("usage", {})
+                prompt_tokens = int(usage_raw.get("prompt_tokens", 0) or 0)
+            if len(raw_vectors) != len(inputs) or any(not isinstance(vector, list) or not vector
+                    or len(vector) > 65_536 for vector in raw_vectors):
+                raise ValueError("embedding count or shape mismatch")
+            vectors = [[float(value) for value in vector] for vector in raw_vectors]
+            if any(not all(math.isfinite(value) for value in vector) for vector in vectors):
+                raise ValueError("non-finite embedding value")
+            if len({len(vector) for vector in vectors}) != 1:
+                raise ValueError("embedding dimensions do not match")
+        except (ValueError, KeyError, TypeError, IndexError) as exc:
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome="invalid_response").inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome="invalid_response").observe(time.perf_counter() - started)
+            raise ProviderError("Provider returned invalid embeddings", retryable=True) from exc
+        PROVIDER_REQUESTS.labels(provider=provider_name, outcome="success").inc()
+        PROVIDER_LATENCY.labels(provider=provider_name, outcome="success").observe(time.perf_counter() - started)
+        return {"data": vectors, "model": body.get("model", model),
+                "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 0,
+                          "total_tokens": int(usage_raw.get("total_tokens", prompt_tokens) or prompt_tokens)}}
 
     async def stream(self, provider_name: str, model: str, payload: dict[str, Any],
                      request_id: str | None = None):
