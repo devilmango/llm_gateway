@@ -57,6 +57,33 @@ class EvaluationCompareRequest(BaseModel):
     max_cost_regression_percent: float | None = Field(default=None, ge=0)
     max_latency_regression_percent: float | None = Field(default=None, ge=0)
     max_failure_rate: float | None = Field(default=None, ge=0, le=1)
+    min_recall_at_5: float | None = Field(default=None, ge=0, le=1)
+    min_mrr: float | None = Field(default=None, ge=0, le=1)
+    min_ndcg_at_5: float | None = Field(default=None, ge=0, le=1)
+
+
+class RetrievalEvaluationCase(BaseModel):
+    ranked_document_ids: list[str] = Field(min_length=1, max_length=10_000)
+    relevant_document_ids: list[str] = Field(min_length=1, max_length=10_000)
+    cost_usd: float = Field(default=0, ge=0)
+    latency_ms: float = Field(default=0, ge=0)
+    failed: bool = False
+
+    @model_validator(mode="after")
+    def validate_labels(self) -> RetrievalEvaluationCase:
+        if len(set(self.ranked_document_ids)) != len(self.ranked_document_ids):
+            raise ValueError("ranked_document_ids must be unique")
+        if len(set(self.relevant_document_ids)) != len(self.relevant_document_ids):
+            raise ValueError("relevant_document_ids must be unique")
+        return self
+
+
+class RetrievalEvaluationCreate(BaseModel):
+    dataset_name: str = Field(min_length=1, max_length=200)
+    dataset_version: str = Field(min_length=1, max_length=120)
+    dataset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    route: str = Field(min_length=1, max_length=120)
+    cases: list[RetrievalEvaluationCase] = Field(min_length=1, max_length=100_000)
 
 
 class PromotionEvaluateRequest(BaseModel):

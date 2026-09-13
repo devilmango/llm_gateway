@@ -25,7 +25,7 @@ from .capabilities import provider_capabilities
 from .config import load_config, validate_tenant_policies
 from .dashboard import OPERATIONS_DASHBOARD
 from .distributed import RateLimitBackendUnavailable
-from .evaluation import compare_saved_runs
+from .evaluation import compare_saved_runs, retrieval_metrics
 from .idempotency import IdempotencyRegistry
 from .limiting import RateLimitExceeded
 from .observability import (
@@ -63,6 +63,7 @@ from .schemas import (
     EvaluationReportCreate,
     PromotionEvaluateRequest,
     RerankRequest,
+    RetrievalEvaluationCreate,
     ToolApprovalDecisionRequest,
     ToolExecutionOutcomeRequest,
     Usage,
@@ -513,6 +514,7 @@ def create_app(config: dict[str, Any] | None = None,
         configured_model: str | None = None
         error_type: str | None = None
         fallback_used = False
+        cached = False
         status = "failure"
         cost = 0.0
         try:
@@ -543,10 +545,40 @@ def create_app(config: dict[str, Any] | None = None,
                 try:
                     await request.app.state.gateway.limiter.acquire(provider_name,
                         int(provider_cfg.get("requests_per_minute", 600)))
-                    async with request.app.state.gateway._concurrency():
-                        result = await request.app.state.gateway.client.embed(provider_name,
-                            configured_model, inputs, request_id)
-                    vectors, usage = result["data"], result["usage"]
+                    cache_cfg = cfg.get("retrieval", {}).get("embedding_cache", {})
+                    cache_secret = os.getenv(cache_cfg.get("hmac_key_env", ""), "") if cache_cfg.get("enabled") else ""
+                    cache_ttl = int(cache_cfg.get("ttl_seconds", 300))
+                    pricing_version = provider_cfg.get("models", {}).get(configured_model, {}).get(
+                        "pricing_version", "unversioned")
+                    cache_keys = [request.app.state.gateway.embedding_cache.key(value,
+                        tenant=tenant_id or "public", provider=provider_name, model=configured_model,
+                        pricing_version=pricing_version, secret=cache_secret)
+                        for value in inputs] if cache_secret and cache_ttl > 0 else []
+                    cached_vectors: dict[int, list[float]] = {}
+                    if cache_keys:
+                        for input_index, cache_key in enumerate(cache_keys):
+                            vector = await request.app.state.gateway.embedding_cache.get(cache_key)
+                            if vector is not None:
+                                cached_vectors[input_index] = vector
+                    missing_indexes = [input_index for input_index in range(len(inputs))
+                                       if input_index not in cached_vectors]
+                    if missing_indexes:
+                        async with request.app.state.gateway._concurrency():
+                            result = await request.app.state.gateway.client.embed(provider_name,
+                                configured_model, [inputs[input_index] for input_index in missing_indexes], request_id)
+                        usage = result["usage"]
+                        for result_index, input_index in enumerate(missing_indexes):
+                            vector = result["data"][result_index]
+                            cached_vectors[input_index] = vector
+                            if cache_keys:
+                                await request.app.state.gateway.embedding_cache.put(
+                                    cache_keys[input_index], vector, cache_ttl)
+                    else:
+                        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                    vectors = [cached_vectors[input_index] for input_index in range(len(inputs))]
+                    cached = bool(cache_keys and cached_vectors)
+                    if cached:
+                        CACHE_HITS.labels(route=model_name).inc()
                     fallback_used = (provider_name, configured_model) != (
                         configured_candidates[0]["provider"], configured_candidates[0]["model"])
                     routing_decisions.append({"provider": provider_name, "model": configured_model,
@@ -582,7 +614,7 @@ def create_app(config: dict[str, Any] | None = None,
                 "prompt_tokens": usage["prompt_tokens"], "completion_tokens": 0,
                 "total_tokens": usage["total_tokens"], "cost_usd": cost,
                 "status": status, "latency_ms": elapsed_ms, "fallback_used": int(fallback_used),
-                "cached": 0, "error_type": error_type, "cost_center": cost_center,
+                "cached": int(cached), "error_type": error_type, "cost_center": cost_center,
                 "canary_used": 0, "operation": operation}
             await asyncio.to_thread(request.app.state.store.record, record)
             if routing_decisions:
@@ -625,6 +657,107 @@ def create_app(config: dict[str, Any] | None = None,
             raise HTTPException(status_code=400, detail=f"Unknown embedding route {body.model!r}")
         if not provider_capabilities(cfg["providers"][route["provider"]]).get("reranking", False):
             raise HTTPException(status_code=400, detail="Embedding route does not support reranking")
+        tenant_cfg = tenant["config"] if tenant else {}
+        if tenant and tenant_cfg.get("allowed_routes") is not None and body.model not in tenant_cfg["allowed_routes"]:
+            raise HTTPException(status_code=403, detail="Tenant policy does not allow this retrieval route")
+        reranker = route.get("reranker", {})
+        native_candidates = [reranker, *reranker.get("fallbacks", [])] if reranker else []
+        allowed_providers = set(tenant_cfg["allowed_providers"]) if tenant_cfg.get("allowed_providers") is not None else set(cfg["providers"])
+        allowed_models = set(tenant_cfg["allowed_models"]) if tenant_cfg.get("allowed_models") is not None else None
+        allowed_regions = set(tenant_cfg["allowed_regions"]) if tenant_cfg.get("allowed_regions") is not None else None
+        native_candidates = [candidate for candidate in native_candidates
+            if candidate["provider"] in allowed_providers
+            and (allowed_models is None or candidate["model"] in allowed_models)
+            and (allowed_regions is None or cfg["providers"][candidate["provider"]].get("data_region", "global") in allowed_regions)]
+        native_error: ProviderError | None = None
+        if native_candidates:
+            ledger_application = f"{tenant['id']}:{body.application}" if tenant else body.application
+            budgets = cfg.get("budgets", {})
+            policy = {**budgets.get("default", {}), **budgets.get("applications", {}).get(body.application, {}),
+                      **tenant_cfg.get("default_policy", {}), **tenant_cfg.get("applications", {}).get(body.application, {})}
+            max_bytes = int(policy.get("max_input_bytes", cfg.get("retrieval", {}).get("max_input_bytes", 2_000_000)))
+            if sum(len(text.encode("utf-8")) for text in [body.query, *body.documents]) > max_bytes:
+                raise HTTPException(status_code=400, detail=f"Request exceeds application input limit of {max_bytes} bytes")
+            for candidate_index, candidate in enumerate(native_candidates):
+                provider_name, upstream_model = candidate["provider"], candidate["model"]
+                provider_cfg = cfg["providers"][provider_name]
+                price = provider_cfg.get("models", {}).get(upstream_model, {})
+                estimated_cost = (len(body.documents) * float(price.get("rerank_cost_per_1k_documents", 0)) / 1000
+                    if "rerank_cost_per_1k_documents" in price else
+                    (len(body.query) + sum(map(len, body.documents))) / 4
+                    * float(price.get("input_cost_per_1m", 0)) / 1_000_000)
+                request_id = str(uuid.uuid4())
+                native_started = time.perf_counter()
+                try:
+                    request_rate = policy.get("max_requests_per_minute")
+                    if request_rate is not None:
+                        await request.app.state.gateway.acquire_application_quota(ledger_application, int(request_rate))
+                    if policy.get("monthly_limit_usd") is not None:
+                        await asyncio.to_thread(request.app.state.store.reserve_budget, request_id,
+                            ledger_application, estimated_cost, float(policy["monthly_limit_usd"]))
+                    await request.app.state.gateway.limiter.acquire(provider_name,
+                        int(provider_cfg.get("requests_per_minute", 600)))
+                    async with request.app.state.gateway._concurrency():
+                        result = await request.app.state.gateway.client.rerank(provider_name, upstream_model,
+                            body.query, body.documents, body.top_n or len(body.documents), request_id)
+                    usage = result["usage"]
+                    if "rerank_cost_per_1k_documents" in price:
+                        cost = estimated_cost
+                    else:
+                        cost = usage["total_tokens"] * float(price.get("input_cost_per_1m", 0)) / 1_000_000
+                    elapsed_ms = int((time.perf_counter() - native_started) * 1000)
+                    native_fallback_used = candidate_index > 0
+                    record = {"request_id": request_id, "occurred_at": datetime.now(UTC).isoformat(),
+                        "application": ledger_application, "route": body.model, "provider": provider_name,
+                        "model": upstream_model, "pricing_catalog": provider_cfg.get("pricing_catalog", "default"),
+                        "pricing_version": price.get("pricing_version", "unversioned"),
+                        "prompt_tokens": usage["prompt_tokens"], "completion_tokens": 0,
+                        "total_tokens": usage["total_tokens"], "cost_usd": cost, "status": "success",
+                        "latency_ms": elapsed_ms, "fallback_used": int(native_fallback_used), "cached": 0,
+                        "cost_center": body.cost_center, "canary_used": 0, "operation": "rerank"}
+                    await asyncio.to_thread(request.app.state.store.record, record)
+                    await asyncio.to_thread(request.app.state.store.record_routing_decisions,
+                        request_id, ledger_application, body.model, [{"provider": provider_name,
+                            "model": upstream_model,
+                            "decision": "fallback" if native_fallback_used else "selected",
+                            "reason": "prior_native_provider_error" if native_fallback_used else "native_reranker",
+                            "attempt_count": 1}])
+                    REQUESTS.labels(route=body.model, status="success").inc()
+                    TOKENS.labels(route=body.model, kind="prompt").inc(usage["prompt_tokens"])
+                    COST.labels(route=body.model).inc(cost)
+                    if native_fallback_used:
+                        FALLBACKS.labels(route=body.model).inc()
+                    record_request_telemetry(ledger_application, body.model, "success", elapsed_ms,
+                        provider_name, upstream_model, usage, operation="rerank")
+                    ranked = [{**item, "document": body.documents[item["index"]]} for item in result["data"]]
+                    return {"model": body.model, "results": ranked, "usage": usage,
+                        "gateway": {"request_id": request_id, "provider": provider_name,
+                            "upstream_model": upstream_model, "cost_usd": round(cost, 8),
+                            "fallback_used": native_fallback_used, "reranker": provider_cfg["kind"],
+                            "billed_units": result.get("billed_units")}}
+                except RateLimitExceeded as exc:
+                    raise HTTPException(status_code=429, detail="Provider request quota exceeded") from exc
+                except BudgetExceeded as exc:
+                    raise HTTPException(status_code=429, detail="Application monthly spend limit reached") from exc
+                except ProviderError as exc:
+                    native_error = exc
+                    elapsed_ms = int((time.perf_counter() - native_started) * 1000)
+                    await asyncio.to_thread(request.app.state.store.record, {
+                        "request_id": request_id, "occurred_at": datetime.now(UTC).isoformat(),
+                        "application": ledger_application, "route": body.model, "provider": provider_name,
+                        "model": upstream_model, "pricing_catalog": provider_cfg.get("pricing_catalog", "default"),
+                        "pricing_version": price.get("pricing_version", "unversioned"),
+                        "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                        "cost_usd": 0, "status": "failure", "latency_ms": elapsed_ms,
+                        "fallback_used": 0, "cached": 0, "error_type": type(exc).__name__,
+                        "cost_center": body.cost_center, "canary_used": 0, "operation": "rerank"})
+                    await asyncio.to_thread(request.app.state.store.record_routing_decisions,
+                        request_id, ledger_application, body.model, [{"provider": provider_name,
+                            "model": upstream_model, "decision": "skipped", "reason": "provider_error", "attempt_count": 1}])
+                    REQUESTS.labels(route=body.model, status="failure").inc()
+                    LATENCY.labels(route=body.model, status="failure").observe(elapsed_ms / 1000)
+            if reranker.get("fallback", "cosine") == "error":
+                raise HTTPException(status_code=502, detail="Configured native reranker failed") from native_error
         vectors, info = await run_retrieval(request, body.model, [body.query, *body.documents],
             body.application, body.cost_center, "rerank", tenant)
         query_vector, document_vectors = vectors[0], vectors[1:]
@@ -638,7 +771,8 @@ def create_app(config: dict[str, Any] | None = None,
         return {"model": body.model, "results": ranked[:body.top_n], "usage": info["usage"],
             "gateway": {"request_id": info["request_id"], "provider": info["provider"],
                 "upstream_model": info["model"], "cost_usd": round(info["cost_usd"], 8),
-                "fallback_used": info["fallback_used"], "reranker": "cosine_similarity"}}
+                "fallback_used": info["fallback_used"], "reranker": "cosine_similarity",
+                "native_fallback": bool(native_candidates)}}
 
     @app.post("/v1/chat/completions", response_model=None)
     async def chat(body: ChatRequest, request: Request,
@@ -1465,6 +1599,31 @@ def create_app(config: dict[str, Any] | None = None,
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"saved": True, **result}
 
+    @app.post("/v1/admin/retrieval/evaluations", dependencies=[Depends(admin_dependency("report"))])
+    async def persist_retrieval_evaluation(body: RetrievalEvaluationCreate, request: Request) -> dict[str, Any]:
+        if body.route not in (set(cfg.get("embedding_routes", {})) | set(cfg.get("routes", {}))):
+            raise HTTPException(status_code=400, detail=f"Unknown retrieval route {body.route!r}")
+        cases = [item.model_dump() for item in body.cases]
+        per_case_metrics = [retrieval_metrics(item["ranked_document_ids"], item["relevant_document_ids"])
+                            for item in cases]
+        metric_names = per_case_metrics[0].keys()
+        quality = {name: round(sum(metrics[name] for metrics in per_case_metrics) / len(per_case_metrics), 8)
+                   for name in metric_names}
+        summary = {"requests": len(cases), "failures": sum(bool(item["failed"]) for item in cases),
+            "estimated_cost_usd": round(sum(item["cost_usd"] for item in cases), 8),
+            "average_latency_ms": round(sum(item["latency_ms"] for item in cases) / len(cases), 2),
+            "retrieval_metrics": quality}
+        report = {"routes": {body.route: summary}, "results": [
+            {"case": index, "route": body.route, "passed": not item["failed"],
+             "latency_ms": item["latency_ms"], "cost_usd": item["cost_usd"]}
+            for index, item in enumerate(cases)]}
+        try:
+            saved = await asyncio.to_thread(request.app.state.store.save_evaluation_report,
+                body.dataset_name, body.dataset_version, body.dataset_sha256, len(cases), report)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"saved": True, **saved, "route": body.route, "summary": summary}
+
     @app.get("/v1/admin/evaluations", dependencies=[Depends(admin_dependency("report"))])
     async def evaluation_reports(request: Request,
                                  dataset_name: str | None = Query(default=None, max_length=200),
@@ -1488,7 +1647,10 @@ def create_app(config: dict[str, Any] | None = None,
             min_pass_rate=body.min_pass_rate,
             max_cost_regression_percent=body.max_cost_regression_percent,
             max_latency_regression_percent=body.max_latency_regression_percent,
-            max_failure_rate=body.max_failure_rate)
+            max_failure_rate=body.max_failure_rate,
+            min_recall_at_5=body.min_recall_at_5,
+            min_mrr=body.min_mrr,
+            min_ndcg_at_5=body.min_ndcg_at_5)
         saved = await asyncio.to_thread(request.app.state.store.save_evaluation_comparison,
             body.baseline_run_id, body.candidate_run_id, report)
         return {"saved": True, **saved, "report": report}

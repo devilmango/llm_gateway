@@ -14,6 +14,7 @@ from llm_gateway.capabilities import provider_capabilities
 from llm_gateway.providers import ProviderCapabilityError, ProviderClient
 
 ADAPTERS = ("openai", "vllm", "azure_openai", "anthropic", "gemini", "vertex", "bedrock")
+RERANK_ADAPTERS = ("cohere", "voyage")
 STREAMING_ADAPTERS = ADAPTERS
 TOOL = {"type": "function", "function": {"name": "lookup_order", "description": "Look up an order",
     "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
@@ -42,6 +43,38 @@ def adapter_config(kind: str) -> dict[str, Any]:
         config["access_key_env"] = "CONFORMANCE_AWS_ACCESS_KEY"
         config["secret_key_env"] = "CONFORMANCE_AWS_SECRET_KEY"
     return config
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", RERANK_ADAPTERS)
+async def test_native_rerank_adapters_normalize_results_and_usage(kind: str, monkeypatch):
+    monkeypatch.setenv("CONFORMANCE_API_KEY", "test-api-key")
+    host = "cohere.test" if kind == "cohere" else "voyage.test"
+    config = {"kind": kind, "base_url": f"https://{host}/v2" if kind == "cohere" else "https://{host}/v1",
+        "api_key_env": "CONFORMANCE_API_KEY", "models": {"rerank-model": {
+            "rerank_cost_per_1k_documents": 1.25, "pricing_version": "price-v1"}}}
+    sent: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        if kind == "cohere":
+            return httpx.Response(200, json={"results": [{"index": 1, "relevance_score": 0.9},
+                {"index": 0, "relevance_score": 0.2}], "meta": {"billed_units": {"search_units": 1}}})
+        return httpx.Response(200, json={"data": [{"index": 1, "relevance_score": 0.9},
+            {"index": 0, "relevance_score": 0.2}], "usage": {"total_tokens": 8}})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    client = ProviderClient(http, {"adapter": config}, 2)
+    try:
+        result = await client.rerank("adapter", "rerank-model", "query", ["first", "second"], 2,
+                                     request_id="gw-rerank-1")
+    finally:
+        await http.aclose()
+    assert [item["index"] for item in result["data"]] == [1, 0]
+    assert result["usage"]["total_tokens"] == (0 if kind == "cohere" else 8)
+    assert result["billed_units"] == (1 if kind == "cohere" else None)
+    assert sent[0].url.path.endswith("/rerank")
+    assert sent[0].headers["X-Gateway-Request-ID"] == "gw-rerank-1"
 
 
 def completion_response(kind: str) -> dict[str, Any]:

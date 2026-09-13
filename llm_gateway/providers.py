@@ -719,6 +719,65 @@ class ProviderClient:
             result["toolConfig"] = tool_config
         return result
 
+    async def rerank(self, provider_name: str, model: str, query: str, documents: list[str],
+                     top_n: int, request_id: str | None = None) -> dict[str, Any]:
+        """Call and normalize a native Cohere or Voyage rerank adapter."""
+        cfg = self.providers[provider_name]
+        kind = cfg.get("kind")
+        if kind not in {"cohere", "voyage"} or not provider_capabilities(cfg).get("native_reranking", False):
+            raise ProviderCapabilityError(f"Provider {provider_name!r} does not support native reranking")
+        try:
+            key = await resolve_secret(cfg.get("api_key_env"), cfg.get("api_key_file")) or None
+        except SecretUnavailable as exc:
+            raise ProviderError(f"Provider {provider_name!r} credential is unavailable") from exc
+        if not key and not cfg.get("api_key_optional", False):
+            raise ProviderError(f"Provider {provider_name!r} has no API key configured")
+        base = (cfg.get("base_url") or ("https://api.cohere.com" if kind == "cohere"
+              else "https://api.voyageai.com/v1")).rstrip("/")
+        url = f"{base}/rerank" if (kind == "voyage" or base.endswith("/v2")) else f"{base}/v2/rerank"
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        payload = {"model": model, "query": query, "documents": documents, "top_n": top_n}
+        self._apply_request_correlation(cfg, headers, payload, request_id)
+        started = time.perf_counter()
+        try:
+            response = await self.http.post(url, json=payload, headers=headers, timeout=self.timeout)
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome="network_error").inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome="network_error").observe(time.perf_counter() - started)
+            raise ProviderError(f"{type(exc).__name__}: upstream request failed", retryable=True) from exc
+        if response.status_code >= 400:
+            outcome = "rate_limited" if response.status_code == 429 else "upstream_error"
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome=outcome).inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome=outcome).observe(time.perf_counter() - started)
+            raise ProviderError(f"Upstream returned HTTP {response.status_code}",
+                retryable=response.status_code == 429 or response.status_code >= 500,
+                status_code=response.status_code)
+        try:
+            body = response.json()
+            raw_results = body.get("results", []) if kind == "cohere" else body.get("data", [])
+            result_data = [{"index": int(item["index"]), "relevance_score": float(item["relevance_score"])}
+                           for item in raw_results]
+            if any(item["index"] < 0 or item["index"] >= len(documents) for item in result_data):
+                raise ValueError("result index out of range")
+            raw_usage = body.get("usage", {})
+            usage = {"prompt_tokens": 0, "completion_tokens": 0,
+                     "total_tokens": int(raw_usage.get("total_tokens", 0) or 0)}
+            if kind == "cohere":
+                usage["total_tokens"] = 0
+                billed_units = int(body.get("meta", {}).get("billed_units", {}).get("search_units", 0) or 0)
+            else:
+                billed_units = None
+            result = {"data": result_data, "usage": usage, "billed_units": billed_units}
+        except (ValueError, TypeError, KeyError) as exc:
+            PROVIDER_REQUESTS.labels(provider=provider_name, outcome="invalid_response").inc()
+            PROVIDER_LATENCY.labels(provider=provider_name, outcome="invalid_response").observe(time.perf_counter() - started)
+            raise ProviderError("Provider returned an invalid rerank response", retryable=True) from exc
+        PROVIDER_REQUESTS.labels(provider=provider_name, outcome="success").inc()
+        PROVIDER_LATENCY.labels(provider=provider_name, outcome="success").observe(time.perf_counter() - started)
+        return result
+
     @staticmethod
     def _sign_aws_request(url: str, payload: dict[str, Any], headers: dict[str, str], region: str,
                           access_key: str, secret_key: str, token: str = "") -> None:

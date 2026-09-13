@@ -114,6 +114,38 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
                 raise ValueError(f"Embedding route {route_name!r} provider {provider_name!r} lacks embeddings capability")
             if not isinstance(candidate.get("model"), str) or not candidate["model"]:
                 raise ValueError(f"Embedding route {route_name!r} candidates require a model")
+        reranker = route.get("reranker")
+        if reranker is not None:
+            if not isinstance(reranker, dict):
+                raise TypeError(f"Embedding route {route_name!r} reranker must be an object")
+            rerank_candidates = [reranker, *reranker.get("fallbacks", [])]
+            if not isinstance(reranker.get("fallbacks", []), list):
+                raise TypeError(f"Embedding route {route_name!r} reranker fallbacks must be a list")
+            for candidate in rerank_candidates:
+                if not isinstance(candidate, dict):
+                    raise TypeError(f"Embedding route {route_name!r} reranker candidates must be objects")
+                provider_name = candidate.get("provider")
+                if provider_name not in config["providers"]:
+                    raise ValueError(f"Embedding route {route_name!r} reranker refers to unknown provider {provider_name!r}")
+                if not provider_capabilities(config["providers"][provider_name]).get("native_reranking", False):
+                    raise ValueError(f"Embedding route {route_name!r} provider {provider_name!r} lacks native reranking capability")
+                if not isinstance(candidate.get("model"), str) or not candidate["model"]:
+                    raise ValueError(f"Embedding route {route_name!r} reranker candidates require a model")
+            if reranker.get("fallback", "cosine") not in {"cosine", "error"}:
+                raise ValueError(f"Embedding route {route_name!r} reranker fallback must be cosine or error")
+    retrieval_policy = config.get("retrieval", {})
+    if not isinstance(retrieval_policy, dict):
+        raise TypeError("retrieval must be an object")
+    embedding_cache = retrieval_policy.get("embedding_cache", {})
+    if not isinstance(embedding_cache, dict):
+        raise TypeError("retrieval.embedding_cache must be an object")
+    ttl = embedding_cache.get("ttl_seconds", 300)
+    if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl < 0:
+        raise ValueError("retrieval.embedding_cache.ttl_seconds must be a non-negative integer")
+    if not isinstance(embedding_cache.get("enabled", False), bool):
+        raise TypeError("retrieval.embedding_cache.enabled must be a boolean")
+    if embedding_cache.get("enabled", False) and not embedding_cache.get("hmac_key_env"):
+        raise ValueError("retrieval.embedding_cache requires hmac_key_env when enabled")
     all_routes = set(config["routes"]) | set(retrieval_routes)
     for tenant_id, tenant in config.get("tenants", config.get("security", {}).get("tenants", {})).items():
         unknown_routes = set(tenant.get("allowed_routes", [])) - all_routes
@@ -133,6 +165,11 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
                 or any(not part for part in body_path.split("."))):
             raise ValueError(f"Provider {provider_name!r} request_id_body_field must be a dot-separated path")
         provider_capabilities(provider)
+        for model_name, pricing in provider.get("models", {}).items():
+            rerank_price = pricing.get("rerank_cost_per_1k_documents")
+            if rerank_price is not None and (isinstance(rerank_price, bool)
+                    or not isinstance(rerank_price, (int, float)) or rerank_price < 0):
+                raise ValueError(f"Provider {provider_name!r} model {model_name!r} rerank cost must be non-negative")
     for route_name, route in config["routes"].items():
         shadow = route.get("shadow")
         if shadow is None:

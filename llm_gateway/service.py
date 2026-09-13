@@ -11,7 +11,7 @@ from urllib.parse import quote
 import httpx
 from opentelemetry import trace
 
-from .cache import RedisResponseCache, ResponseCache
+from .cache import EmbeddingCache, RedisResponseCache, ResponseCache
 from .circuit import ProviderCircuitBreaker
 from .distributed import (
     RateLimitBackendUnavailable,
@@ -34,6 +34,7 @@ class GatewayService:
         self.client = ProviderClient(http, self.providers, float(config["server"].get("request_timeout_seconds", 45)))
         self.limiter = RedisSlidingWindowLimiter(shared_redis) if shared_redis else SlidingWindowLimiter()
         self.cache = RedisResponseCache(shared_redis) if shared_redis else ResponseCache()
+        self.embedding_cache = EmbeddingCache(self.cache)
         self.max_concurrent_requests = int(config["server"].get("max_concurrent_requests", 100))
         self.shared_redis = shared_redis
         self.semaphore = asyncio.Semaphore(self.max_concurrent_requests)

@@ -65,7 +65,9 @@ The goal is a small, understandable infrastructure service: start with one proce
 | Cost reconciliation | Import actual provider charges by gateway request ID and compare totals and variance with the original per-request estimates. |
 | Cost anomaly detection | Compare recent per-request and per-1,000-token costs with the previous equal-length window by application, provider, model, and pricing version. |
 | Routing decision history | Inspect selected, fallback, and skipped provider/model candidates with safe reason codes, retry counts, and report aggregates. |
-| Saved evaluation comparisons | Compare persisted evaluation runs by route, including pass-rate confidence intervals, cost and latency regressions, failure rates, and optional promotion gates. |
+| Saved evaluation comparisons | Compare persisted evaluation runs by route, including pass-rate confidence intervals, retrieval quality, cost and latency regressions, failure rates, and optional promotion gates. |
+| Retrieval quality evaluations | Track recall@k, MRR, and nDCG on labeled ranking datasets; apply minimum retrieval quality gates during candidate promotion. |
+| Native rerankers and embedding cache | Route rerank requests to Cohere or Voyage cross-encoders with cosine fallback; cache embeddings by tenant, provider, model, and pricing version using HMAC input hashes. |
 | Tool execution timeout visibility | Inspect generated tool calls without reported outcomes, flag overdue calls, and scrape pending/overdue counts for Prometheus alerting. |
 | Tool approval workflow | Set approval TTLs, revoke active approvals, notify configured applications through the signed webhook outbox, and use the Python client helper to check approval immediately before execution. |
 | Shadow evaluation and promotion | Sample live requests to a non-returned candidate, compare validity-based quality, cost, latency, and failures, then combine shadow thresholds with saved evaluation and live SLO gates. |
@@ -270,7 +272,7 @@ Supported request fields include `model`, `messages`, `application`, `cost_cente
 
 ### Retrieval endpoints
 
-Configure logical vector routes under `embedding_routes`; each candidate provider must advertise the `embeddings` capability. OpenAI, Azure OpenAI, vLLM, and Gemini adapters are supported. Route fallbacks use the same capability checks. The gateway records provider-reported input tokens, model pricing, request status, latency, and an `embeddings` or `rerank` operation in the regular usage ledger. Application request quotas, monthly budget reservations, alerts, and tenant provider/model/region restrictions apply.
+Configure logical vector routes under `embedding_routes`; each candidate provider must advertise the `embeddings` capability. OpenAI, Azure OpenAI, vLLM, and Gemini adapters are supported. Route fallbacks use the same capability checks. Optional Cohere and Voyage native cross-encoder adapters can rank candidates; `fallback: cosine` uses the route's embeddings if native reranking fails. Configure `rerank_cost_per_1k_documents` and `pricing_version` in the provider model catalog. Requests are recorded in the regular usage ledger, and application quotas, monthly budget reservations, and tenant provider/model/region restrictions apply.
 
 ```yaml
 embedding_routes:
@@ -282,7 +284,42 @@ embedding_routes:
         model: bge-small-en
 ```
 
-`POST /v1/embeddings` accepts a string or list of strings in `input`, and `model` names the configured logical embedding route. The response uses the OpenAI embeddings list shape with a `gateway` object for provider, upstream model, request ID, and cost. `POST /v1/rerank` accepts `model`, `query`, `documents`, and optional `top_n`; it returns the original document/index and cosine similarity score ordered from most to least similar. Reranking currently uses the route's embedding model rather than a cross-encoder.
+`POST /v1/embeddings` accepts a string or list of strings in `input`, and `model` names the configured logical embedding route. The response uses the OpenAI embeddings list shape with a `gateway` object for provider, upstream model, request ID, and cost. `POST /v1/rerank` accepts `model`, `query`, `documents`, and optional `top_n`; it returns the original document/index and relevance score, using the configured cross-encoder or cosine similarity.
+
+Example native provider and route configuration:
+
+```yaml
+providers:
+  cohere-reranker:
+    kind: cohere
+    base_url: https://api.cohere.com/v2
+    api_key_env: COHERE_API_KEY
+    models:
+      rerank-v4.0:
+        rerank_cost_per_1k_documents: 2.0
+        pricing_version: "2026-10"
+
+embedding_routes:
+  support-search:
+    provider: openai
+    model: text-embedding-3-small
+    reranker:
+      provider: cohere-reranker
+      model: rerank-v4.0
+      fallback: cosine
+```
+
+Embedding vector caching is opt-in. Cache keys use an HMAC of the input plus tenant namespace, provider, model, and pricing version; the cache does not use the raw text as its key. Configure a private HMAC key and retention period:
+
+```yaml
+retrieval:
+  embedding_cache:
+    enabled: true
+    hmac_key_env: EMBEDDING_CACHE_HMAC_KEY
+    ttl_seconds: 300
+```
+
+To evaluate labeled rankings, post one result per query to `POST /v1/admin/retrieval/evaluations`. Cases contain `ranked_document_ids`, `relevant_document_ids`, and optional observed `cost_usd` and `latency_ms`. The gateway stores mean recall@1/3/5/10, MRR, nDCG@1/3/5/10, cost, and latency in the immutable evaluation store. Use the logical route name being promoted so the report joins the existing comparison and promotion flow. `POST /v1/admin/evaluations/compare` accepts optional `min_recall_at_5`, `min_mrr`, and `min_ndcg_at_5` gates; a missing metric fails its configured gate.
 
 Example request:
 
@@ -353,7 +390,8 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/v1/routes` | Configured route names, providers, models, fallbacks, and cache policy. |
 | `POST` | `/v1/chat/completions` | Make a routed chat completion. |
 | `POST` | `/v1/embeddings` | Create normalized vectors through an embedding route. |
-| `POST` | `/v1/rerank` | Rank documents against a query using normalized embeddings and cosine similarity. |
+| `POST` | `/v1/rerank` | Rank documents with a native cross-encoder or cosine fallback. |
+| `POST` | `/v1/admin/retrieval/evaluations` | Persist labeled ranking metrics and observed cost/latency for a route. |
 | `GET` | `/admin` | Operations dashboard shell; data loads through authenticated admin APIs. |
 | `GET` | `/v1/admin/report` | Aggregate token, cost, and reliability data. |
 | `GET` | `/v1/admin/slos` | Report route/application availability and latency objectives with error-budget burn. |

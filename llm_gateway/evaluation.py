@@ -45,6 +45,30 @@ def _wilson_interval(successes: int, trials: int, z: float = 1.959963984540054) 
     return [round(max(0.0, center - margin), 4), round(min(1.0, center + margin), 4)]
 
 
+def retrieval_metrics(ranked_document_ids: list[str], relevant_document_ids: list[str],
+                      k_values: list[int] | None = None) -> dict[str, float]:
+    """Compute binary-relevance recall@k, MRR, and nDCG@k for one query."""
+    ks = k_values or [1, 3, 5, 10]
+    if not ranked_document_ids or len(ranked_document_ids) != len(set(ranked_document_ids)):
+        raise ValueError("ranked document ids must be non-empty and unique")
+    if not relevant_document_ids or len(relevant_document_ids) != len(set(relevant_document_ids)):
+        raise ValueError("relevant document ids must be non-empty and unique")
+    if not ks or any(not isinstance(k, int) or isinstance(k, bool) or k < 1 for k in ks):
+        raise ValueError("k values must be positive integers")
+    relevant = set(relevant_document_ids)
+    first_relevant = next((index for index, item in enumerate(ranked_document_ids, 1) if item in relevant), None)
+    result = {"mrr": 1 / first_relevant if first_relevant else 0.0}
+    for k in sorted(set(ks)):
+        top = ranked_document_ids[:k]
+        found = sum(item in relevant for item in top)
+        dcg = sum(1 / math.log2(index + 1) for index, item in enumerate(top, 1) if item in relevant)
+        ideal_hits = min(k, len(relevant))
+        ideal = sum(1 / math.log2(index + 1) for index in range(1, ideal_hits + 1))
+        result[f"recall@{k}"] = found / len(relevant)
+        result[f"ndcg@{k}"] = dcg / ideal if ideal else 0.0
+    return {key: round(value, 8) for key, value in result.items()}
+
+
 async def evaluate_cases(cases: list[dict[str, Any]], base_url: str, api_key: str | None = None,
                         transport: httpx.AsyncBaseTransport | None = None,
                         application: str = "llm-gateway-eval",
@@ -181,7 +205,10 @@ def compare_saved_runs(baseline_run: dict[str, Any], candidate_run: dict[str, An
                        *, min_pass_rate: float | None = None,
                        max_cost_regression_percent: float | None = None,
                        max_latency_regression_percent: float | None = None,
-                       max_failure_rate: float | None = None) -> dict[str, Any]:
+                       max_failure_rate: float | None = None,
+                       min_recall_at_5: float | None = None,
+                       min_mrr: float | None = None,
+                       min_ndcg_at_5: float | None = None) -> dict[str, Any]:
     """Compare stored run summaries by route, including a conservative pass-rate CI."""
     baseline_routes, baseline_results = _saved_run_routes(baseline_run["report"])
     candidate_routes, candidate_results = _saved_run_routes(candidate_run["report"])
@@ -217,6 +244,13 @@ def compare_saved_runs(baseline_run: dict[str, Any], candidate_run: dict[str, An
         candidate_errors = sum(1 for row in candidate_results
                                if row.get("route") == route and "error" in row)
         failure_rate = candidate_errors / max(int(after.get("requests", 0)), 1)
+        before_quality = before.get("retrieval_metrics", {})
+        after_quality = after.get("retrieval_metrics", {})
+        quality_deltas = {}
+        for metric in ("recall@5", "mrr", "ndcg@5"):
+            before_value, after_value = before_quality.get(metric), after_quality.get(metric)
+            quality_deltas[metric] = (round(float(after_value) - float(before_value), 8)
+                                      if before_value is not None and after_value is not None else None)
         route_diffs[route] = {
             "change": "compared", "baseline": before, "candidate": after,
             "deltas": {"pass_rate": pass_delta,
@@ -230,6 +264,8 @@ def compare_saved_runs(baseline_run: dict[str, Any], candidate_run: dict[str, An
                 "latency_regression_percent": latency_regression,
                 "failures": int(after.get("failures", 0)) - int(before.get("failures", 0)),
                 "candidate_failure_rate": round(failure_rate, 4)},
+            "retrieval_metrics": {"baseline": before_quality or None, "candidate": after_quality or None,
+                                  "deltas": quality_deltas},
         }
         if min_pass_rate is not None:
             checks.append(after_pass is not None and after_pass >= min_pass_rate)
@@ -239,6 +275,11 @@ def compare_saved_runs(baseline_run: dict[str, Any], candidate_run: dict[str, An
             checks.append(latency_regression != "infinite" and latency_regression <= max_latency_regression_percent)
         if max_failure_rate is not None:
             checks.append(failure_rate <= max_failure_rate)
+        for threshold, metric in ((min_recall_at_5, "recall@5"), (min_mrr, "mrr"),
+                                  (min_ndcg_at_5, "ndcg@5")):
+            if threshold is not None:
+                value = after_quality.get(metric)
+                checks.append(value is not None and float(value) >= threshold)
 
     candidate_check_passed = not any(row.get("passed") is False for row in candidate_results)
     return {"baseline_run_id": baseline_run["run_id"], "candidate_run_id": candidate_run["run_id"],

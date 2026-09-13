@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import time
@@ -9,6 +10,28 @@ from typing import Any
 from redis.exceptions import RedisError
 
 logger = logging.getLogger(__name__)
+
+
+class EmbeddingCache:
+    """Vector cache whose key never contains the source text and is tenant scoped."""
+
+    def __init__(self, backend: Any | None = None) -> None:
+        self.backend = backend or ResponseCache()
+
+    @staticmethod
+    def key(text: str, *, tenant: str, provider: str, model: str,
+            pricing_version: str, secret: str) -> str:
+        digest = hmac.new(secret.encode(), text.encode("utf-8"), hashlib.sha256).hexdigest()
+        namespace = json.dumps([tenant, provider, model, pricing_version, digest], separators=(",", ":"))
+        return "embedding:" + hashlib.sha256(namespace.encode()).hexdigest()
+
+    async def get(self, key: str) -> list[float] | None:
+        item = await self.backend.get(key)
+        vector = item.get("embedding") if item else None
+        return vector if isinstance(vector, list) else None
+
+    async def put(self, key: str, vector: list[float], ttl_seconds: int) -> None:
+        await self.backend.put(key, {"embedding": vector}, ttl_seconds)
 
 class ResponseCache:
     def __init__(self, max_entries: int = 2_000) -> None:

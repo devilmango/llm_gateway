@@ -1920,6 +1920,117 @@ async def test_embeddings_and_rerank_are_billed_and_reported_by_operation(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_rerank_uses_native_provider_and_tracks_cost(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("COHERE_KEY", "cohere-secret")
+    cfg = config(str(tmp_path / "native-rerank.sqlite3"))
+    cfg["providers"]["cohere"] = {"kind": "cohere", "base_url": "https://cohere.test/v2",
+        "api_key_env": "COHERE_KEY", "models": {"rank-v1": {
+            "rerank_cost_per_1k_documents": 2, "pricing_version": "rank-price-v1"}}}
+    cfg["embedding_routes"] = {"retrieval": {"provider": "primary", "model": "embed-model",
+        "reranker": {"provider": "cohere", "model": "rank-v1", "fallback": "cosine"}}}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v2/rerank"
+        return httpx.Response(200, json={"results": [{"index": 1, "relevance_score": 0.95},
+            {"index": 0, "relevance_score": 0.1}], "meta": {"billed_units": {"search_units": 1}}})
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        result = await client.post("/v1/rerank", json={"model": "retrieval", "query": "q",
+            "documents": ["first", "second"], "application": "search"})
+        assert result.status_code == 200
+        body = result.json()
+        assert body["gateway"]["reranker"] == "cohere"
+        assert body["gateway"]["cost_usd"] == pytest.approx(0.004)
+        assert body["results"][0]["document"] == "second"
+        report = (await client.get("/v1/admin/report", params={"application": "search"})).json()
+        assert report["cost_usd"] == pytest.approx(0.004)
+
+
+@pytest.mark.asyncio
+async def test_native_rerank_falls_back_to_cosine_before_returning_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("COHERE_KEY", "cohere-secret")
+    cfg = config(str(tmp_path / "native-rerank-fallback.sqlite3"))
+    cfg["providers"]["cohere"] = {"kind": "cohere", "base_url": "https://cohere.test/v2",
+        "api_key_env": "COHERE_KEY", "models": {"rank-v1": {"rerank_cost_per_1k_documents": 2}}}
+    cfg["providers"]["primary"]["models"]["embed-model"] = {"input_cost_per_1m": 1}
+    cfg["embedding_routes"] = {"retrieval": {"provider": "primary", "model": "embed-model",
+        "reranker": {"provider": "cohere", "model": "rank-v1", "fallback": "cosine"}}}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2/rerank":
+            return httpx.Response(503)
+        values = json.loads(request.content)["input"]
+        vectors = [[1.0, 0.0] if value in {"query", "best"} else [0.0, 1.0] for value in values]
+        return httpx.Response(200, json={"model": "embed-model", "data": [
+            {"index": index, "embedding": vector} for index, vector in enumerate(vectors)],
+            "usage": {"prompt_tokens": len(values) * 2, "total_tokens": len(values) * 2}})
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        result = await client.post("/v1/rerank", json={"model": "retrieval", "query": "query",
+            "documents": ["other", "best"]})
+        assert result.status_code == 200
+        assert result.json()["gateway"]["reranker"] == "cosine_similarity"
+        assert result.json()["gateway"]["native_fallback"] is True
+        assert result.json()["results"][0]["index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_embedding_cache_reuses_vectors_only_with_same_tenant_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("EMBED_CACHE_KEY", "stable-private-cache-key")
+    cfg = config(str(tmp_path / "embedding-cache.sqlite3"))
+    cfg["embedding_routes"] = {"retrieval": {"provider": "primary", "model": "embed-model"}}
+    cfg["retrieval"] = {"embedding_cache": {"enabled": True, "ttl_seconds": 60,
+        "hmac_key_env": "EMBED_CACHE_KEY"}}
+    calls = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content)["input"])
+        values = calls[-1]
+        return httpx.Response(200, json={"model": "embed-model", "data": [
+            {"index": index, "embedding": [1.0, float(index)]} for index, _ in enumerate(values)],
+            "usage": {"prompt_tokens": len(values) * 2, "total_tokens": len(values) * 2}})
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        first = await client.post("/v1/embeddings", json={"model": "retrieval", "input": "same text"})
+        second = await client.post("/v1/embeddings", json={"model": "retrieval", "input": "same text"})
+        assert first.status_code == second.status_code == 200
+        assert second.json()["usage"]["total_tokens"] == 0
+        assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_retrieval_evaluations_feed_quality_promotion_gates(tmp_path):
+    cfg = config(str(tmp_path / "retrieval-evaluation.sqlite3"))
+    cfg["embedding_routes"] = {"retrieval": {"provider": "primary", "model": "embed-model"}}
+    async with gateway_client(cfg,
+                              httpx.MockTransport(lambda _: success_response())) as client:
+        # Evaluation reports are persisted in the same immutable store as chat evaluations.
+        saved = await client.post("/v1/admin/retrieval/evaluations", json={
+            "dataset_name": "retrieval-golden", "dataset_version": "candidate",
+            "dataset_sha256": "a" * 64, "route": "retrieval", "cases": [
+                {"ranked_document_ids": ["irrelevant", "relevant"], "relevant_document_ids": ["relevant"],
+                 "cost_usd": 0.01, "latency_ms": 20},
+                {"ranked_document_ids": ["relevant", "other"], "relevant_document_ids": ["relevant"],
+                 "cost_usd": 0.02, "latency_ms": 30}]})
+        assert saved.status_code == 200
+        assert saved.json()["summary"]["retrieval_metrics"]["mrr"] == pytest.approx(0.75)
+        baseline = await client.post("/v1/admin/retrieval/evaluations", json={
+            "dataset_name": "retrieval-golden", "dataset_version": "baseline",
+            "dataset_sha256": "b" * 64, "route": "retrieval", "cases": [
+                {"ranked_document_ids": ["relevant", "irrelevant"], "relevant_document_ids": ["relevant"]}]})
+        assert baseline.status_code == 200
+        comparison = await client.post("/v1/admin/evaluations/compare", json={
+            "baseline_run_id": baseline.json()["run_id"], "candidate_run_id": saved.json()["run_id"],
+            "min_mrr": 0.8})
+        assert comparison.status_code == 200
+        assert comparison.json()["report"]["promotion_passed"] is False
+        assert comparison.json()["report"]["routes"]["retrieval"]["retrieval_metrics"]["candidate"]["mrr"] == 0.75
+
+
+@pytest.mark.asyncio
 async def test_tenant_export_and_delete_preserve_audit_record(tmp_path, monkeypatch):
     monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
     cfg = config(str(tmp_path / "tenant-export.sqlite3"))
