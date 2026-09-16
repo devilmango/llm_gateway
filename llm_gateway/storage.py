@@ -135,6 +135,15 @@ class UsageStore:
                 record_counts TEXT NOT NULL
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_tenant_data_audit ON tenant_data_audits(tenant_id, occurred_at)")
+            db.execute("""CREATE TABLE IF NOT EXISTS async_jobs (
+                job_id TEXT PRIMARY KEY, job_type TEXT NOT NULL, tenant_id TEXT, actor TEXT,
+                status TEXT NOT NULL, progress_completed INTEGER NOT NULL DEFAULT 0,
+                progress_total INTEGER NOT NULL DEFAULT 0, usage_json TEXT NOT NULL DEFAULT '{}',
+                manifest_json TEXT, payload_json TEXT, result_json TEXT, error TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, started_at TEXT,
+                completed_at TEXT, lease_until TEXT
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_async_jobs_pending ON async_jobs(status, lease_until, created_at)")
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.database, timeout=10)
@@ -222,6 +231,10 @@ class UsageStore:
             for table in ("tool_call_audits", "tool_execution_outcomes"):
                 cursor = db.execute(f"DELETE FROM {table} WHERE tenant_id=? AND occurred_at < ?", (tenant_id, cutoff))
                 deleted += cursor.rowcount
+            cursor = db.execute("""DELETE FROM async_jobs WHERE tenant_id=? AND created_at < ?
+                AND (status != 'running' OR lease_until <= ?)""",
+                (tenant_id, cutoff, datetime.now(UTC).isoformat()))
+            deleted += cursor.rowcount
             return deleted
 
     def record_tenant_data_audit(self, tenant_id: str, actor: str, action: str,
@@ -248,6 +261,17 @@ class UsageStore:
             for table in ("tool_call_audits", "tool_execution_outcomes"):
                 result[table] = [dict(row) for row in db.execute(
                     f"SELECT * FROM {table} WHERE tenant_id=? ORDER BY occurred_at", (tenant_id,)).fetchall()]
+            jobs = db.execute("""SELECT job_id, job_type, tenant_id, actor, status,
+                progress_completed, progress_total, usage_json, manifest_json, error,
+                created_at, updated_at, started_at, completed_at
+                FROM async_jobs WHERE tenant_id=? ORDER BY created_at""", (tenant_id,)).fetchall()
+            result["async_jobs"] = []
+            for row in jobs:
+                job = dict(row)
+                for column in ("usage_json", "manifest_json"):
+                    raw = job.pop(column)
+                    job[column.removesuffix("_json")] = json.loads(raw) if raw is not None else None
+                result["async_jobs"].append(job)
             if actor:
                 counts = {name: len(rows) for name, rows in result.items()}
                 db.execute("INSERT INTO tenant_data_audits (occurred_at, tenant_id, actor, action, record_counts) VALUES (?, ?, ?, ?, ?)",
@@ -258,7 +282,8 @@ class UsageStore:
                                        for row in audits]
             return result
 
-    def delete_tenant_data(self, tenant_id: str, actor: str | None = None) -> dict[str, int]:
+    def delete_tenant_data(self, tenant_id: str, actor: str | None = None,
+                           preserve_job_id: str | None = None) -> dict[str, int]:
         prefix = f"{tenant_id}:"
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -272,10 +297,127 @@ class UsageStore:
             for table in ("budget_reservations", "budget_alerts", "webhook_outbox"):
                 cursor = db.execute(f"DELETE FROM {table} WHERE substr(application,1,length(?))=?", (prefix, prefix))
                 counts[table] = cursor.rowcount
+            cursor = db.execute("DELETE FROM async_jobs WHERE tenant_id=? AND job_id != COALESCE(?, '')",
+                                (tenant_id, preserve_job_id))
+            counts["async_jobs"] = cursor.rowcount
             if actor:
                 db.execute("INSERT INTO tenant_data_audits (occurred_at, tenant_id, actor, action, record_counts) VALUES (?, ?, ?, ?, ?)",
                     (datetime.now(UTC).isoformat(), tenant_id, actor, "delete", json.dumps(counts, sort_keys=True)))
             return counts
+
+    def tenant_data_counts(self, tenant_id: str) -> dict[str, int]:
+        prefix = f"{tenant_id}:"
+        with self._lock, self._connect() as db:
+            counts = {}
+            for table in ("requests", "routing_decisions", "shadow_observations"):
+                counts[table] = int(db.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE substr(application,1,length(?))=?",
+                    (prefix, prefix)).fetchone()[0])
+            for table in ("tool_call_audits", "tool_execution_outcomes"):
+                counts[table] = int(db.execute(f"SELECT COUNT(*) FROM {table} WHERE tenant_id=?",
+                                               (tenant_id,)).fetchone()[0])
+            counts["async_jobs"] = int(db.execute("SELECT COUNT(*) FROM async_jobs WHERE tenant_id=?",
+                                                  (tenant_id,)).fetchone()[0])
+            return counts
+
+    def create_async_job(self, job_type: str, tenant_id: str | None, actor: str | None,
+                         payload: dict[str, Any], progress_total: int) -> dict[str, Any]:
+        job_id, now = "job_" + uuid.uuid4().hex, datetime.now(UTC).isoformat()
+        with self._lock, self._connect() as db:
+            db.execute("""INSERT INTO async_jobs (job_id, job_type, tenant_id, actor, status,
+                progress_total, payload_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)""",
+                (job_id, job_type, tenant_id, actor, progress_total,
+                 json.dumps(payload, separators=(",", ":")), now, now))
+        return self.async_job(job_id) or {}
+
+    def async_job(self, job_id: str, *, include_payload: bool = False,
+                  include_results: bool = False) -> dict[str, Any] | None:
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT * FROM async_jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                return None
+            job = dict(row)
+        for source, target in (("usage_json", "usage"), ("manifest_json", "manifest"),
+                               ("payload_json", "payload"), ("result_json", "result")):
+            raw = job.pop(source)
+            if raw is not None and (target in {"usage", "manifest"} or
+                                    (target == "payload" and include_payload) or
+                                    (target == "result" and include_results)):
+                job[target] = json.loads(raw)
+        if not include_payload:
+            job.pop("payload", None)
+        if not include_results:
+            job.pop("result", None)
+        job.pop("lease_until", None)
+        return job
+
+    def pending_async_jobs(self, limit: int = 20) -> list[str]:
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connect() as db:
+            rows = db.execute("""SELECT job_id FROM async_jobs WHERE status='queued'
+                OR (status='running' AND lease_until <= ?) ORDER BY created_at LIMIT ?""",
+                (now, limit)).fetchall()
+            return [row["job_id"] for row in rows]
+
+    def claim_async_job(self, job_id: str, lease_seconds: int = 300) -> bool:
+        now = datetime.now(UTC)
+        lease_until = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute("""UPDATE async_jobs SET status='running', started_at=COALESCE(started_at, ?),
+                updated_at=?, lease_until=? WHERE job_id=? AND (status='queued'
+                OR (status='running' AND lease_until <= ?))""",
+                (now.isoformat(), now.isoformat(), lease_until, job_id, now.isoformat()))
+            return cursor.rowcount == 1
+
+    def update_async_job(self, job_id: str, *, status: str | None = None,
+                         progress_completed: int | None = None, usage: dict[str, Any] | None = None,
+                         manifest: dict[str, Any] | None = None, result: Any = None,
+                         error: str | None = None, clear_payload: bool = False,
+                         lease_seconds: int = 300) -> None:
+        now = datetime.now(UTC)
+        assignments, values = ["updated_at=?"], [now.isoformat()]
+        if status is not None:
+            assignments.append("status=?")
+            values.append(status)
+        if progress_completed is not None:
+            assignments.append("progress_completed=?")
+            values.append(int(progress_completed))
+        if usage is not None:
+            assignments.append("usage_json=?")
+            values.append(json.dumps(usage, separators=(",", ":")))
+        if manifest is not None:
+            assignments.append("manifest_json=?")
+            values.append(json.dumps(manifest, separators=(",", ":")))
+        if result is not None:
+            assignments.append("result_json=?")
+            values.append(json.dumps(result, separators=(",", ":")))
+        if error is not None:
+            assignments.append("error=?")
+            values.append(error[:500])
+        if clear_payload:
+            assignments.append("payload_json=NULL")
+        terminal = status in {"completed", "failed", "cancelled"}
+        assignments.extend(["completed_at=?", "lease_until=?"])
+        values.extend([now.isoformat() if terminal else None,
+                       None if terminal else (now + timedelta(seconds=lease_seconds)).isoformat()])
+        values.append(job_id)
+        with self._lock, self._connect() as db:
+            db.execute(f"UPDATE async_jobs SET {', '.join(assignments)} WHERE job_id=?", values)
+
+    def finish_tenant_data_job(self, job_id: str, tenant_id: str, actor: str, action: str,
+                               record_counts: dict[str, int], result: dict[str, Any],
+                               manifest: dict[str, Any]) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""UPDATE async_jobs SET status='completed', progress_completed=progress_total,
+                manifest_json=?, result_json=?, payload_json=NULL, updated_at=?, completed_at=?, lease_until=NULL
+                WHERE job_id=?""", (json.dumps(manifest, separators=(",", ":")),
+                json.dumps(result, separators=(",", ":"), default=str), now, now, job_id))
+            db.execute("""INSERT INTO tenant_data_audits
+                (occurred_at, tenant_id, actor, action, record_counts) VALUES (?, ?, ?, ?, ?)""",
+                (now, tenant_id, actor, action, json.dumps(record_counts, sort_keys=True)))
 
     def reconcile_costs(self, records: list[dict[str, Any]], source: str,
                         reconciled_at: datetime | None = None) -> dict[str, Any]:

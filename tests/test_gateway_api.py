@@ -1920,6 +1920,87 @@ async def test_embeddings_and_rerank_are_billed_and_reported_by_operation(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_async_embedding_job_batches_reports_progress_usage_and_item_results(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    cfg = config(str(tmp_path / "embedding-jobs.sqlite3"))
+    cfg["providers"]["primary"]["models"]["embed-model"] = {"input_cost_per_1m": 1}
+    cfg["providers"]["primary"]["max_embedding_batch_size"] = 2
+    cfg["embedding_routes"] = {"retrieval": {"provider": "primary", "model": "embed-model"}}
+    batches = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        inputs = json.loads(request.content)["input"]
+        batches.append(inputs)
+        if "bad-item" in inputs:
+            return httpx.Response(400)
+        return httpx.Response(200, json={"model": "embed-model", "data": [
+            {"index": index, "embedding": [float(len(value)), 1.0]} for index, value in enumerate(inputs)],
+            "usage": {"prompt_tokens": len(inputs) * 3, "total_tokens": len(inputs) * 3}})
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        created = await client.post("/v1/embeddings/jobs", json={"model": "retrieval",
+            "input": ["one", "bad-item", "three", "four", "five"], "application": "batch-search"})
+        assert created.status_code == 202
+        job_id = created.json()["job_id"]
+        for _ in range(100):
+            status = await client.get(f"/v1/embeddings/jobs/{job_id}")
+            if status.json()["status"] in {"completed", "failed"}:
+                break
+            await asyncio.sleep(0.01)
+        assert status.json()["status"] == "completed"
+        assert status.json()["progress"] == {"completed": 5, "total": 5}
+        assert status.json()["usage"]["total_tokens"] == 12
+        results = await client.get(f"/v1/embeddings/jobs/{job_id}/results")
+        assert results.status_code == 200
+        assert [item["status"] for item in results.json()["items"]] == [
+            "succeeded", "failed", "succeeded", "succeeded", "succeeded"]
+        assert results.json()["items"][0]["embedding"] == [3.0, 1.0]
+        assert batches[0] == ["one", "bad-item"]
+
+
+@pytest.mark.asyncio
+async def test_tenant_export_and_deletion_can_run_as_audited_jobs(tmp_path, monkeypatch):
+    monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+    cfg = config(str(tmp_path / "tenant-data-jobs.sqlite3"))
+    cfg["tenants"] = {"tenant-a": {"api_key_env": "TENANT_A_KEY",
+        "data_policy": {"usage_retention_days": 90}}}
+    store = create_usage_store(cfg["server"]["database"])
+    store.record({"request_id": "job-request", "occurred_at": datetime.now(UTC).isoformat(),
+        "application": "tenant-a:search", "route": "retrieval", "provider": "primary",
+        "model": "embed-model", "prompt_tokens": 2, "completion_tokens": 0, "total_tokens": 2,
+        "cost_usd": 0.01, "status": "success", "latency_ms": 10, "fallback_used": 0,
+        "cached": 0, "operation": "embeddings"})
+    async with gateway_client(cfg, httpx.MockTransport(lambda _: success_response())) as client:
+        headers = {"Authorization": "Bearer admin-secret"}
+        queued = await client.get("/v1/admin/tenants/tenant-a/data-export?async=true", headers=headers)
+        assert queued.status_code == 202
+        job_id = queued.json()["job_id"]
+        for _ in range(100):
+            status = await client.get(f"/v1/admin/tenant-data-jobs/{job_id}", headers=headers)
+            if status.json()["status"] in {"completed", "failed"}:
+                break
+            await asyncio.sleep(0.01)
+        assert status.json()["status"] == "completed"
+        assert status.json()["manifest"]["record_counts"]["requests"] == 1
+        exported = await client.get(f"/v1/admin/tenant-data-jobs/{job_id}/results", headers=headers)
+        assert exported.json()["data"]["requests"][0]["request_id"] == "job-request"
+
+        deletion = await client.delete("/v1/admin/tenants/tenant-a/data?confirm_tenant_id=tenant-a&async=true",
+                                       headers=headers)
+        assert deletion.status_code == 202
+        delete_id = deletion.json()["job_id"]
+        for _ in range(100):
+            status = await client.get(f"/v1/admin/tenant-data-jobs/{delete_id}", headers=headers)
+            if status.json()["status"] in {"completed", "failed"}:
+                break
+            await asyncio.sleep(0.01)
+        assert status.json()["status"] == "completed"
+        assert status.json()["manifest"]["deleted_record_counts"]["requests"] == 1
+        assert store.async_job(job_id) is None
+        assert store.tenant_data_audits("tenant-a")[0]["action"] == "delete_job_completed"
+
+
+@pytest.mark.asyncio
 async def test_rerank_uses_native_provider_and_tracks_cost(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
     monkeypatch.setenv("COHERE_KEY", "cohere-secret")

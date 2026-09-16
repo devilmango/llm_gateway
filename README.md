@@ -202,9 +202,9 @@ tenants:
         max_input_bytes: 32768
 ```
 
-Each route has a primary `provider` and `model`, an ordered optional `fallbacks` list, and optional cache settings. A route can also define a `canary` with `provider`, `model`, and `traffic_percent` from 0 to 100. A request ID hash makes sampling stable for that request; selected canary traffic bypasses route caching and falls back to the configured primary/fallback candidates if needed. Provider `kind` values include `openai`, `azure_openai`, `vllm`, `anthropic`, `gemini`, `vertex`, and `bedrock`.
+Each route has a primary `provider` and `model`, an ordered optional `fallbacks` list, and optional cache settings. A route can also define a `canary` with `provider`, `model`, and `traffic_percent` from 0 to 100. A request ID hash makes sampling stable for that request; selected canary traffic bypasses route caching and falls back to the configured primary/fallback candidates if needed. Provider `kind` values include `openai`, `azure_openai`, `vllm`, `anthropic`, `gemini`, `vertex`, `bedrock`, `cohere`, and `voyage`.
 
-`allowed_providers`, `allowed_models`, and `allowed_regions` are optional tenant restrictions and apply to the route's primary, canary, and fallback candidates. Set each provider's `data_region` to the region where that deployment processes tenant data; untagged providers are treated as `global`. The gateway uses these tags as operator-supplied policy metadata and does not independently verify provider residency. Tenant `data_policy.usage_retention_days` removes expired usage and tenant audit metadata every 24 hours. The minimum is 35 days to preserve full current-month budget accounting; prompt and completion content is not stored in the ledger. Operators with the `tenant_data` admin scope can export retained records from `/v1/admin/tenants/{tenant_id}/data-export` or explicitly delete tenant usage and associated audit metadata with `DELETE /v1/admin/tenants/{tenant_id}/data?confirm_tenant_id={tenant_id}`. Both workflows require a configured retention policy. Each operation writes a durable tenant data audit record; deletion preserves its audit event and does not erase that operation history.
+`allowed_providers`, `allowed_models`, and `allowed_regions` are optional tenant restrictions and apply to the route's primary, canary, and fallback candidates. Set each provider's `data_region` to the region where that deployment processes tenant data; untagged providers are treated as `global`. The gateway uses these tags as operator-supplied policy metadata and does not independently verify provider residency. Tenant `data_policy.usage_retention_days` removes expired usage and tenant audit metadata every 24 hours. The minimum is 35 days to preserve full current-month budget accounting; prompt and completion content is not stored in the ledger. Operators with the `tenant_data` admin scope can export retained records from `/v1/admin/tenants/{tenant_id}/data-export` or explicitly delete tenant usage and associated audit metadata with `DELETE /v1/admin/tenants/{tenant_id}/data?confirm_tenant_id={tenant_id}`. Both workflows require a configured retention policy. Small requests remain synchronous; add `?async=true` to force a job, or configure `tenant_data.async_threshold_records` (default 10,000) to automatically queue larger operations. Poll `/v1/admin/tenant-data-jobs/{job_id}` for progress and the manifest, then fetch completed export data from `/results`. Job completion writes a tenant audit record; deletion removes older tenant job payloads and results while preserving its own job and audit event.
 
 ### Pricing configuration
 
@@ -285,6 +285,10 @@ embedding_routes:
 ```
 
 `POST /v1/embeddings` accepts a string or list of strings in `input`, and `model` names the configured logical embedding route. The response uses the OpenAI embeddings list shape with a `gateway` object for provider, upstream model, request ID, and cost. `POST /v1/rerank` accepts `model`, `query`, `documents`, and optional `top_n`; it returns the original document/index and relevance score, using the configured cross-encoder or cosine similarity.
+
+For long-running batches, submit a list to `POST /v1/embeddings/jobs` (up to 50,000 items and 20 MB total input). The worker selects a safe batch size from the configured provider candidates and `max_embedding_batch_size`, reports per-index success/error and cumulative usage, and isolates failed batches to identify bad items. `POST /v1/embeddings` automatically returns `202` with a job ID when its item count exceeds `server.async_embedding_threshold` (default 256). Poll `GET /v1/embeddings/jobs/{job_id}` and fetch completed vectors from `/results`. Inputs are removed from the job record at completion; the result contains vectors and metadata, not the original text.
+
+Tenant data jobs use `?async=true` to force asynchronous execution; large requests are automatically queued based on `tenant_data.async_threshold_records`. Job status includes progress and a manifest with export record counts, byte size, and SHA-256. Export content is available from the job `/results` endpoint after completion. Job completion audits are retained separately from the exported/deleted tenant records.
 
 Example native provider and route configuration:
 
@@ -390,6 +394,9 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/v1/routes` | Configured route names, providers, models, fallbacks, and cache policy. |
 | `POST` | `/v1/chat/completions` | Make a routed chat completion. |
 | `POST` | `/v1/embeddings` | Create normalized vectors through an embedding route. |
+| `POST` | `/v1/embeddings/jobs` | Queue large embedding batches and report per-item outcomes and aggregate usage. |
+| `GET` | `/v1/embeddings/jobs/{job_id}` | Read embedding job status and progress. |
+| `GET` | `/v1/embeddings/jobs/{job_id}/results` | Retrieve completed embedding vectors and per-item errors. |
 | `POST` | `/v1/rerank` | Rank documents with a native cross-encoder or cosine fallback. |
 | `POST` | `/v1/admin/retrieval/evaluations` | Persist labeled ranking metrics and observed cost/latency for a route. |
 | `GET` | `/admin` | Operations dashboard shell; data loads through authenticated admin APIs. |
@@ -405,6 +412,8 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/v1/admin/audit` | Recent authenticated admin API access events. |
 | `GET` | `/v1/admin/tenants/{tenant_id}/data-export` | Export retained usage and tenant audit metadata; requires `tenant_data` scope and configured retention. |
 | `DELETE` | `/v1/admin/tenants/{tenant_id}/data?confirm_tenant_id=...` | Remove tenant usage and associated audit metadata while retaining the deletion audit event. |
+| `GET` | `/v1/admin/tenant-data-jobs/{job_id}` | Read export/deletion job status, progress, and manifest. |
+| `GET` | `/v1/admin/tenant-data-jobs/{job_id}/results` | Retrieve a completed tenant export or deletion manifest. |
 | `GET` | `/v1/admin/tool-audit` | Metadata-only tool-call decisions, optionally filtered by tenant. |
 | `POST` | `/v1/admin/tool-approvals` | Record approval, denial, or revocation for a gated tool call. Requires the `tool_approvals` scope. |
 | `GET` | `/v1/tool-approvals/{request_id}/{tool_call_id}` | Query approval state before the application executes a gated tool call. |

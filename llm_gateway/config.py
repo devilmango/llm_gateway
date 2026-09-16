@@ -14,6 +14,23 @@ MIN_TENANT_USAGE_RETENTION_DAYS = 35
 
 
 def validate_tenant_policies(config: dict[str, Any]) -> None:
+    server = config.get("server", {})
+    for key, default in (("async_embedding_threshold", 256), ("async_job_lease_seconds", 300),
+                         ("async_job_concurrency", 4)):
+        value = server.get(key, default)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"server.{key} must be a positive integer")
+    tenant_data = config.get("tenant_data", {})
+    if not isinstance(tenant_data, dict):
+        raise TypeError("tenant_data must be an object")
+    threshold = tenant_data.get("async_threshold_records", 10_000)
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 1:
+        raise ValueError("tenant_data.async_threshold_records must be a positive integer")
+    for provider_name, provider in config.get("providers", {}).items():
+        batch_size = provider.get("max_embedding_batch_size")
+        if batch_size is not None and (not isinstance(batch_size, int) or isinstance(batch_size, bool)
+                                       or batch_size < 1 or batch_size > 50_000):
+            raise ValueError(f"Provider {provider_name!r} max_embedding_batch_size must be between 1 and 50000")
     governance = config.get("tool_governance", {})
     if not isinstance(governance, dict):
         raise TypeError("tool_governance must be an object")

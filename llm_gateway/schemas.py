@@ -227,6 +227,21 @@ class EmbeddingsRequest(BaseModel):
         return self
 
 
+class EmbeddingBatchJobRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=120)
+    input: list[str] = Field(min_length=1, max_length=50_000)
+    application: str = Field(default="default", max_length=120)
+    cost_center: str | None = Field(default=None, max_length=120)
+
+    @model_validator(mode="after")
+    def validate_inputs(self) -> EmbeddingBatchJobRequest:
+        if any(not value.strip() or len(value) > 100_000 for value in self.input):
+            raise ValueError("input items must be non-empty strings of at most 100000 characters")
+        if sum(len(value.encode("utf-8")) for value in self.input) > 20_000_000:
+            raise ValueError("total embedding job input must not exceed 20 MB")
+        return self
+
+
 class RerankRequest(BaseModel):
     model: str = Field(min_length=1, max_length=120)
     query: str = Field(min_length=1, max_length=100_000)
