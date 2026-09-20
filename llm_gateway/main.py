@@ -21,6 +21,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from opentelemetry import trace
 
+from .artifacts import create_artifact_store
 from .billing_import import normalize_billing_export
 from .capabilities import provider_capabilities
 from .config import load_config, validate_tenant_policies
@@ -66,6 +67,7 @@ from .schemas import (
     PromotionEvaluateRequest,
     RerankRequest,
     RetrievalEvaluationCreate,
+    RetrievalEvaluationJobCreate,
     ToolApprovalDecisionRequest,
     ToolExecutionOutcomeRequest,
     Usage,
@@ -156,11 +158,23 @@ async def _tenant_retention_loop(app: FastAPI, tenants: dict[str, Any]) -> None:
 
 def _async_job_response(job: dict[str, Any]) -> dict[str, Any]:
     total, completed = int(job.get("progress_total", 0)), int(job.get("progress_completed", 0))
+    started = datetime.fromisoformat(job["started_at"]) if job.get("started_at") else None
+    ended = datetime.fromisoformat(job["completed_at"]) if job.get("completed_at") else datetime.now(UTC)
+    duration_ms = max(0, int((ended - started).total_seconds() * 1000)) if started else None
     return {"job_id": job["job_id"], "job_type": job["job_type"], "status": job["status"],
         "progress": {"completed": completed, "total": total}, "usage": job.get("usage", {}),
         "manifest": job.get("manifest"), "error": job.get("error"),
+        "attempt_count": job.get("attempt_count", 0), "max_attempts": job.get("max_attempts", 5),
+        "duration_ms": duration_ms, "cancel_requested": bool(job.get("cancel_requested", False)),
         "created_at": job.get("created_at"), "updated_at": job.get("updated_at"),
         "completed_at": job.get("completed_at")}
+
+
+async def _check_job_cancelled(app: FastAPI, job_id: str) -> None:
+    if await asyncio.to_thread(app.state.store.async_job_cancel_requested, job_id):
+        await asyncio.to_thread(app.state.store.update_async_job, job_id, status="cancelled",
+                                error="cancelled_by_operator", clear_payload=True)
+        raise asyncio.CancelledError
 
 
 async def _process_embedding_job(app: FastAPI, job: dict[str, Any]) -> None:
@@ -189,6 +203,7 @@ async def _process_embedding_job(app: FastAPI, job: dict[str, Any]) -> None:
     lease_seconds = int(app.state.config.get("server", {}).get("async_job_lease_seconds", 300))
 
     async def run_batch(batch: list[tuple[int, str]]) -> None:
+        await _check_job_cancelled(app, job["job_id"])
         try:
             vectors, info = await app.state.run_retrieval(fake_request, payload["model"],
                 [value for _, value in batch], payload["application"], payload.get("cost_center"),
@@ -202,7 +217,6 @@ async def _process_embedding_job(app: FastAPI, job: dict[str, Any]) -> None:
                     "provider": info["provider"], "model": info["model"]})
                 await asyncio.to_thread(app.state.store.update_async_job, job["job_id"],
                     progress_completed=len(results), usage=usage,
-                    result={"items": sorted(results, key=lambda row: row["index"]), "usage": usage},
                     lease_seconds=lease_seconds)
         except HTTPException as exc:
             if exc.status_code == 502 and len(batch) > 1:
@@ -214,7 +228,6 @@ async def _process_embedding_job(app: FastAPI, job: dict[str, Any]) -> None:
                     "error": f"embedding_request_failed_{exc.status_code}"})
                 await asyncio.to_thread(app.state.store.update_async_job, job["job_id"],
                     progress_completed=len(results), usage=usage,
-                    result={"items": sorted(results, key=lambda row: row["index"]), "usage": usage},
                     lease_seconds=lease_seconds)
 
     for start in range(0, len(inputs), batch_size):
@@ -225,9 +238,16 @@ async def _process_embedding_job(app: FastAPI, job: dict[str, Any]) -> None:
         "succeeded": sum(item["status"] == "succeeded" for item in results),
         "failed": sum(item["status"] == "failed" for item in results),
         "usage": usage}
+    await _check_job_cancelled(app, job["job_id"])
+    artifact_key = f"jobs/{job['job_id']}/results.json"
+    artifact_body = json.dumps({"items": results, "usage": usage, "manifest": manifest},
+                               separators=(",", ":")).encode()
+    await asyncio.to_thread(app.state.artifacts.put, artifact_key, artifact_body)
+    manifest["artifact_key"] = artifact_key
+    manifest["artifact_bytes"] = len(artifact_body)
     await asyncio.to_thread(app.state.store.update_async_job, job["job_id"], status="completed",
         progress_completed=len(results), usage=usage, manifest=manifest,
-        result={"items": results, "usage": usage, "manifest": manifest}, clear_payload=True)
+        result={"artifact_key": artifact_key, "format": "application/json"}, clear_payload=True)
 
 
 async def _process_tenant_data_job(app: FastAPI, job: dict[str, Any]) -> None:
@@ -238,14 +258,85 @@ async def _process_tenant_data_job(app: FastAPI, job: dict[str, Any]) -> None:
         encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode()
         manifest = {"record_counts": counts, "bytes": len(encoded),
                     "sha256": hashlib.sha256(encoded).hexdigest(), "format": "application/json"}
-        result = {"tenant_id": tenant_id, "data": data, "manifest": manifest}
+        artifact_key = f"jobs/{job['job_id']}/tenant-export.json"
+        await asyncio.to_thread(app.state.artifacts.put, artifact_key, encoded)
+        manifest["artifact_key"] = artifact_key
+        manifest["artifact_bytes"] = len(encoded)
+        result = {"tenant_id": tenant_id, "manifest": manifest,
+                  "download_url": f"/v1/admin/tenant-data-jobs/{job['job_id']}/download"}
         await asyncio.to_thread(app.state.store.finish_tenant_data_job, job["job_id"], tenant_id,
             actor, "export_job_completed", counts, result, manifest)
         return
+    artifact_keys = await asyncio.to_thread(app.state.store.tenant_job_artifact_keys, tenant_id, job["job_id"])
+    for artifact_key in artifact_keys:
+        await asyncio.to_thread(app.state.artifacts.delete, artifact_key)
     counts = await asyncio.to_thread(app.state.store.delete_tenant_data, tenant_id, None, job["job_id"])
+    counts["artifacts"] = len(artifact_keys)
     manifest = {"deleted_record_counts": counts, "record_count": sum(counts.values())}
     await asyncio.to_thread(app.state.store.finish_tenant_data_job, job["job_id"], tenant_id,
         actor, "delete_job_completed", counts, {"tenant_id": tenant_id, "manifest": manifest}, manifest)
+
+
+async def _process_retrieval_evaluation_job(app: FastAPI, job: dict[str, Any]) -> None:
+    payload = job["payload"]
+    fake_request = SimpleNamespace(app=app)
+    case_reports: dict[str, list[dict[str, Any]]] = {"baseline": [], "candidate": []}
+    routes = {"baseline": payload["baseline_route"], "candidate": payload["candidate_route"]}
+    for index, case in enumerate(payload["cases"]):
+        await _check_job_cancelled(app, job["job_id"])
+        for side, route in routes.items():
+            started = time.perf_counter()
+            try:
+                response = await app.state.run_rerank(RerankRequest(model=route, query=case["query"],
+                    documents=case["documents"], top_n=len(case["documents"]),
+                    application=payload["application"]), fake_request, None)
+                ranked_ids = [case["document_ids"][int(item["index"])] for item in response["results"]]
+                metrics = retrieval_metrics(ranked_ids, case["relevant_document_ids"])
+                gateway = response.get("gateway", {})
+                case_reports[side].append({"case": case.get("id", str(index)),
+                    "route": payload["candidate_route"],
+                    "passed": True, "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "cost_usd": float(gateway.get("cost_usd", 0)), "retrieval_metrics": metrics})
+            except (HTTPException, ValueError, KeyError, IndexError) as exc:
+                case_reports[side].append({"case": case.get("id", str(index)),
+                    "route": payload["candidate_route"],
+                    "passed": False, "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "cost_usd": 0.0, "error": f"evaluation_case_failed_{type(exc).__name__}",
+                    "retrieval_metrics": {name: 0.0 for name in retrieval_metrics(
+                        ["__missing__"], case["relevant_document_ids"])}})
+        await asyncio.to_thread(app.state.store.update_async_job, job["job_id"],
+            progress_completed=index + 1, lease_seconds=int(app.state.config.get("server", {}).get(
+                "async_job_lease_seconds", 300)))
+
+    saved_runs = {}
+    summaries = {}
+    for side, route in routes.items():
+        await _check_job_cancelled(app, job["job_id"])
+        rows = case_reports[side]
+        metric_names = retrieval_metrics(["__missing__"], ["__relevant__"]).keys()
+        quality = {name: round(sum(row["retrieval_metrics"].get(name, 0) for row in rows) / len(rows), 8)
+                   for name in metric_names}
+        summary = {"requests": len(rows), "failures": sum(not row["passed"] for row in rows),
+            "estimated_cost_usd": round(sum(row["cost_usd"] for row in rows), 8),
+            "average_latency_ms": round(sum(row["latency_ms"] for row in rows) / max(len(rows), 1), 2),
+            "retrieval_metrics": quality, "configured_route": route}
+        summaries[side] = summary
+        version = f"{payload['dataset_version']}-{side}"
+        saved_runs[side] = await asyncio.to_thread(app.state.store.save_evaluation_report,
+            payload["dataset_name"], version, payload["dataset_sha256"], len(rows),
+            {"routes": {payload["candidate_route"]: summary}, "results": rows})
+    baseline_run = await asyncio.to_thread(app.state.store.evaluation_report, saved_runs["baseline"]["run_id"])
+    candidate_run = await asyncio.to_thread(app.state.store.evaluation_report, saved_runs["candidate"]["run_id"])
+    comparison = compare_saved_runs(baseline_run, candidate_run)
+    comparison_ref = await asyncio.to_thread(app.state.store.save_evaluation_comparison,
+        saved_runs["baseline"]["run_id"], saved_runs["candidate"]["run_id"], comparison)
+    result = {"baseline": {**saved_runs["baseline"], "summary": summaries["baseline"]},
+        "candidate": {**saved_runs["candidate"], "summary": summaries["candidate"]},
+        "comparison_id": comparison_ref["comparison_id"], "comparison": comparison}
+    await asyncio.to_thread(app.state.store.update_async_job, job["job_id"], status="completed",
+        progress_completed=len(payload["cases"]),
+        manifest={"case_count": len(payload["cases"]), "comparison_id": comparison_ref["comparison_id"]},
+        result=result, clear_payload=True)
 
 
 async def _run_async_job(app: FastAPI, job_id: str) -> None:
@@ -253,28 +344,44 @@ async def _run_async_job(app: FastAPI, job_id: str) -> None:
     claimed = await asyncio.to_thread(app.state.store.claim_async_job, job_id, lease_seconds)
     if not claimed:
         return
-    job = await asyncio.to_thread(app.state.store.async_job, job_id, include_payload=True)
-    if job is None:
-        return
+    heartbeat = asyncio.create_task(_async_job_lease_heartbeat(app, job_id, lease_seconds))
     try:
+        job = await asyncio.to_thread(app.state.store.async_job, job_id, include_payload=True)
+        if job is None:
+            return
         if job["job_type"] == "embedding_batch":
             await _process_embedding_job(app, job)
         elif job["job_type"] in {"tenant_export", "tenant_delete"}:
+            await _check_job_cancelled(app, job_id)
             await _process_tenant_data_job(app, job)
+        elif job["job_type"] == "retrieval_evaluation":
+            await _process_retrieval_evaluation_job(app, job)
         else:
             raise ValueError("Unknown asynchronous job type")
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         logger.exception("async_job_failed job_id=%s type=%s", job_id, job.get("job_type"))
-        await asyncio.to_thread(app.state.store.update_async_job, job_id, status="failed",
-            error=type(exc).__name__, clear_payload=True)
+        server = app.state.config.get("server", {})
+        status = await asyncio.to_thread(app.state.store.fail_async_job, job_id,
+            type(exc).__name__, max_attempts=int(server.get("async_job_max_attempts", 5)),
+            base_delay_seconds=float(server.get("async_job_retry_base_delay_seconds", 1)),
+            max_delay_seconds=float(server.get("async_job_retry_max_delay_seconds", 300)))
+        logger.info("async_job_failure_recorded job_id=%s status=%s", job_id, status)
+    finally:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
 
 
 async def _async_job_dispatch_loop(app: FastAPI) -> None:
     while True:
         try:
             capacity = int(app.state.config.get("server", {}).get("async_job_concurrency", 4))
+            server = app.state.config.get("server", {})
+            await asyncio.to_thread(app.state.store.recover_stalled_async_jobs,
+                max_attempts=int(server.get("async_job_max_attempts", 5)),
+                base_delay_seconds=float(server.get("async_job_retry_base_delay_seconds", 1)),
+                max_delay_seconds=float(server.get("async_job_retry_max_delay_seconds", 300)))
             available = max(capacity - len(app.state.job_tasks), 0)
             if available:
                 pending = await asyncio.to_thread(app.state.store.pending_async_jobs, available)
@@ -287,6 +394,15 @@ async def _async_job_dispatch_loop(app: FastAPI) -> None:
         except Exception:
             logger.exception("async_job_dispatch_failed")
         await asyncio.sleep(0.1)
+
+
+async def _async_job_lease_heartbeat(app: FastAPI, job_id: str, lease_seconds: int) -> None:
+    interval = max(0.1, lease_seconds / 3)
+    while True:
+        await asyncio.sleep(interval)
+        renewed = await asyncio.to_thread(app.state.store.renew_async_job_lease, job_id, lease_seconds)
+        if not renewed:
+            return
 
 
 async def _record_shadow_observation(app: FastAPI, *, request_id: str, application: str,
@@ -361,6 +477,7 @@ def create_app(config: dict[str, Any] | None = None,
             app.state.gateway = GatewayService(cfg, app.state.http, shared_redis=redis_client)
             database = os.getenv("GATEWAY_DATABASE", cfg["server"].get("database", "./gateway.sqlite3"))
             app.state.store = create_usage_store(database)
+            app.state.artifacts = create_artifact_store(cfg.get("object_storage", {}), database)
             app.state.webhook_task = asyncio.create_task(_webhook_delivery_loop(app))
             app.state.retention_task = asyncio.create_task(
                 _tenant_retention_loop(app, cfg.get("tenants", cfg.get("security", {}).get("tenants", {}))))
@@ -793,7 +910,8 @@ def create_app(config: dict[str, Any] | None = None,
             job = await asyncio.to_thread(request.app.state.store.create_async_job,
                 "embedding_batch", tenant["id"] if tenant else None, body.application,
                 {"model": body.model, "input": inputs, "application": body.application,
-                 "cost_center": body.cost_center}, len(inputs))
+                 "cost_center": body.cost_center}, len(inputs),
+                int(cfg["server"].get("async_job_max_attempts", 5)))
             response.status_code = 202
             return _async_job_response(job)
         vectors, info = await run_retrieval(request, body.model, inputs,
@@ -816,7 +934,7 @@ def create_app(config: dict[str, Any] | None = None,
             raise HTTPException(status_code=403, detail="Tenant policy does not allow this embedding route")
         job = await asyncio.to_thread(request.app.state.store.create_async_job,
             "embedding_batch", tenant["id"] if tenant else None, body.application,
-            body.model_dump(), len(body.input))
+            body.model_dump(), len(body.input), int(cfg["server"].get("async_job_max_attempts", 5)))
         return _async_job_response(job)
 
     @app.get("/v1/embeddings/jobs/{job_id}")
@@ -827,15 +945,49 @@ def create_app(config: dict[str, Any] | None = None,
             raise HTTPException(status_code=404, detail="Embedding job was not found")
         return _async_job_response(job)
 
+    @app.delete("/v1/embeddings/jobs/{job_id}")
+    async def cancel_embedding_job(job_id: str, request: Request,
+                                   tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
+        job = await asyncio.to_thread(request.app.state.store.async_job, job_id)
+        if job is None or job["job_type"] != "embedding_batch" or job.get("tenant_id") != (tenant["id"] if tenant else None):
+            raise HTTPException(status_code=404, detail="Embedding job was not found")
+        cancelled = await asyncio.to_thread(request.app.state.store.cancel_async_job, job_id)
+        return _async_job_response(cancelled or job)
+
     @app.get("/v1/embeddings/jobs/{job_id}/results")
     async def embedding_job_results(job_id: str, request: Request,
+                                    offset: int = Query(default=0, ge=0),
+                                    limit: int = Query(default=100, ge=1, le=1000),
                                     tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
         job = await asyncio.to_thread(request.app.state.store.async_job, job_id, include_results=True)
         if job is None or job["job_type"] != "embedding_batch" or job.get("tenant_id") != (tenant["id"] if tenant else None):
             raise HTTPException(status_code=404, detail="Embedding job was not found")
-        if job["status"] not in {"completed", "failed"}:
+        if job["status"] not in {"completed", "failed", "dead_letter"}:
             raise HTTPException(status_code=409, detail="Embedding job results are not ready")
-        return job.get("result") or {"items": [], "manifest": job.get("manifest")}
+        result = job.get("result") or {}
+        artifact_key = result.get("artifact_key")
+        if artifact_key:
+            try:
+                stored = await asyncio.to_thread(request.app.state.artifacts.get, artifact_key)
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=410, detail="Job result artifact has expired or was removed") from exc
+            result = json.loads(stored)
+        items = result.get("items", [])
+        page = items[offset:offset + limit]
+        return {**{key: value for key, value in result.items() if key != "items"}, "items": page,
+            "pagination": {"offset": offset, "limit": limit, "total": len(items),
+                           "has_more": offset + len(page) < len(items)}}
+
+    @app.get("/v1/admin/async-jobs", dependencies=[Depends(admin_dependency("report"))])
+    async def async_job_queue_report(request: Request) -> dict[str, Any]:
+        return await asyncio.to_thread(request.app.state.store.async_job_stats)
+
+    @app.delete("/v1/admin/async-jobs/{job_id}", dependencies=[Depends(admin_dependency("report"))])
+    async def cancel_async_job(job_id: str, request: Request) -> dict[str, Any]:
+        job = await asyncio.to_thread(request.app.state.store.cancel_async_job, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Async job was not found")
+        return _async_job_response(job)
 
     @app.post("/v1/rerank")
     async def rerank(body: RerankRequest, request: Request,
@@ -961,6 +1113,8 @@ def create_app(config: dict[str, Any] | None = None,
                 "upstream_model": info["model"], "cost_usd": round(info["cost_usd"], 8),
                 "fallback_used": info["fallback_used"], "reranker": "cosine_similarity",
                 "native_fallback": bool(native_candidates)}}
+
+    app.state.run_rerank = rerank
 
     @app.post("/v1/chat/completions", response_model=None)
     async def chat(body: ChatRequest, request: Request,
@@ -1504,7 +1658,8 @@ def create_app(config: dict[str, Any] | None = None,
         threshold = int(cfg.get("tenant_data", {}).get("async_threshold_records", 10_000))
         if async_job or sum(counts.values()) > threshold:
             job = await asyncio.to_thread(request.app.state.store.create_async_job, "tenant_export",
-                tenant_id, actor, {"retention_days": int(retention_days)}, sum(counts.values()))
+                tenant_id, actor, {"retention_days": int(retention_days)}, sum(counts.values()),
+                int(cfg["server"].get("async_job_max_attempts", 5)))
             response.status_code = 202
             return _async_job_response(job)
         exported = await asyncio.to_thread(request.app.state.store.export_tenant_data, tenant_id, actor)
@@ -1531,7 +1686,8 @@ def create_app(config: dict[str, Any] | None = None,
         threshold = int(cfg.get("tenant_data", {}).get("async_threshold_records", 10_000))
         if async_job or sum(counts.values()) > threshold:
             job = await asyncio.to_thread(request.app.state.store.create_async_job, "tenant_delete",
-                tenant_id, actor, {"retention_days": int(retention_days)}, sum(counts.values()))
+                tenant_id, actor, {"retention_days": int(retention_days)}, sum(counts.values()),
+                int(cfg["server"].get("async_job_max_attempts", 5)))
             response.status_code = 202
             return _async_job_response(job)
         counts = await asyncio.to_thread(request.app.state.store.delete_tenant_data, tenant_id, actor)
@@ -1555,7 +1711,29 @@ def create_app(config: dict[str, Any] | None = None,
             raise HTTPException(status_code=404, detail="Tenant data job was not found")
         if job["status"] not in {"completed", "failed"}:
             raise HTTPException(status_code=409, detail="Tenant data job results are not ready")
-        return job.get("result") or {"manifest": job.get("manifest"), "error": job.get("error")}
+        result = job.get("result") or {"error": job.get("error")}
+        if job["job_type"] == "tenant_export" and result.get("manifest", {}).get("artifact_key"):
+            return {"tenant_id": job.get("tenant_id"), "manifest": result["manifest"],
+                "download_url": f"/v1/admin/tenant-data-jobs/{job_id}/download"}
+        return result
+
+    @app.get("/v1/admin/tenant-data-jobs/{job_id}/download",
+             dependencies=[Depends(admin_dependency("tenant_data"))])
+    async def download_tenant_export(job_id: str, request: Request) -> Response:
+        job = await asyncio.to_thread(request.app.state.store.async_job, job_id, include_results=True)
+        if job is None or job["job_type"] != "tenant_export":
+            raise HTTPException(status_code=404, detail="Tenant export job was not found")
+        if job["status"] != "completed":
+            raise HTTPException(status_code=409, detail="Tenant export is not ready")
+        artifact_key = (job.get("manifest") or {}).get("artifact_key")
+        if not artifact_key:
+            raise HTTPException(status_code=410, detail="Tenant export artifact is unavailable")
+        try:
+            content = await asyncio.to_thread(request.app.state.artifacts.get, artifact_key)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=410, detail="Tenant export artifact has expired or was removed") from exc
+        return Response(content=content, media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="tenant-export-{job_id}.json"'})
 
     @app.get("/v1/admin/slos", dependencies=[Depends(admin_dependency("report"))])
     async def slo_report(request: Request,
@@ -1846,6 +2024,41 @@ def create_app(config: dict[str, Any] | None = None,
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"saved": True, **saved, "route": body.route, "summary": summary}
+
+    @app.post("/v1/admin/retrieval/evaluation-jobs", status_code=202,
+              dependencies=[Depends(admin_dependency("report"))])
+    async def create_retrieval_evaluation_job(body: RetrievalEvaluationJobCreate,
+                                              request: Request) -> dict[str, Any]:
+        routes = cfg.get("embedding_routes", {})
+        for route_name in (body.baseline_route, body.candidate_route):
+            route = routes.get(route_name)
+            if route is None:
+                raise HTTPException(status_code=400, detail=f"Unknown retrieval route {route_name!r}")
+            if not provider_capabilities(cfg["providers"][route["provider"]]).get("reranking", False):
+                raise HTTPException(status_code=400, detail=f"Retrieval route {route_name!r} cannot rerank documents")
+        payload = body.model_dump()
+        job = await asyncio.to_thread(request.app.state.store.create_async_job,
+            "retrieval_evaluation", None, getattr(request.state, "admin_actor", "unknown-admin"),
+            payload, len(body.cases), int(cfg["server"].get("async_job_max_attempts", 5)))
+        return _async_job_response(job)
+
+    @app.get("/v1/admin/retrieval/evaluation-jobs/{job_id}",
+             dependencies=[Depends(admin_dependency("report"))])
+    async def retrieval_evaluation_job_status(job_id: str, request: Request) -> dict[str, Any]:
+        job = await asyncio.to_thread(request.app.state.store.async_job, job_id)
+        if job is None or job["job_type"] != "retrieval_evaluation":
+            raise HTTPException(status_code=404, detail="Retrieval evaluation job was not found")
+        return _async_job_response(job)
+
+    @app.get("/v1/admin/retrieval/evaluation-jobs/{job_id}/results",
+             dependencies=[Depends(admin_dependency("report"))])
+    async def retrieval_evaluation_job_results(job_id: str, request: Request) -> dict[str, Any]:
+        job = await asyncio.to_thread(request.app.state.store.async_job, job_id, include_results=True)
+        if job is None or job["job_type"] != "retrieval_evaluation":
+            raise HTTPException(status_code=404, detail="Retrieval evaluation job was not found")
+        if job["status"] not in {"completed", "failed", "dead_letter"}:
+            raise HTTPException(status_code=409, detail="Retrieval evaluation results are not ready")
+        return job.get("result") or {"error": job.get("error"), "manifest": job.get("manifest")}
 
     @app.get("/v1/admin/evaluations", dependencies=[Depends(admin_dependency("report"))])
     async def evaluation_reports(request: Request,

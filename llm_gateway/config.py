@@ -16,10 +16,22 @@ MIN_TENANT_USAGE_RETENTION_DAYS = 35
 def validate_tenant_policies(config: dict[str, Any]) -> None:
     server = config.get("server", {})
     for key, default in (("async_embedding_threshold", 256), ("async_job_lease_seconds", 300),
-                         ("async_job_concurrency", 4)):
+                         ("async_job_concurrency", 4), ("async_job_max_attempts", 5)):
         value = server.get(key, default)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise ValueError(f"server.{key} must be a positive integer")
+    for key, default in (("async_job_retry_base_delay_seconds", 1),
+                         ("async_job_retry_max_delay_seconds", 300)):
+        value = server.get(key, default)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"server.{key} must be a non-negative number")
+    if server.get("async_job_retry_max_delay_seconds", 300) < server.get("async_job_retry_base_delay_seconds", 1):
+        raise ValueError("server.async_job_retry_max_delay_seconds must be at least the retry base delay")
+    object_storage = config.get("object_storage", {})
+    if not isinstance(object_storage, dict) or object_storage.get("backend", "local") not in {"local", "s3"}:
+        raise ValueError("object_storage must configure the 'local' or 's3' backend")
+    if object_storage.get("backend") == "s3" and not object_storage.get("bucket"):
+        raise ValueError("object_storage.bucket is required when using S3")
     tenant_data = config.get("tenant_data", {})
     if not isinstance(tenant_data, dict):
         raise TypeError("tenant_data must be an object")

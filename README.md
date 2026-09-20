@@ -204,7 +204,7 @@ tenants:
 
 Each route has a primary `provider` and `model`, an ordered optional `fallbacks` list, and optional cache settings. A route can also define a `canary` with `provider`, `model`, and `traffic_percent` from 0 to 100. A request ID hash makes sampling stable for that request; selected canary traffic bypasses route caching and falls back to the configured primary/fallback candidates if needed. Provider `kind` values include `openai`, `azure_openai`, `vllm`, `anthropic`, `gemini`, `vertex`, `bedrock`, `cohere`, and `voyage`.
 
-`allowed_providers`, `allowed_models`, and `allowed_regions` are optional tenant restrictions and apply to the route's primary, canary, and fallback candidates. Set each provider's `data_region` to the region where that deployment processes tenant data; untagged providers are treated as `global`. The gateway uses these tags as operator-supplied policy metadata and does not independently verify provider residency. Tenant `data_policy.usage_retention_days` removes expired usage and tenant audit metadata every 24 hours. The minimum is 35 days to preserve full current-month budget accounting; prompt and completion content is not stored in the ledger. Operators with the `tenant_data` admin scope can export retained records from `/v1/admin/tenants/{tenant_id}/data-export` or explicitly delete tenant usage and associated audit metadata with `DELETE /v1/admin/tenants/{tenant_id}/data?confirm_tenant_id={tenant_id}`. Both workflows require a configured retention policy. Small requests remain synchronous; add `?async=true` to force a job, or configure `tenant_data.async_threshold_records` (default 10,000) to automatically queue larger operations. Poll `/v1/admin/tenant-data-jobs/{job_id}` for progress and the manifest, then fetch completed export data from `/results`. Job completion writes a tenant audit record; deletion removes older tenant job payloads and results while preserving its own job and audit event.
+`allowed_providers`, `allowed_models`, and `allowed_regions` are optional tenant restrictions and apply to the route's primary, canary, and fallback candidates. Set each provider's `data_region` to the region where that deployment processes tenant data; untagged providers are treated as `global`. The gateway uses these tags as operator-supplied policy metadata and does not independently verify provider residency. Tenant `data_policy.usage_retention_days` removes expired usage and tenant audit metadata every 24 hours. The minimum is 35 days to preserve full current-month budget accounting; prompt and completion content is not stored in the ledger. Operators with the `tenant_data` admin scope can export retained records from `/v1/admin/tenants/{tenant_id}/data-export` or explicitly delete tenant usage and associated audit metadata with `DELETE /v1/admin/tenants/{tenant_id}/data?confirm_tenant_id={tenant_id}`. Both workflows require a configured retention policy. Small requests remain synchronous; add `?async=true` to force a job, or configure `tenant_data.async_threshold_records` (default 10,000) to automatically queue larger operations. Poll `/v1/admin/tenant-data-jobs/{job_id}` for progress and the manifest, then use the protected `download_url` from `/results` for export files stored in object storage. Job completion writes a tenant audit record; deletion removes older tenant job payloads and results while preserving its own job and audit event.
 
 ### Pricing configuration
 
@@ -286,9 +286,23 @@ embedding_routes:
 
 `POST /v1/embeddings` accepts a string or list of strings in `input`, and `model` names the configured logical embedding route. The response uses the OpenAI embeddings list shape with a `gateway` object for provider, upstream model, request ID, and cost. `POST /v1/rerank` accepts `model`, `query`, `documents`, and optional `top_n`; it returns the original document/index and relevance score, using the configured cross-encoder or cosine similarity.
 
-For long-running batches, submit a list to `POST /v1/embeddings/jobs` (up to 50,000 items and 20 MB total input). The worker selects a safe batch size from the configured provider candidates and `max_embedding_batch_size`, reports per-index success/error and cumulative usage, and isolates failed batches to identify bad items. `POST /v1/embeddings` automatically returns `202` with a job ID when its item count exceeds `server.async_embedding_threshold` (default 256). Poll `GET /v1/embeddings/jobs/{job_id}` and fetch completed vectors from `/results`. Inputs are removed from the job record at completion; the result contains vectors and metadata, not the original text.
+For long-running batches, submit a list to `POST /v1/embeddings/jobs` (up to 50,000 items and 20 MB total input). The worker selects a safe batch size from the configured provider candidates and `max_embedding_batch_size`, reports per-index success/error and cumulative usage, and isolates failed batches to identify bad items. `POST /v1/embeddings` automatically returns `202` with a job ID when its item count exceeds `server.async_embedding_threshold` (default 256). Poll `GET /v1/embeddings/jobs/{job_id}` and fetch completed vectors from `/results?offset=0&limit=100`; results are paginated from an artifact rather than retained in the usage database. Inputs are removed from the job record at completion; the result contains vectors and metadata, not the original text. `DELETE /v1/embeddings/jobs/{job_id}` cancels an owned job.
 
-Tenant data jobs use `?async=true` to force asynchronous execution; large requests are automatically queued based on `tenant_data.async_threshold_records`. Job status includes progress and a manifest with export record counts, byte size, and SHA-256. Export content is available from the job `/results` endpoint after completion. Job completion audits are retained separately from the exported/deleted tenant records.
+Tenant data jobs use `?async=true` to force asynchronous execution; large requests are automatically queued based on `tenant_data.async_threshold_records`. Job status includes progress and a manifest with export record counts, byte size, and SHA-256. Export files are stored as artifacts; the job `/results` endpoint returns a protected `download_url` after completion. Job completion audits are retained separately from the exported/deleted tenant records.
+
+Async jobs use capped exponential retry backoff, cooperative cancellation at work-unit boundaries, and a `dead_letter` terminal state after `server.async_job_max_attempts`. Expired worker leases are recovered by the dispatcher and either requeued or dead-lettered based on the attempt limit. Configure `async_job_retry_base_delay_seconds`, `async_job_retry_max_delay_seconds`, and `async_job_lease_seconds` under `server`. Operators can inspect queue depth, status counts, average completed duration, and recent durations from `GET /v1/admin/async-jobs`; job status responses also include attempts and elapsed duration. The admin endpoint requires the `report` scope; `DELETE /v1/admin/async-jobs/{job_id}` cancels any job.
+
+Large job output is written outside the database. The default local backend writes to `gateway-artifacts/`; configure a shared S3 bucket for multi-replica deployments:
+
+```yaml
+object_storage:
+  backend: s3
+  bucket: ${GATEWAY_ARTIFACT_BUCKET}
+  prefix: llm-gateway
+  region: us-east-1
+```
+
+Install the optional adapter with `pip install '.[s3]'` and provide AWS credentials through the standard AWS SDK credential chain. Local artifact directories and generated artifacts are ignored by Git.
 
 Example native provider and route configuration:
 
@@ -323,7 +337,7 @@ retrieval:
     ttl_seconds: 300
 ```
 
-To evaluate labeled rankings, post one result per query to `POST /v1/admin/retrieval/evaluations`. Cases contain `ranked_document_ids`, `relevant_document_ids`, and optional observed `cost_usd` and `latency_ms`. The gateway stores mean recall@1/3/5/10, MRR, nDCG@1/3/5/10, cost, and latency in the immutable evaluation store. Use the logical route name being promoted so the report joins the existing comparison and promotion flow. `POST /v1/admin/evaluations/compare` accepts optional `min_recall_at_5`, `min_mrr`, and `min_ndcg_at_5` gates; a missing metric fails its configured gate.
+To evaluate labeled rankings directly, queue a dataset at `POST /v1/admin/retrieval/evaluation-jobs` with baseline/candidate route names and cases containing `query`, parallel `documents` and `document_ids`, and `relevant_document_ids`. Each case is sent to both configured rerankers through the same gateway path as `/v1/rerank`. The job saves both immutable reports plus a comparison ID, including mean recall@1/3/5/10, MRR, nDCG@1/3/5/10, observed cost, latency, and failures. Use the candidate route name as the route key for subsequent promotion checks. The existing `POST /v1/admin/retrieval/evaluations` endpoint remains available for callers that already have ranked results; `/v1/admin/evaluations/compare` accepts optional `min_recall_at_5`, `min_mrr`, and `min_ndcg_at_5` gates, and a missing metric fails its configured gate.
 
 Example request:
 
@@ -396,9 +410,15 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `POST` | `/v1/embeddings` | Create normalized vectors through an embedding route. |
 | `POST` | `/v1/embeddings/jobs` | Queue large embedding batches and report per-item outcomes and aggregate usage. |
 | `GET` | `/v1/embeddings/jobs/{job_id}` | Read embedding job status and progress. |
-| `GET` | `/v1/embeddings/jobs/{job_id}/results` | Retrieve completed embedding vectors and per-item errors. |
+| `DELETE` | `/v1/embeddings/jobs/{job_id}` | Cancel an owned embedding job. |
+| `GET` | `/v1/embeddings/jobs/{job_id}/results` | Retrieve a page of completed embedding vectors and per-item errors. |
 | `POST` | `/v1/rerank` | Rank documents with a native cross-encoder or cosine fallback. |
 | `POST` | `/v1/admin/retrieval/evaluations` | Persist labeled ranking metrics and observed cost/latency for a route. |
+| `POST` | `/v1/admin/retrieval/evaluation-jobs` | Run baseline and candidate rerankers on a labeled dataset and save reports/comparison. |
+| `GET` | `/v1/admin/retrieval/evaluation-jobs/{job_id}` | Read retrieval-evaluation job progress and status. |
+| `GET` | `/v1/admin/retrieval/evaluation-jobs/{job_id}/results` | Retrieve saved baseline/candidate reports and promotion comparison. |
+| `GET` | `/v1/admin/async-jobs` | Report job queue depth, status counts, and durations. |
+| `DELETE` | `/v1/admin/async-jobs/{job_id}` | Cancel an asynchronous job. |
 | `GET` | `/admin` | Operations dashboard shell; data loads through authenticated admin APIs. |
 | `GET` | `/v1/admin/report` | Aggregate token, cost, and reliability data. |
 | `GET` | `/v1/admin/slos` | Report route/application availability and latency objectives with error-budget burn. |
@@ -413,7 +433,8 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/v1/admin/tenants/{tenant_id}/data-export` | Export retained usage and tenant audit metadata; requires `tenant_data` scope and configured retention. |
 | `DELETE` | `/v1/admin/tenants/{tenant_id}/data?confirm_tenant_id=...` | Remove tenant usage and associated audit metadata while retaining the deletion audit event. |
 | `GET` | `/v1/admin/tenant-data-jobs/{job_id}` | Read export/deletion job status, progress, and manifest. |
-| `GET` | `/v1/admin/tenant-data-jobs/{job_id}/results` | Retrieve a completed tenant export or deletion manifest. |
+| `GET` | `/v1/admin/tenant-data-jobs/{job_id}/results` | Retrieve an export download link or deletion manifest. |
+| `GET` | `/v1/admin/tenant-data-jobs/{job_id}/download` | Download a completed tenant export artifact. |
 | `GET` | `/v1/admin/tool-audit` | Metadata-only tool-call decisions, optionally filtered by tenant. |
 | `POST` | `/v1/admin/tool-approvals` | Record approval, denial, or revocation for a gated tool call. Requires the `tool_approvals` scope. |
 | `GET` | `/v1/tool-approvals/{request_id}/{tool_call_id}` | Query approval state before the application executes a gated tool call. |
@@ -707,6 +728,9 @@ Suggested next milestones, ordered by production value:
 - [x] Stream Bedrock ConverseStream text, tool-call, and usage events; test fallback boundaries before and after caller-visible output.
 - [x] Add expiring and revocable tool approvals, application webhooks, and a Python helper that checks approval before execution.
 - [x] Sample shadow traffic and compare output validity, cost, latency, and failures; combine shadow, evaluation, and SLO gates for promotion.
+- [x] Add retry/backoff, cancellation, dead-letter handling, stalled-lease recovery, and async-job queue/duration reporting.
+- [x] Store large embedding results and tenant exports in local or S3 object storage, with paginated embedding results and protected export downloads.
+- [x] Run labeled retrieval datasets end to end against baseline and candidate rerankers, saving quality/cost/latency reports and promotion comparisons.
 
 ## Contributing
 

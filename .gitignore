@@ -10,6 +10,9 @@ __pycache__/
 build/
 dist/
 *.sqlite3*
+*.sqlite3.artifacts/
+gateway-artifacts/
+artifacts/
 
 # Test, lint, type-check, and coverage caches/reports.
 .pytest_cache/

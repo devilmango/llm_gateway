@@ -136,6 +136,11 @@ class PostgresUsageStore:
                 completed_at TEXT, lease_until TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS idx_async_jobs_pending ON async_jobs(status, lease_until, created_at)",
+            "ALTER TABLE async_jobs ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE async_jobs ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 5",
+            "ALTER TABLE async_jobs ADD COLUMN IF NOT EXISTS next_attempt_at TEXT",
+            "ALTER TABLE async_jobs ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE",
+            "CREATE INDEX IF NOT EXISTS idx_async_jobs_due ON async_jobs(status, next_attempt_at, created_at)",
         ]
         with self.pool.connection() as conn, conn.cursor() as cursor:
             for statement in statements:
@@ -310,6 +315,21 @@ class PostgresUsageStore:
                     (datetime.now(UTC).isoformat(), tenant_id, actor, "delete", json.dumps(counts, sort_keys=True)))
             return counts
 
+    def tenant_job_artifact_keys(self, tenant_id: str, preserve_job_id: str | None = None) -> list[str]:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("""SELECT manifest_json, result_json FROM async_jobs
+                WHERE tenant_id=%s AND job_id != COALESCE(%s, '')""", (tenant_id, preserve_job_id))
+            rows = cursor.fetchall()
+        keys = set()
+        for row in rows:
+            for column in ("manifest_json", "result_json"):
+                value = row[column]
+                if isinstance(value, str):
+                    value = json.loads(value)
+                if isinstance(value, dict) and value.get("artifact_key"):
+                    keys.add(value["artifact_key"])
+        return sorted(keys)
+
     def tenant_data_counts(self, tenant_id: str) -> dict[str, int]:
         prefix = f"{tenant_id}:"
         with self.pool.connection() as conn, conn.cursor() as cursor:
@@ -326,13 +346,14 @@ class PostgresUsageStore:
             return counts
 
     def create_async_job(self, job_type: str, tenant_id: str | None, actor: str | None,
-                         payload: dict[str, Any], progress_total: int) -> dict[str, Any]:
+                         payload: dict[str, Any], progress_total: int,
+                         max_attempts: int = 5) -> dict[str, Any]:
         job_id, now = "job_" + uuid.uuid4().hex, datetime.now(UTC).isoformat()
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
             cursor.execute("""INSERT INTO async_jobs (job_id, job_type, tenant_id, actor, status,
-                progress_total, payload_json, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, 'queued', %s, %s::jsonb, %s, %s)""",
-                (job_id, job_type, tenant_id, actor, progress_total,
+                progress_total, max_attempts, payload_json, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, 'queued', %s, %s, %s::jsonb, %s, %s)""",
+                (job_id, job_type, tenant_id, actor, progress_total, max_attempts,
                  json.dumps(payload, separators=(",", ":")), now, now))
         return self.async_job(job_id) or {}
 
@@ -360,11 +381,90 @@ class PostgresUsageStore:
         job.pop("lease_until", None)
         return job
 
+    def cancel_async_job(self, job_id: str) -> dict[str, Any] | None:
+        now = datetime.now(UTC).isoformat()
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("""UPDATE async_jobs SET status='cancelled', cancel_requested=TRUE,
+                payload_json=NULL, completed_at=%s, updated_at=%s, lease_until=NULL
+                WHERE job_id=%s AND status='queued'""", (now, now, job_id))
+            cursor.execute("""UPDATE async_jobs SET cancel_requested=TRUE, updated_at=%s
+                WHERE job_id=%s AND status='running'""", (now, job_id))
+        return self.async_job(job_id)
+
+    def async_job_cancel_requested(self, job_id: str) -> bool:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT cancel_requested FROM async_jobs WHERE job_id=%s", (job_id,))
+            row = cursor.fetchone()
+        return bool(row and row["cancel_requested"])
+
+    def fail_async_job(self, job_id: str, error: str, *, max_attempts: int,
+                       base_delay_seconds: float, max_delay_seconds: float) -> str:
+        now = datetime.now(UTC)
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("SELECT attempt_count, cancel_requested FROM async_jobs WHERE job_id=%s FOR UPDATE",
+                           (job_id,))
+            job = cursor.fetchone()
+            if job is None:
+                return "missing"
+            attempts = int(job["attempt_count"])
+            if job["cancel_requested"]:
+                status, next_at = "cancelled", None
+            elif attempts >= max_attempts:
+                status, next_at = "dead_letter", None
+            else:
+                delay = min(max_delay_seconds, base_delay_seconds * (2 ** max(attempts - 1, 0)))
+                status, next_at = "queued", (now + timedelta(seconds=delay)).isoformat()
+            terminal = status in {"cancelled", "dead_letter"}
+            cursor.execute("""UPDATE async_jobs SET status=%s, error=%s, next_attempt_at=%s,
+                updated_at=%s, completed_at=%s, lease_until=NULL,
+                payload_json=CASE WHEN %s THEN NULL ELSE payload_json END WHERE job_id=%s""",
+                (status, error[:500], next_at, now.isoformat(), now.isoformat() if terminal else None,
+                 terminal, job_id))
+            return status
+
+    def recover_stalled_async_jobs(self, *, max_attempts: int, base_delay_seconds: float,
+                                   max_delay_seconds: float) -> int:
+        now = datetime.now(UTC)
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("""SELECT job_id, attempt_count, cancel_requested FROM async_jobs
+                WHERE status='running' AND lease_until <= %s FOR UPDATE""", (now.isoformat(),))
+            stalled = cursor.fetchall()
+            for job in stalled:
+                attempts = int(job["attempt_count"])
+                cancelled = bool(job["cancel_requested"])
+                terminal = cancelled or attempts >= max_attempts
+                delay = min(max_delay_seconds, base_delay_seconds * (2 ** max(attempts - 1, 0)))
+                next_at = None if terminal else (now + timedelta(seconds=delay)).isoformat()
+                cursor.execute("""UPDATE async_jobs SET status=%s, error='stalled_job_lease_expired',
+                    next_attempt_at=%s, updated_at=%s, completed_at=%s, lease_until=NULL,
+                    payload_json=CASE WHEN %s THEN NULL ELSE payload_json END WHERE job_id=%s""",
+                    ("cancelled" if cancelled else "dead_letter" if terminal else "queued", next_at, now.isoformat(),
+                     now.isoformat() if terminal else None, terminal, job["job_id"]))
+            return len(stalled)
+
+    def async_job_stats(self) -> dict[str, Any]:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT status, COUNT(*) AS count FROM async_jobs GROUP BY status")
+            counts = {row["status"]: int(row["count"]) for row in cursor.fetchall()}
+            cursor.execute("""SELECT AVG(EXTRACT(EPOCH FROM (completed_at::timestamptz-
+                started_at::timestamptz))*1000) AS average FROM async_jobs
+                WHERE status='completed' AND started_at IS NOT NULL AND completed_at IS NOT NULL""")
+            average = cursor.fetchone()["average"]
+            cursor.execute("""SELECT started_at, completed_at FROM async_jobs WHERE started_at IS NOT NULL
+                ORDER BY started_at DESC LIMIT 100""")
+            rows = cursor.fetchall()
+        durations = [max(0, int((datetime.fromisoformat(row["completed_at"])
+            - datetime.fromisoformat(row["started_at"])).total_seconds() * 1000))
+            for row in rows if row["completed_at"]]
+        return {"queue_depth": counts.get("queued", 0), "running": counts.get("running", 0),
+            "dead_letter": counts.get("dead_letter", 0), "counts_by_status": counts,
+            "average_duration_ms": round(float(average or 0), 2), "recent_durations_ms": durations}
+
     def pending_async_jobs(self, limit: int = 20) -> list[str]:
         now = datetime.now(UTC).isoformat()
         with self.pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute("""SELECT job_id FROM async_jobs WHERE status='queued'
-                OR (status='running' AND lease_until <= %s) ORDER BY created_at LIMIT %s""",
+                AND (next_attempt_at IS NULL OR next_attempt_at <= %s) ORDER BY created_at LIMIT %s""",
                 (now, limit))
             return [row["job_id"] for row in cursor.fetchall()]
 
@@ -373,9 +473,17 @@ class PostgresUsageStore:
         lease_until = (now + timedelta(seconds=lease_seconds)).isoformat()
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
             cursor.execute("""UPDATE async_jobs SET status='running', started_at=COALESCE(started_at, %s),
-                updated_at=%s, lease_until=%s WHERE job_id=%s AND (status='queued'
-                OR (status='running' AND lease_until <= %s))""",
+                attempt_count=attempt_count+1, next_attempt_at=NULL, updated_at=%s, lease_until=%s
+                WHERE job_id=%s AND status='queued' AND (next_attempt_at IS NULL OR next_attempt_at <= %s)""",
                 (now.isoformat(), now.isoformat(), lease_until, job_id, now.isoformat()))
+            return cursor.rowcount == 1
+
+    def renew_async_job_lease(self, job_id: str, lease_seconds: int = 300) -> bool:
+        now = datetime.now(UTC)
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("""UPDATE async_jobs SET updated_at=%s, lease_until=%s
+                WHERE job_id=%s AND status='running'""",
+                (now.isoformat(), (now + timedelta(seconds=lease_seconds)).isoformat(), job_id))
             return cursor.rowcount == 1
 
     def update_async_job(self, job_id: str, *, status: str | None = None,
@@ -398,9 +506,11 @@ class PostgresUsageStore:
         if error is not None:
             assignments.append("error=%s")
             values.append(error[:500])
+        elif status == "completed":
+            assignments.append("error=NULL")
         if clear_payload:
             assignments.append("payload_json=NULL")
-        terminal = status in {"completed", "failed", "cancelled"}
+        terminal = status in {"completed", "failed", "cancelled", "dead_letter"}
         assignments.extend(["completed_at=%s", "lease_until=%s"])
         values.extend([now.isoformat() if terminal else None,
                        None if terminal else (now + timedelta(seconds=lease_seconds)).isoformat()])
@@ -415,7 +525,7 @@ class PostgresUsageStore:
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
             cursor.execute("""UPDATE async_jobs SET status='completed', progress_completed=progress_total,
                 manifest_json=%s::jsonb, result_json=%s::jsonb, payload_json=NULL, updated_at=%s,
-                completed_at=%s, lease_until=NULL WHERE job_id=%s""",
+                completed_at=%s, lease_until=NULL, error=NULL WHERE job_id=%s""",
                 (json.dumps(manifest, separators=(",", ":")),
                  json.dumps(result, separators=(",", ":"), default=str), now, now, job_id))
             cursor.execute("""INSERT INTO tenant_data_audits

@@ -1959,6 +1959,125 @@ async def test_async_embedding_job_batches_reports_progress_usage_and_item_resul
 
 
 @pytest.mark.asyncio
+async def test_async_embedding_results_are_artifact_backed_and_paginated(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+    cfg = config(str(tmp_path / "artifact-jobs.sqlite3"))
+    cfg["providers"]["primary"]["models"]["embed-model"] = {"input_cost_per_1m": 1}
+    cfg["embedding_routes"] = {"retrieval": {"provider": "primary", "model": "embed-model"}}
+    cfg["object_storage"] = {"backend": "local", "directory": str(tmp_path / "objects")}
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        inputs = json.loads(request.content)["input"]
+        return httpx.Response(200, json={"model": "embed-model", "data": [
+            {"index": index, "embedding": [float(index)]} for index, _ in enumerate(inputs)],
+            "usage": {"prompt_tokens": len(inputs), "total_tokens": len(inputs)}})
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        headers = {"Authorization": "Bearer admin-secret"}
+        created = await client.post("/v1/embeddings/jobs", json={"model": "retrieval",
+            "input": ["one", "two", "three"], "application": "artifact-search"}, headers=headers)
+        job_id = created.json()["job_id"]
+        for _ in range(100):
+            status = await client.get(f"/v1/embeddings/jobs/{job_id}", headers=headers)
+            if status.json()["status"] in {"completed", "failed"}:
+                break
+            await asyncio.sleep(0.01)
+        assert status.json()["status"] == "completed"
+        assert status.json()["manifest"]["artifact_key"]
+        assert status.json()["duration_ms"] is not None
+        persisted = create_usage_store(cfg["server"]["database"]).async_job(job_id, include_results=True)
+        assert persisted["result"]["artifact_key"] == status.json()["manifest"]["artifact_key"]
+        assert "items" not in persisted["result"]
+        first = await client.get(f"/v1/embeddings/jobs/{job_id}/results",
+                                 params={"offset": 0, "limit": 2}, headers=headers)
+        second = await client.get(f"/v1/embeddings/jobs/{job_id}/results",
+                                  params={"offset": 2, "limit": 2}, headers=headers)
+        assert [item["index"] for item in first.json()["items"]] == [0, 1]
+        assert [item["index"] for item in second.json()["items"]] == [2]
+        assert first.json()["pagination"] == {"offset": 0, "limit": 2, "total": 3, "has_more": True}
+        queue = await client.get("/v1/admin/async-jobs", headers=headers)
+        assert queue.json()["queue_depth"] == 0
+        assert queue.json()["counts_by_status"]["completed"] == 1
+
+
+def test_async_jobs_support_retry_cancellation_and_queue_statistics(tmp_path):
+    store = create_usage_store(str(tmp_path / "job-ops.sqlite3"))
+    queued = store.create_async_job("embedding_batch", None, "job-ops",
+                                    {"input": ["one"]}, progress_total=1)
+    assert store.cancel_async_job(queued["job_id"])["status"] == "cancelled"
+    assert store.async_job(queued["job_id"], include_payload=True).get("payload") is None
+
+    retrying = store.create_async_job("embedding_batch", None, "job-ops",
+                                      {"input": ["two"]}, progress_total=1)
+    assert store.claim_async_job(retrying["job_id"], lease_seconds=60)
+    assert store.renew_async_job_lease(retrying["job_id"], lease_seconds=60)
+    assert store.fail_async_job(retrying["job_id"], "TimeoutError", max_attempts=3,
+                                base_delay_seconds=10, max_delay_seconds=30) == "queued"
+    assert store.async_job(retrying["job_id"])["attempt_count"] == 1
+    assert retrying["job_id"] not in store.pending_async_jobs()
+    assert store.async_job_stats()["queue_depth"] == 1
+
+    terminal = store.create_async_job("embedding_batch", None, "job-ops",
+                                      {"input": ["three"]}, progress_total=1, max_attempts=1)
+    assert store.claim_async_job(terminal["job_id"], lease_seconds=60)
+    assert store.fail_async_job(terminal["job_id"], "RuntimeError", max_attempts=1,
+                                base_delay_seconds=0, max_delay_seconds=0) == "dead_letter"
+
+    stalled = store.create_async_job("embedding_batch", None, "job-ops",
+                                     {"input": ["four"]}, progress_total=1)
+    assert store.claim_async_job(stalled["job_id"], lease_seconds=0)
+    assert store.recover_stalled_async_jobs(max_attempts=5, base_delay_seconds=0,
+                                            max_delay_seconds=0) >= 1
+    assert store.async_job(stalled["job_id"])["status"] == "queued"
+    assert store.async_job_stats()["dead_letter"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retrieval_evaluation_job_runs_baseline_and_candidate_rerankers(tmp_path, monkeypatch):
+    monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
+    monkeypatch.setenv("COHERE_KEY", "cohere-secret")
+    cfg = config(str(tmp_path / "retrieval-eval-jobs.sqlite3"))
+    cfg["providers"]["cohere"] = {"kind": "cohere", "base_url": "https://cohere.test/v2",
+        "api_key_env": "COHERE_KEY", "models": {"rank-v1": {"rerank_cost_per_1k_documents": 1}}}
+    cfg["embedding_routes"] = {
+        "baseline": {"provider": "primary", "model": "embed-model",
+            "reranker": {"provider": "cohere", "model": "rank-v1"}},
+        "candidate": {"provider": "primary", "model": "embed-model",
+            "reranker": {"provider": "cohere", "model": "rank-v1"}},
+    }
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/rerank")
+        return httpx.Response(200, json={"results": [{"index": 1, "relevance_score": 0.9},
+            {"index": 0, "relevance_score": 0.1}], "meta": {"billed_units": {"search_units": 1}}})
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        headers = {"Authorization": "Bearer admin-secret"}
+        queued = await client.post("/v1/admin/retrieval/evaluation-jobs", headers=headers, json={
+            "dataset_name": "help-center", "dataset_version": "v1", "dataset_sha256": "c" * 64,
+            "baseline_route": "baseline", "candidate_route": "candidate", "application": "search",
+            "cases": [{"query": "refund", "documents": ["shipping", "refund policy"],
+                "document_ids": ["d1", "d2"], "relevant_document_ids": ["d2"]}]})
+        assert queued.status_code == 202
+        job_id = queued.json()["job_id"]
+        for _ in range(100):
+            status = await client.get(f"/v1/admin/retrieval/evaluation-jobs/{job_id}", headers=headers)
+            if status.json()["status"] in {"completed", "failed", "dead_letter"}:
+                break
+            await asyncio.sleep(0.01)
+        assert status.json()["status"] == "completed"
+        result = (await client.get(f"/v1/admin/retrieval/evaluation-jobs/{job_id}/results",
+            headers=headers)).json()
+        assert result["comparison"]["routes"]["candidate"]["candidate"]["retrieval_metrics"]["mrr"] == 1
+        candidate_summary = result["candidate"]["summary"]
+        assert candidate_summary["estimated_cost_usd"] > 0
+        assert candidate_summary["average_latency_ms"] >= 0
+        assert candidate_summary["retrieval_metrics"]["recall@5"] == 1
+        assert result["comparison_id"]
+
+
+@pytest.mark.asyncio
 async def test_tenant_export_and_deletion_can_run_as_audited_jobs(tmp_path, monkeypatch):
     monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
     cfg = config(str(tmp_path / "tenant-data-jobs.sqlite3"))
@@ -1983,7 +2102,12 @@ async def test_tenant_export_and_deletion_can_run_as_audited_jobs(tmp_path, monk
         assert status.json()["status"] == "completed"
         assert status.json()["manifest"]["record_counts"]["requests"] == 1
         exported = await client.get(f"/v1/admin/tenant-data-jobs/{job_id}/results", headers=headers)
-        assert exported.json()["data"]["requests"][0]["request_id"] == "job-request"
+        assert exported.json()["download_url"].endswith("/download")
+        export_key = exported.json()["manifest"]["artifact_key"]
+        export_path = tmp_path / "tenant-data-jobs.sqlite3.artifacts" / export_key
+        assert export_path.exists()
+        downloaded = await client.get(exported.json()["download_url"], headers=headers)
+        assert downloaded.json()["requests"][0]["request_id"] == "job-request"
 
         deletion = await client.delete("/v1/admin/tenants/tenant-a/data?confirm_tenant_id=tenant-a&async=true",
                                        headers=headers)
@@ -1997,6 +2121,7 @@ async def test_tenant_export_and_deletion_can_run_as_audited_jobs(tmp_path, monk
         assert status.json()["status"] == "completed"
         assert status.json()["manifest"]["deleted_record_counts"]["requests"] == 1
         assert store.async_job(job_id) is None
+        assert not export_path.exists()
         assert store.tenant_data_audits("tenant-a")[0]["action"] == "delete_job_completed"
 
 

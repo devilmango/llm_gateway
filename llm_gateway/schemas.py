@@ -86,6 +86,47 @@ class RetrievalEvaluationCreate(BaseModel):
     cases: list[RetrievalEvaluationCase] = Field(min_length=1, max_length=100_000)
 
 
+class RetrievalEvaluationJobCase(BaseModel):
+    query: str = Field(min_length=1, max_length=100_000)
+    documents: list[str] = Field(min_length=1, max_length=1000)
+    document_ids: list[str] = Field(min_length=1, max_length=1000)
+    relevant_document_ids: list[str] = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_ids(self) -> RetrievalEvaluationJobCase:
+        if len(self.documents) != len(self.document_ids):
+            raise ValueError("documents and document_ids must have the same length")
+        if len(set(self.document_ids)) != len(self.document_ids):
+            raise ValueError("document_ids must be unique")
+        if len(set(self.relevant_document_ids)) != len(self.relevant_document_ids):
+            raise ValueError("relevant_document_ids must be unique")
+        if not set(self.relevant_document_ids).intersection(self.document_ids):
+            raise ValueError("each case must mark at least one supplied document as relevant")
+        return self
+
+
+class RetrievalEvaluationJobCreate(BaseModel):
+    dataset_name: str = Field(min_length=1, max_length=200)
+    dataset_version: str = Field(min_length=1, max_length=120)
+    dataset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    baseline_route: str = Field(min_length=1, max_length=120)
+    candidate_route: str = Field(min_length=1, max_length=120)
+    application: str = Field(default="retrieval-evaluation", max_length=120)
+    cases: list[RetrievalEvaluationJobCase] = Field(min_length=1, max_length=10_000)
+
+    @model_validator(mode="after")
+    def validate_distinct_routes(self) -> RetrievalEvaluationJobCreate:
+        if self.baseline_route == self.candidate_route:
+            raise ValueError("baseline_route and candidate_route must differ")
+        document_count = sum(len(case.documents) for case in self.cases)
+        input_bytes = sum(len(value.encode("utf-8")) for case in self.cases
+                          for value in (case.query, *case.documents, *case.document_ids,
+                                        *case.relevant_document_ids))
+        if document_count > 100_000 or input_bytes > 20_000_000:
+            raise ValueError("retrieval evaluation jobs are limited to 100000 documents and 20 MB of input")
+        return self
+
+
 class PromotionEvaluateRequest(BaseModel):
     comparison_id: str = Field(min_length=1, max_length=120)
     application: str = Field(min_length=1, max_length=120)
