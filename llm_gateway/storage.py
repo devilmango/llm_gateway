@@ -457,16 +457,47 @@ class UsageStore:
                 (now, limit)).fetchall()
             return [row["job_id"] for row in rows]
 
-    def claim_async_job(self, job_id: str, lease_seconds: int = 300) -> bool:
+    def claim_async_job(self, job_id: str, lease_seconds: int = 300,
+                        max_concurrent_for_tenant: int | None = None) -> bool:
         now = datetime.now(UTC)
         lease_until = (now + timedelta(seconds=lease_seconds)).isoformat()
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            job = db.execute("SELECT tenant_id, status FROM async_jobs WHERE job_id=?", (job_id,)).fetchone()
+            if job is None or job["status"] != "queued":
+                return False
+            if job["tenant_id"] and max_concurrent_for_tenant is not None:
+                running = db.execute("SELECT COUNT(*) FROM async_jobs WHERE tenant_id=? AND status='running'",
+                                     (job["tenant_id"],)).fetchone()[0]
+                if running >= max_concurrent_for_tenant:
+                    return False
             cursor = db.execute("""UPDATE async_jobs SET status='running', started_at=COALESCE(started_at, ?),
                 attempt_count=attempt_count+1, next_attempt_at=NULL, updated_at=?, lease_until=?
                 WHERE job_id=? AND status='queued' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)""",
                 (now.isoformat(), now.isoformat(), lease_until, job_id, now.isoformat()))
             return cursor.rowcount == 1
+
+    def expired_tenant_async_job_artifacts(self, tenant_id: str, retention_days: int) -> list[str]:
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+        with self._lock, self._connect() as db:
+            rows = db.execute("""SELECT manifest_json, result_json FROM async_jobs WHERE tenant_id=?
+                AND status IN ('completed','failed','cancelled','dead_letter')
+                AND COALESCE(completed_at, updated_at, created_at) < ?""", (tenant_id, cutoff)).fetchall()
+        keys: set[str] = set()
+        for row in rows:
+            for column in ("manifest_json", "result_json"):
+                value = json.loads(row[column]) if row[column] else {}
+                if isinstance(value, dict) and value.get("artifact_key"):
+                    keys.add(value["artifact_key"])
+        return sorted(keys)
+
+    def prune_tenant_async_jobs(self, tenant_id: str, retention_days: int) -> int:
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+        with self._lock, self._connect() as db:
+            cursor = db.execute("""DELETE FROM async_jobs WHERE tenant_id=?
+                AND status IN ('completed','failed','cancelled','dead_letter')
+                AND COALESCE(completed_at, updated_at, created_at) < ?""", (tenant_id, cutoff))
+            return cursor.rowcount
 
     def renew_async_job_lease(self, job_id: str, lease_seconds: int = 300) -> bool:
         now = datetime.now(UTC)

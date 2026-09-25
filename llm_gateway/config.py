@@ -77,6 +77,13 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
             value = tenant.get(key)
             if value is not None and (not isinstance(value, list) or any(not isinstance(item, str) for item in value)):
                 raise ValueError(f"Tenant {tenant_id!r} {key} must be a list of strings")
+        job_policy = tenant.get("job_policy", {})
+        if not isinstance(job_policy, dict):
+            raise TypeError(f"Tenant {tenant_id!r} job_policy must be an object")
+        for limit_name in ("max_concurrent_jobs", "max_job_items", "max_job_input_bytes", "retention_days"):
+            value = job_policy.get(limit_name)
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+                raise ValueError(f"Tenant {tenant_id!r} job_policy.{limit_name} must be a positive integer")
         for policy_name, policy in [("default_policy", tenant.get("default_policy", {})),
                                     *[(f"applications.{name}", value)
                                       for name, value in tenant.get("applications", {}).items()]]:

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 import struct
 import sys
 import zlib
@@ -2031,6 +2032,113 @@ def test_async_jobs_support_retry_cancellation_and_queue_statistics(tmp_path):
                                             max_delay_seconds=0) >= 1
     assert store.async_job(stalled["job_id"])["status"] == "queued"
     assert store.async_job_stats()["dead_letter"] == 1
+
+
+def test_tenant_job_concurrency_is_enforced_and_retention_prunes_artifacts(tmp_path):
+    database = str(tmp_path / "tenant-job-controls.sqlite3")
+    store = create_usage_store(database)
+    first = store.create_async_job("embedding_batch", "tenant-a", "search", {"input": ["a"]}, 1)
+    second = store.create_async_job("embedding_batch", "tenant-a", "search", {"input": ["b"]}, 1)
+    assert store.claim_async_job(first["job_id"], max_concurrent_for_tenant=1)
+    assert not store.claim_async_job(second["job_id"], max_concurrent_for_tenant=1)
+    store.update_async_job(first["job_id"], status="completed", manifest={"artifact_key": "tenant-a/old.json"})
+    with sqlite3.connect(database) as db:
+        db.execute("UPDATE async_jobs SET completed_at='2000-01-01T00:00:00+00:00' WHERE job_id=?",
+                   (first["job_id"],))
+    assert store.expired_tenant_async_job_artifacts("tenant-a", 1) == ["tenant-a/old.json"]
+    assert store.prune_tenant_async_jobs("tenant-a", 1) == 1
+    assert store.async_job(first["job_id"]) is None
+    assert store.claim_async_job(second["job_id"], max_concurrent_for_tenant=1)
+
+
+@pytest.mark.asyncio
+async def test_tenant_embedding_job_size_limits_are_enforced(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUPPORT_TENANT_KEY", "tenant-secret")
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    cfg = config(str(tmp_path / "tenant-job-limits.sqlite3"))
+    cfg["server"]["async_embedding_threshold"] = 1
+    cfg["providers"]["primary"]["models"]["embed-model"] = {"input_cost_per_1m": 1}
+    cfg["embedding_routes"] = {"retrieval": {"provider": "primary", "model": "embed-model"}}
+    cfg["tenants"] = {"support": {"api_key_env": "SUPPORT_TENANT_KEY", "job_policy": {
+        "max_concurrent_jobs": 1, "max_job_items": 2, "max_job_input_bytes": 5}}}
+    async with gateway_client(cfg, httpx.MockTransport(lambda _: httpx.Response(200))) as client:
+        headers = {"Authorization": "Bearer tenant-secret"}
+        too_many = await client.post("/v1/embeddings/jobs", headers=headers, json={
+            "model": "retrieval", "input": ["a", "b", "c"], "application": "search"})
+        too_large = await client.post("/v1/embeddings/jobs", headers=headers, json={
+            "model": "retrieval", "input": ["123", "456"], "application": "search"})
+        auto_job_too_many = await client.post("/v1/embeddings", headers=headers, json={
+            "model": "retrieval", "input": ["a", "b", "c"], "application": "search"})
+        assert too_many.status_code == 413
+        assert too_large.status_code == 413
+        assert auto_job_too_many.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_embedding_provider_circuit_state_is_reported_and_skips_open_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("TEST_BACKUP_KEY", "backup-secret")
+    cfg = config(str(tmp_path / "embedding-breaker.sqlite3"))
+    cfg["circuit_breaker"] = {"failure_threshold": 1, "recovery_seconds": 30}
+    cfg["providers"]["primary"]["models"]["embed-model"] = {"input_cost_per_1m": 1}
+    cfg["providers"]["backup"]["models"]["embed-model"] = {"input_cost_per_1m": 1}
+    cfg["embedding_routes"] = {"retrieval": {"provider": "primary", "model": "embed-model",
+        "fallbacks": [{"provider": "backup", "model": "embed-model"}]}}
+    calls = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.host)
+        if request.url.host == "primary.test":
+            return httpx.Response(503)
+        inputs = json.loads(request.content)["input"]
+        return httpx.Response(200, json={"model": "embed-model", "data": [
+            {"index": i, "embedding": [1.0]} for i, _ in enumerate(inputs)],
+            "usage": {"prompt_tokens": len(inputs), "total_tokens": len(inputs)}})
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        for text in ("one", "two"):
+            result = await client.post("/v1/embeddings", json={"model": "retrieval", "input": text})
+            assert result.status_code == 200
+            assert result.json()["gateway"]["provider"] == "backup"
+        health = (await client.get("/v1/admin/providers")).json()["providers"]
+        assert health["primary"]["state"] == "open"
+        assert health["primary"]["failures"] == 1
+        assert calls.count("primary.test") == 1
+
+
+@pytest.mark.asyncio
+async def test_native_reranker_circuit_state_is_reported_and_falls_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    monkeypatch.setenv("COHERE_KEY", "cohere-secret")
+    cfg = config(str(tmp_path / "rerank-breaker.sqlite3"))
+    cfg["circuit_breaker"] = {"failure_threshold": 1, "recovery_seconds": 30}
+    cfg["providers"]["primary"]["models"]["embed-model"] = {"input_cost_per_1m": 1}
+    cfg["providers"]["cohere"] = {"kind": "cohere", "base_url": "https://cohere.test/v2",
+        "api_key_env": "COHERE_KEY", "models": {"rank-v1": {"rerank_cost_per_1k_documents": 1}}}
+    cfg["embedding_routes"] = {"retrieval": {"provider": "primary", "model": "embed-model",
+        "reranker": {"provider": "cohere", "model": "rank-v1", "fallback": "cosine"}}}
+    calls = 0
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.url.host == "cohere.test":
+            calls += 1
+            return httpx.Response(503)
+        inputs = json.loads(request.content)["input"]
+        return httpx.Response(200, json={"model": "embed-model", "data": [
+            {"index": i, "embedding": [1.0, float(i)]} for i, _ in enumerate(inputs)],
+            "usage": {"prompt_tokens": len(inputs), "total_tokens": len(inputs)}})
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        for _ in range(2):
+            result = await client.post("/v1/rerank", json={"model": "retrieval", "query": "q",
+                "documents": ["a", "b"]})
+            assert result.status_code == 200
+            assert result.json()["gateway"]["reranker"] == "cosine_similarity"
+        health = (await client.get("/v1/admin/providers")).json()["providers"]
+        assert health["cohere"]["state"] == "open"
+        assert health["cohere"]["failures"] == 1
+        assert calls == 1
 
 
 @pytest.mark.asyncio

@@ -468,15 +468,56 @@ class PostgresUsageStore:
                 (now, limit))
             return [row["job_id"] for row in cursor.fetchall()]
 
-    def claim_async_job(self, job_id: str, lease_seconds: int = 300) -> bool:
+    def claim_async_job(self, job_id: str, lease_seconds: int = 300,
+                        max_concurrent_for_tenant: int | None = None) -> bool:
         now = datetime.now(UTC)
         lease_until = (now + timedelta(seconds=lease_seconds)).isoformat()
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("SELECT tenant_id, status FROM async_jobs WHERE job_id=%s FOR UPDATE", (job_id,))
+            job = cursor.fetchone()
+            if job is None or job["status"] != "queued":
+                return False
+            tenant_id = job["tenant_id"]
+            if tenant_id and max_concurrent_for_tenant is not None:
+                # Serialize claims for this tenant across gateway processes.
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("async-job-tenant:" + tenant_id,))
+                cursor.execute("SELECT status FROM async_jobs WHERE job_id=%s FOR UPDATE", (job_id,))
+                if cursor.fetchone()["status"] != "queued":
+                    return False
+                cursor.execute("SELECT COUNT(*) AS count FROM async_jobs WHERE tenant_id=%s AND status='running'",
+                               (tenant_id,))
+                if int(cursor.fetchone()["count"]) >= max_concurrent_for_tenant:
+                    return False
             cursor.execute("""UPDATE async_jobs SET status='running', started_at=COALESCE(started_at, %s),
                 attempt_count=attempt_count+1, next_attempt_at=NULL, updated_at=%s, lease_until=%s
                 WHERE job_id=%s AND status='queued' AND (next_attempt_at IS NULL OR next_attempt_at <= %s)""",
                 (now.isoformat(), now.isoformat(), lease_until, job_id, now.isoformat()))
             return cursor.rowcount == 1
+
+    def expired_tenant_async_job_artifacts(self, tenant_id: str, retention_days: int) -> list[str]:
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("""SELECT manifest_json, result_json FROM async_jobs WHERE tenant_id=%s
+                AND status IN ('completed','failed','cancelled','dead_letter')
+                AND COALESCE(completed_at, updated_at, created_at) < %s""", (tenant_id, cutoff))
+            rows = cursor.fetchall()
+        keys: set[str] = set()
+        for row in rows:
+            for column in ("manifest_json", "result_json"):
+                value = row[column]
+                if isinstance(value, str):
+                    value = json.loads(value)
+                if isinstance(value, dict) and value.get("artifact_key"):
+                    keys.add(value["artifact_key"])
+        return sorted(keys)
+
+    def prune_tenant_async_jobs(self, tenant_id: str, retention_days: int) -> int:
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("""DELETE FROM async_jobs WHERE tenant_id=%s
+                AND status IN ('completed','failed','cancelled','dead_letter')
+                AND COALESCE(completed_at, updated_at, created_at) < %s""", (tenant_id, cutoff))
+            return cursor.rowcount
 
     def renew_async_job_lease(self, job_id: str, lease_seconds: int = 300) -> bool:
         now = datetime.now(UTC)
