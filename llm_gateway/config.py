@@ -27,6 +27,24 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
             raise ValueError(f"server.{key} must be a non-negative number")
     if server.get("async_job_retry_max_delay_seconds", 300) < server.get("async_job_retry_base_delay_seconds", 1):
         raise ValueError("server.async_job_retry_max_delay_seconds must be at least the retry base delay")
+    async_jobs = config.get("async_jobs", {})
+    if not isinstance(async_jobs, dict):
+        raise TypeError("async_jobs must be an object")
+    job_webhooks = async_jobs.get("webhooks", {})
+    if not isinstance(job_webhooks, dict):
+        raise TypeError("async_jobs.webhooks must be an application map")
+    valid_job_events = {"queued", "progress", "completed", "cancelled", "dead_letter"}
+    for application, webhook in job_webhooks.items():
+        if (not isinstance(application, str) or not application or not isinstance(webhook, dict)
+                or not isinstance(webhook.get("url"), str)
+                or not webhook["url"].startswith(("https://", "http://"))):
+            raise ValueError("async_jobs.webhooks entries require an application and HTTP(S) url")
+        secret_env = webhook.get("secret_env")
+        if secret_env is not None and (not isinstance(secret_env, str) or not secret_env):
+            raise ValueError("async_jobs.webhooks secret_env must be a non-empty string")
+        events = webhook.get("events", list(valid_job_events))
+        if not isinstance(events, list) or any(event not in valid_job_events for event in events):
+            raise ValueError("async_jobs.webhooks events must contain supported job lifecycle events")
     object_storage = config.get("object_storage", {})
     if not isinstance(object_storage, dict) or object_storage.get("backend", "local") not in {"local", "s3"}:
         raise ValueError("object_storage must configure the 'local' or 's3' backend")

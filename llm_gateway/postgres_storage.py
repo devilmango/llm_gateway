@@ -69,9 +69,19 @@ class PostgresUsageStore:
                 event_id TEXT PRIMARY KEY, application TEXT NOT NULL, webhook_url TEXT NOT NULL,
                 secret_env TEXT, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
-                created_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT
+                created_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT,
+                job_id TEXT, event_type TEXT, updated_at TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS idx_webhook_outbox_due ON webhook_outbox(status, next_attempt_at)",
+            "ALTER TABLE webhook_outbox ADD COLUMN IF NOT EXISTS job_id TEXT",
+            "ALTER TABLE webhook_outbox ADD COLUMN IF NOT EXISTS event_type TEXT",
+            "ALTER TABLE webhook_outbox ADD COLUMN IF NOT EXISTS updated_at TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_webhook_outbox_job ON webhook_outbox(job_id, created_at)",
+            """CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
+                id BIGSERIAL PRIMARY KEY, event_id TEXT NOT NULL, attempted_at TEXT NOT NULL,
+                attempt INTEGER NOT NULL, outcome TEXT NOT NULL, http_status INTEGER, error TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_webhook_attempts_event ON webhook_delivery_attempts(event_id, attempt)",
             """CREATE TABLE IF NOT EXISTS admin_audit_events (
                 id BIGSERIAL PRIMARY KEY, occurred_at TEXT NOT NULL,
                 actor TEXT NOT NULL, action TEXT NOT NULL, status_code INTEGER NOT NULL
@@ -429,6 +439,18 @@ class PostgresUsageStore:
                 WHERE job_id=%s AND status='running'""", (now, job_id))
         return self.async_job(job_id)
 
+    def requeue_dead_letter_async_job(self, job_id: str, actor: str) -> bool:
+        now = datetime.now(UTC).isoformat()
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("""UPDATE async_jobs SET status='queued', attempt_count=0,
+                next_attempt_at=NULL, error=NULL, completed_at=NULL, cancel_requested=FALSE,
+                updated_at=%s WHERE job_id=%s AND status='dead_letter' AND payload_json IS NOT NULL""",
+                (now, job_id))
+            if cursor.rowcount:
+                cursor.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (%s,%s,%s,%s)",
+                    (now, actor, f"async_job_requeued:{job_id}", 200))
+            return bool(cursor.rowcount)
+
     def async_job_cancel_requested(self, job_id: str) -> bool:
         with self.pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute("SELECT cancel_requested FROM async_jobs WHERE job_id=%s", (job_id,))
@@ -457,7 +479,7 @@ class PostgresUsageStore:
                 updated_at=%s, completed_at=%s, lease_until=NULL,
                 payload_json=CASE WHEN %s THEN NULL ELSE payload_json END WHERE job_id=%s""",
                 (status, error[:500], next_at, now.isoformat(), now.isoformat() if terminal else None,
-                 terminal, job_id))
+                 status == "cancelled", job_id))
             return status
 
     def recover_stalled_async_jobs(self, *, max_attempts: int, base_delay_seconds: float,
@@ -477,8 +499,16 @@ class PostgresUsageStore:
                     next_attempt_at=%s, updated_at=%s, completed_at=%s, lease_until=NULL,
                     payload_json=CASE WHEN %s THEN NULL ELSE payload_json END WHERE job_id=%s""",
                     ("cancelled" if cancelled else "dead_letter" if terminal else "queued", next_at, now.isoformat(),
-                     now.isoformat() if terminal else None, terminal, job["job_id"]))
+                     now.isoformat() if terminal else None,
+                     bool(job["cancel_requested"]), job["job_id"]))
             return len(stalled)
+
+    def expired_async_job_leases(self, now: datetime | None = None) -> list[str]:
+        now = now or datetime.now(UTC)
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("""SELECT job_id FROM async_jobs
+                WHERE status='running' AND lease_until <= %s""", (now.isoformat(),))
+            return [row["job_id"] for row in cursor.fetchall()]
 
     def async_job_stats(self) -> dict[str, Any]:
         with self.pool.connection() as conn, conn.cursor() as cursor:
@@ -668,10 +698,12 @@ class PostgresUsageStore:
         with self.pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute("""INSERT INTO webhook_outbox
                 (event_id, application, webhook_url, secret_env, body, status, attempts,
-                 next_attempt_at, created_at) VALUES (%s,%s,%s,%s,%s,'pending',0,%s,%s)
+                 next_attempt_at, created_at, job_id, event_type, updated_at)
+                VALUES (%s,%s,%s,%s,%s,'pending',0,%s,%s,%s,%s,%s)
                 ON CONFLICT (event_id) DO NOTHING""",
-                (event["alert_id"], event["application"], webhook_url, secret_env,
-                 json.dumps(event, separators=(",", ":"), sort_keys=True), now.isoformat(), now.isoformat()))
+                (event.get("event_id") or event.get("alert_id"), event["application"], webhook_url, secret_env,
+                 json.dumps(event, separators=(",", ":"), sort_keys=True), now.isoformat(), now.isoformat(),
+                 event.get("job_id"), event.get("type"), now.isoformat()))
 
     def due_webhooks(self, limit: int = 20, now: datetime | None = None) -> list[dict[str, Any]]:
         now = now or datetime.now(UTC)
@@ -686,12 +718,16 @@ class PostgresUsageStore:
 
     def update_webhook(self, event_id: str, *, attempts: int, status: str,
                        next_attempt_at: datetime | None = None, delivered_at: datetime | None = None,
-                       last_error: str | None = None) -> None:
-        with self.pool.connection() as conn, conn.cursor() as cursor:
+                       last_error: str | None = None, http_status: int | None = None) -> None:
+        now = datetime.now(UTC)
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
             cursor.execute("""UPDATE webhook_outbox SET attempts=%s,status=%s,next_attempt_at=%s,
-                delivered_at=%s,last_error=%s WHERE event_id=%s""",
+                delivered_at=%s,last_error=%s,updated_at=%s WHERE event_id=%s""",
                 (attempts, status, (next_attempt_at or datetime.now(UTC)).isoformat(),
-                 delivered_at.isoformat() if delivered_at else None, last_error, event_id))
+                 delivered_at.isoformat() if delivered_at else None, last_error, now.isoformat(), event_id))
+            cursor.execute("""INSERT INTO webhook_delivery_attempts
+                (event_id,attempted_at,attempt,outcome,http_status,error) VALUES (%s,%s,%s,%s,%s,%s)""",
+                (event_id, now.isoformat(), attempts, status, http_status, last_error))
 
     def redrive_webhook(self, event_id: str, now: datetime | None = None) -> bool:
         now = now or datetime.now(UTC)
@@ -704,10 +740,23 @@ class PostgresUsageStore:
     def webhook_events(self, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         with self.pool.connection() as conn, conn.cursor() as cursor:
             if status:
-                cursor.execute("SELECT event_id,application,status,attempts,created_at,delivered_at,last_error FROM webhook_outbox WHERE status=%s ORDER BY created_at DESC LIMIT %s", (status, limit))
+                cursor.execute("SELECT event_id,application,status,attempts,created_at,delivered_at,last_error,job_id,event_type,updated_at FROM webhook_outbox WHERE status=%s ORDER BY created_at DESC LIMIT %s", (status, limit))
             else:
-                cursor.execute("SELECT event_id,application,status,attempts,created_at,delivered_at,last_error FROM webhook_outbox ORDER BY created_at DESC LIMIT %s", (limit,))
+                cursor.execute("SELECT event_id,application,status,attempts,created_at,delivered_at,last_error,job_id,event_type,updated_at FROM webhook_outbox ORDER BY created_at DESC LIMIT %s", (limit,))
             return cursor.fetchall()
+
+    def async_job_webhook_events(self, job_id: str) -> list[dict[str, Any]]:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("""SELECT event_id, application, status, attempts, created_at,
+                updated_at, delivered_at, last_error, event_type FROM webhook_outbox
+                WHERE job_id=%s ORDER BY created_at, event_id""", (job_id,))
+            events = cursor.fetchall()
+            for event in events:
+                cursor.execute("""SELECT attempted_at, attempt, outcome, http_status, error
+                    FROM webhook_delivery_attempts WHERE event_id=%s ORDER BY attempt, id""",
+                    (event["event_id"],))
+                event["delivery_history"] = cursor.fetchall()
+            return events
 
     def record_audit(self, actor: str, action: str, status_code: int,
                      now: datetime | None = None) -> None:

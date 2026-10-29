@@ -20,7 +20,7 @@ from pydantic import ValidationError
 
 from llm_gateway.client import ToolApprovalError, execute_tool_with_approval
 from llm_gateway.evaluation import compare_routes, evaluate_cases
-from llm_gateway.main import _deliver_webhook_batch, create_app
+from llm_gateway.main import _deliver_webhook_batch, _emit_async_job_event, create_app
 from llm_gateway.providers import ProviderClient
 from llm_gateway.schemas import ChatRequest
 from llm_gateway.storage import create_usage_store
@@ -2066,6 +2066,75 @@ def test_async_jobs_support_retry_cancellation_and_queue_statistics(tmp_path):
                                             max_delay_seconds=0) >= 1
     assert store.async_job(stalled["job_id"])["status"] == "queued"
     assert store.async_job_stats()["dead_letter"] == 1
+
+
+def test_dead_letter_job_can_be_requeued_with_payload_and_operator_audit(tmp_path):
+    store = create_usage_store(str(tmp_path / "dead-letter-requeue.sqlite3"))
+    job = store.create_async_job("embedding_batch", "tenant-a", "operator",
+        {"application": "search", "input": ["keep me"]}, progress_total=1, max_attempts=1)
+    assert store.claim_async_job(job["job_id"])
+    assert store.fail_async_job(job["job_id"], "TimeoutError", max_attempts=1,
+        base_delay_seconds=0, max_delay_seconds=0) == "dead_letter"
+    assert store.async_job(job["job_id"], include_payload=True)["payload"]["input"] == ["keep me"]
+
+    assert store.requeue_dead_letter_async_job(job["job_id"], "ops-user") is True
+    recovered = store.async_job(job["job_id"], include_payload=True)
+    assert recovered["status"] == "queued"
+    assert recovered["attempt_count"] == 0
+    assert recovered["payload"]["input"] == ["keep me"]
+    assert store.requeue_dead_letter_async_job(job["job_id"], "ops-user") is False
+    audit = store.audit_events(limit=10)
+    assert any(event["actor"] == "ops-user"
+        and event["action"] == f"async_job_requeued:{job['job_id']}" for event in audit)
+
+
+@pytest.mark.asyncio
+async def test_signed_job_webhook_delivery_records_attempt_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("JOB_EVENT_SECRET", "job-event-secret")
+    store = create_usage_store(str(tmp_path / "job-webhook.sqlite3"))
+    requests = []
+
+    async def receive(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    app = SimpleNamespace(state=SimpleNamespace(
+        config={"async_jobs": {"webhooks": {"search": {
+            "url": "https://hooks.test/jobs", "secret_env": "JOB_EVENT_SECRET"}}}},
+        store=store, http=httpx.AsyncClient(transport=httpx.MockTransport(receive))))
+    job = store.create_async_job("embedding_batch", "tenant-a", "operator",
+        {"application": "search", "input": ["private input must not be included"]}, progress_total=1)
+
+    await _emit_async_job_event(app, {**job, "payload": {"application": "search"}}, "queued")
+    await _deliver_webhook_batch(app)
+
+    event = store.async_job_webhook_events(job["job_id"])[0]
+    request = requests[0]
+    expected = "sha256=" + hmac.new(b"job-event-secret", request.content, hashlib.sha256).hexdigest()
+    assert request.headers["X-LLM-Gateway-Signature"] == expected
+    assert request.headers["X-LLM-Gateway-Event"] == "queued"
+    assert request.headers["Idempotency-Key"] == event["event_id"]
+    assert b"private input" not in request.content
+    assert event["status"] == "delivered"
+    assert len(event["delivery_history"]) == 1
+    assert event["delivery_history"][0]["http_status"] == 204
+    await app.state.http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_admin_job_retry_requires_exact_confirmation_and_dead_letter(tmp_path):
+    cfg = config(str(tmp_path / "job-retry-api.sqlite3"))
+    async with gateway_client(cfg, httpx.MockTransport(lambda request: success_response())) as client:
+        store = create_usage_store(cfg["server"]["database"])
+        job = store.create_async_job("embedding_batch", None, "admin",
+            {"application": "search", "input": ["one"]}, 1)
+        mismatch = await client.post(f"/v1/admin/async-jobs/{job['job_id']}/retry?confirm_job_id=wrong")
+        assert mismatch.status_code == 400
+        not_dead = await client.post(
+            f"/v1/admin/async-jobs/{job['job_id']}/retry?confirm_job_id={job['job_id']}")
+        assert not_dead.status_code == 409
+        assert (await client.get(f"/v1/admin/async-jobs/{job['job_id']}/webhooks")).json() == {
+            "job_id": job["job_id"], "events": []}
 
 
 def test_async_job_idempotency_and_tenant_queue_limit(tmp_path):

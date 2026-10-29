@@ -11,6 +11,17 @@ server:
   async_job_retry_base_delay_seconds: 1
   async_job_retry_max_delay_seconds: 300
 
+# Optional signed lifecycle notifications for asynchronous jobs. Webhooks are
+# matched by application name, tenant ID, "tenant:application", or "*".
+# Signing secrets are read from the named environment variable at delivery time.
+async_jobs:
+  webhooks: {}
+  # webhooks:
+  #   support-router:
+  #     url: https://hooks.example.com/llm-gateway/jobs
+  #     secret_env: JOB_WEBHOOK_SECRET
+  #     events: [queued, progress, completed, cancelled, dead_letter]
+
 # Job artifacts are written outside the usage database. Use `local` for a
 # single-node install or `s3` for shared object storage across gateway replicas.
 object_storage:

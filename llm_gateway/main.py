@@ -104,6 +104,9 @@ async def _deliver_webhook_batch(app: FastAPI, batch_size: int = 20) -> None:
         try:
             body = event["body"].encode("utf-8")
             headers = {"Content-Type": "application/json", "Idempotency-Key": event["event_id"]}
+            if event.get("event_type"):
+                headers["X-LLM-Gateway-Event"] = event["event_type"]
+                headers["X-LLM-Gateway-Event-Id"] = event["event_id"]
             secret = os.getenv(event.get("secret_env") or "", "")
             if secret:
                 signature = hmac.new(secret.encode("utf-8"), body, "sha256").hexdigest()
@@ -113,16 +116,18 @@ async def _deliver_webhook_batch(app: FastAPI, batch_size: int = 20) -> None:
             attempts = int(event["attempts"]) + 1
             if not response.is_error:
                 await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
-                    status="delivered", delivered_at=datetime.now(UTC), last_error=None)
+                    status="delivered", delivered_at=datetime.now(UTC), last_error=None,
+                    http_status=response.status_code)
             elif response.status_code < 500 and response.status_code != 429:
                 await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
-                    status="dead_letter", last_error=f"HTTP{response.status_code}")
+                    status="dead_letter", last_error=f"HTTP{response.status_code}",
+                    http_status=response.status_code)
             else:
                 status = "dead_letter" if attempts >= 8 else "pending"
                 delay = min(300, 2 ** min(attempts, 8))
                 await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
                     status=status, next_attempt_at=datetime.now(UTC) + timedelta(seconds=delay),
-                    last_error=f"HTTP{response.status_code}")
+                    last_error=f"HTTP{response.status_code}", http_status=response.status_code)
         except (httpx.HTTPError, ValueError) as exc:
             attempts = int(event["attempts"]) + 1
             status = "dead_letter" if attempts >= 8 else "pending"
@@ -207,18 +212,55 @@ async def _submit_async_job(request: Request, job_type: str, tenant_id: str | No
                             idempotency_key: str | None, idempotency_scope: str,
                             max_queued_for_tenant: int | None = None) -> dict[str, Any]:
     try:
-        return await asyncio.to_thread(request.app.state.store.create_async_job, job_type, tenant_id,
+        job = await asyncio.to_thread(request.app.state.store.create_async_job, job_type, tenant_id,
             actor, payload, progress_total, max_attempts, idempotency_key=idempotency_key,
             idempotency_scope=idempotency_scope, max_queued_for_tenant=max_queued_for_tenant)
+        await _emit_async_job_event(request.app, {**job, "payload": payload}, "queued")
+        return job
     except AsyncJobIdempotencyConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except AsyncJobQueueLimitExceeded as exc:
         raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "5"}) from exc
 
 
+async def _emit_async_job_event(app: FastAPI, job: dict[str, Any], event_type: str) -> None:
+    """Persist a configured job lifecycle event; event IDs make enqueue idempotent."""
+    webhooks = app.state.config.get("async_jobs", {}).get("webhooks", {})
+    payload = job.get("payload") or {}
+    tenant_id = job.get("tenant_id")
+    application = payload.get("application") or tenant_id or "system"
+    webhook = webhooks.get(f"{tenant_id}:{application}") or webhooks.get(application) or webhooks.get(tenant_id) or webhooks.get("*")
+    if not webhook or event_type not in webhook.get("events", ["queued", "progress", "completed", "cancelled", "dead_letter"]):
+        return
+    event_revision = job.get("updated_at") or job.get("created_at") or "initial"
+    event_id = f"{job['job_id']}:{event_type}:{job.get('progress_completed', 0)}:{event_revision}"
+    event = {"event_id": event_id, "type": event_type, "job_id": job["job_id"],
+        "job_type": job["job_type"], "application": application, "tenant_id": tenant_id,
+        "status": job.get("status"), "progress": {"completed": int(job.get("progress_completed", 0)),
+            "total": int(job.get("progress_total", 0))}, "occurred_at": datetime.now(UTC).isoformat()}
+    await asyncio.to_thread(app.state.store.enqueue_webhook, event, webhook["url"], webhook.get("secret_env"))
+
+
+async def _update_async_job(app: FastAPI, job_id: str, **changes: Any) -> None:
+    before = await asyncio.to_thread(app.state.store.async_job, job_id, include_payload=True)
+    if before is None:
+        return
+    await asyncio.to_thread(app.state.store.update_async_job, job_id, **changes)
+    after = await asyncio.to_thread(app.state.store.async_job, job_id)
+    if after is None:
+        return
+    after["payload"] = before.get("payload")
+    old_progress = int(before.get("progress_completed", 0))
+    new_progress = int(after.get("progress_completed", 0))
+    if after.get("status") in {"completed", "cancelled", "dead_letter"} and after.get("status") != before.get("status"):
+        await _emit_async_job_event(app, after, after["status"])
+    elif new_progress > old_progress:
+        await _emit_async_job_event(app, after, "progress")
+
+
 async def _check_job_cancelled(app: FastAPI, job_id: str) -> None:
     if await asyncio.to_thread(app.state.store.async_job_cancel_requested, job_id):
-        await asyncio.to_thread(app.state.store.update_async_job, job_id, status="cancelled",
+        await _update_async_job(app, job_id, status="cancelled",
                                 error="cancelled_by_operator", clear_payload=True)
         raise asyncio.CancelledError
 
@@ -261,7 +303,7 @@ async def _process_embedding_job(app: FastAPI, job: dict[str, Any]) -> None:
             for (index, _), vector in zip(batch, vectors, strict=True):
                 results.append({"index": index, "status": "succeeded", "embedding": vector,
                     "provider": info["provider"], "model": info["model"]})
-                await asyncio.to_thread(app.state.store.update_async_job, job["job_id"],
+                await _update_async_job(app, job["job_id"],
                     progress_completed=len(results), usage=usage,
                     lease_seconds=lease_seconds)
         except HTTPException as exc:
@@ -272,7 +314,7 @@ async def _process_embedding_job(app: FastAPI, job: dict[str, Any]) -> None:
             for index, _ in batch:
                 results.append({"index": index, "status": "failed",
                     "error": f"embedding_request_failed_{exc.status_code}"})
-                await asyncio.to_thread(app.state.store.update_async_job, job["job_id"],
+                await _update_async_job(app, job["job_id"],
                     progress_completed=len(results), usage=usage,
                     lease_seconds=lease_seconds)
 
@@ -291,7 +333,7 @@ async def _process_embedding_job(app: FastAPI, job: dict[str, Any]) -> None:
     await asyncio.to_thread(app.state.artifacts.put, artifact_key, artifact_body)
     manifest["artifact_key"] = artifact_key
     manifest["artifact_bytes"] = len(artifact_body)
-    await asyncio.to_thread(app.state.store.update_async_job, job["job_id"], status="completed",
+    await _update_async_job(app, job["job_id"], status="completed",
         progress_completed=len(results), usage=usage, manifest=manifest,
         result={"artifact_key": artifact_key, "format": "application/json"}, clear_payload=True)
 
@@ -312,6 +354,8 @@ async def _process_tenant_data_job(app: FastAPI, job: dict[str, Any]) -> None:
                   "download_url": f"/v1/admin/tenant-data-jobs/{job['job_id']}/download"}
         await asyncio.to_thread(app.state.store.finish_tenant_data_job, job["job_id"], tenant_id,
             actor, "export_job_completed", counts, result, manifest)
+        await _emit_async_job_event(app, {**job, "status": "completed",
+            "progress_completed": job.get("progress_total", 0)}, "completed")
         return
     artifact_keys = await asyncio.to_thread(app.state.store.tenant_job_artifact_keys, tenant_id, job["job_id"])
     for artifact_key in artifact_keys:
@@ -321,6 +365,8 @@ async def _process_tenant_data_job(app: FastAPI, job: dict[str, Any]) -> None:
     manifest = {"deleted_record_counts": counts, "record_count": sum(counts.values())}
     await asyncio.to_thread(app.state.store.finish_tenant_data_job, job["job_id"], tenant_id,
         actor, "delete_job_completed", counts, {"tenant_id": tenant_id, "manifest": manifest}, manifest)
+    await _emit_async_job_event(app, {**job, "status": "completed",
+        "progress_completed": job.get("progress_total", 0)}, "completed")
 
 
 async def _process_retrieval_evaluation_job(app: FastAPI, job: dict[str, Any]) -> None:
@@ -350,7 +396,7 @@ async def _process_retrieval_evaluation_job(app: FastAPI, job: dict[str, Any]) -
                     "cost_usd": 0.0, "error": f"evaluation_case_failed_{type(exc).__name__}",
                     "retrieval_metrics": {name: 0.0 for name in retrieval_metrics(
                         ["__missing__"], case["relevant_document_ids"])}})
-        await asyncio.to_thread(app.state.store.update_async_job, job["job_id"],
+        await _update_async_job(app, job["job_id"],
             progress_completed=index + 1, lease_seconds=int(app.state.config.get("server", {}).get(
                 "async_job_lease_seconds", 300)))
 
@@ -379,7 +425,7 @@ async def _process_retrieval_evaluation_job(app: FastAPI, job: dict[str, Any]) -
     result = {"baseline": {**saved_runs["baseline"], "summary": summaries["baseline"]},
         "candidate": {**saved_runs["candidate"], "summary": summaries["candidate"]},
         "comparison_id": comparison_ref["comparison_id"], "comparison": comparison}
-    await asyncio.to_thread(app.state.store.update_async_job, job["job_id"], status="completed",
+    await _update_async_job(app, job["job_id"], status="completed",
         progress_completed=len(payload["cases"]),
         manifest={"case_count": len(payload["cases"]), "comparison_id": comparison_ref["comparison_id"]},
         result=result, clear_payload=True)
@@ -420,6 +466,11 @@ async def _run_async_job(app: FastAPI, job_id: str) -> None:
             type(exc).__name__, max_attempts=int(server.get("async_job_max_attempts", 5)),
             base_delay_seconds=float(server.get("async_job_retry_base_delay_seconds", 1)),
             max_delay_seconds=float(server.get("async_job_retry_max_delay_seconds", 300)))
+        if status in {"cancelled", "dead_letter"}:
+            terminal = await asyncio.to_thread(app.state.store.async_job, job_id)
+            if terminal:
+                terminal["payload"] = job.get("payload")
+                await _emit_async_job_event(app, terminal, status)
         logger.info("async_job_failure_recorded job_id=%s status=%s", job_id, status)
     finally:
         heartbeat.cancel()
@@ -431,10 +482,18 @@ async def _async_job_dispatch_loop(app: FastAPI) -> None:
         try:
             capacity = int(app.state.config.get("server", {}).get("async_job_concurrency", 4))
             server = app.state.config.get("server", {})
+            expired_ids = await asyncio.to_thread(app.state.store.expired_async_job_leases)
+            expired_jobs = {job_id: await asyncio.to_thread(app.state.store.async_job,
+                job_id, include_payload=True) for job_id in expired_ids}
             await asyncio.to_thread(app.state.store.recover_stalled_async_jobs,
                 max_attempts=int(server.get("async_job_max_attempts", 5)),
                 base_delay_seconds=float(server.get("async_job_retry_base_delay_seconds", 1)),
                 max_delay_seconds=float(server.get("async_job_retry_max_delay_seconds", 300)))
+            for job_id, before in expired_jobs.items():
+                recovered = await asyncio.to_thread(app.state.store.async_job, job_id)
+                if before and recovered and recovered["status"] in {"cancelled", "dead_letter"}:
+                    recovered["payload"] = before.get("payload")
+                    await _emit_async_job_event(app, recovered, recovered["status"])
             available = max(capacity - len(app.state.job_tasks), 0)
             if available:
                 tenants = app.state.config.get("tenants",
@@ -1046,10 +1105,12 @@ def create_app(config: dict[str, Any] | None = None,
     @app.delete("/v1/embeddings/jobs/{job_id}")
     async def cancel_embedding_job(job_id: str, request: Request,
                                    tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
-        job = await asyncio.to_thread(request.app.state.store.async_job, job_id)
+        job = await asyncio.to_thread(request.app.state.store.async_job, job_id, include_payload=True)
         if job is None or job["job_type"] != "embedding_batch" or job.get("tenant_id") != (tenant["id"] if tenant else None):
             raise HTTPException(status_code=404, detail="Embedding job was not found")
         cancelled = await asyncio.to_thread(request.app.state.store.cancel_async_job, job_id)
+        if cancelled and cancelled["status"] == "cancelled":
+            await _emit_async_job_event(request.app, {**cancelled, "payload": job.get("payload")}, "cancelled")
         return _async_job_response(cancelled or job)
 
     @app.get("/v1/embeddings/jobs/{job_id}/results")
@@ -1082,10 +1143,39 @@ def create_app(config: dict[str, Any] | None = None,
 
     @app.delete("/v1/admin/async-jobs/{job_id}", dependencies=[Depends(admin_dependency("report"))])
     async def cancel_async_job(job_id: str, request: Request) -> dict[str, Any]:
+        before = await asyncio.to_thread(request.app.state.store.async_job, job_id, include_payload=True)
         job = await asyncio.to_thread(request.app.state.store.cancel_async_job, job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Async job was not found")
+        if job["status"] == "cancelled":
+            await _emit_async_job_event(request.app, {**job, "payload": (before or {}).get("payload")}, "cancelled")
         return _async_job_response(job)
+
+    @app.get("/v1/admin/async-jobs/{job_id}/webhooks", dependencies=[Depends(admin_dependency("report"))])
+    async def async_job_webhook_history(job_id: str, request: Request) -> dict[str, Any]:
+        job = await asyncio.to_thread(request.app.state.store.async_job, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Async job was not found")
+        events = await asyncio.to_thread(request.app.state.store.async_job_webhook_events, job_id)
+        return {"job_id": job_id, "events": events}
+
+    @app.post("/v1/admin/async-jobs/{job_id}/retry", dependencies=[Depends(admin_dependency("report"))])
+    async def retry_dead_letter_async_job(job_id: str, request: Request,
+                                          confirm_job_id: str = Query(..., min_length=1)) -> dict[str, Any]:
+        if confirm_job_id != job_id:
+            raise HTTPException(status_code=400, detail="confirm_job_id must exactly match the job_id")
+        job = await asyncio.to_thread(request.app.state.store.async_job, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Async job was not found")
+        if job["status"] != "dead_letter":
+            raise HTTPException(status_code=409, detail="Only dead-letter jobs can be retried")
+        actor = getattr(request.state, "admin_actor", "unknown-admin")
+        requeued = await asyncio.to_thread(request.app.state.store.requeue_dead_letter_async_job, job_id, actor)
+        if not requeued:
+            raise HTTPException(status_code=409, detail="Dead-letter job has no retained payload or is no longer retryable")
+        updated = await asyncio.to_thread(request.app.state.store.async_job, job_id, include_payload=True)
+        await _emit_async_job_event(request.app, updated or {}, "queued")
+        return _async_job_response(updated or {})
 
     @app.post("/v1/rerank")
     async def rerank(body: RerankRequest, request: Request,
