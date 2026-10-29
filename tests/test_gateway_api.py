@@ -1960,6 +1960,40 @@ async def test_async_embedding_job_batches_reports_progress_usage_and_item_resul
 
 
 @pytest.mark.asyncio
+async def test_embedding_job_submission_is_idempotent_and_rejects_key_reuse(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
+    cfg = config(str(tmp_path / "job-idempotency-api.sqlite3"))
+    cfg["providers"]["primary"]["models"]["embed-model"] = {"input_cost_per_1m": 1}
+    cfg["embedding_routes"] = {"retrieval": {"provider": "primary", "model": "embed-model"}}
+    calls = 0
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        inputs = json.loads(request.content)["input"]
+        return httpx.Response(200, json={"model": "embed-model", "data": [
+            {"index": index, "embedding": [1.0]} for index, _ in enumerate(inputs)],
+            "usage": {"prompt_tokens": len(inputs), "total_tokens": len(inputs)}})
+
+    async with gateway_client(cfg, httpx.MockTransport(upstream)) as client:
+        headers = {"Idempotency-Key": "batch-77"}
+        request = {"model": "retrieval", "input": ["one", "two"], "application": "search"}
+        first = await client.post("/v1/embeddings/jobs", json=request, headers=headers)
+        second = await client.post("/v1/embeddings/jobs", json=request, headers=headers)
+        changed = await client.post("/v1/embeddings/jobs",
+            json={**request, "input": ["different"]}, headers=headers)
+        assert first.status_code == second.status_code == 202
+        assert first.json()["job_id"] == second.json()["job_id"]
+        assert changed.status_code == 409
+        for _ in range(100):
+            status = await client.get(f"/v1/embeddings/jobs/{first.json()['job_id']}")
+            if status.json()["status"] == "completed":
+                break
+            await asyncio.sleep(0.01)
+        assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_async_embedding_results_are_artifact_backed_and_paginated(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_PRIMARY_KEY", "primary-secret")
     monkeypatch.setenv("GATEWAY_API_KEY", "admin-secret")
@@ -2034,6 +2068,63 @@ def test_async_jobs_support_retry_cancellation_and_queue_statistics(tmp_path):
     assert store.async_job_stats()["dead_letter"] == 1
 
 
+def test_async_job_idempotency_and_tenant_queue_limit(tmp_path):
+    store = create_usage_store(str(tmp_path / "idempotent-jobs.sqlite3"))
+    first = store.create_async_job("embedding_batch", "tenant-a", "search", {"input": ["one"]}, 1,
+        idempotency_key="request-1", idempotency_scope="tenant-a:search", max_queued_for_tenant=1)
+    replay = store.create_async_job("embedding_batch", "tenant-a", "search", {"input": ["one"]}, 1,
+        idempotency_key="request-1", idempotency_scope="tenant-a:search", max_queued_for_tenant=1)
+    assert replay["job_id"] == first["job_id"]
+    with pytest.raises(ValueError, match="Idempotency-Key"):
+        store.create_async_job("embedding_batch", "tenant-a", "search", {"input": ["different"]}, 1,
+            idempotency_key="request-1", idempotency_scope="tenant-a:search", max_queued_for_tenant=1)
+    with pytest.raises(ValueError, match="queue limit"):
+        store.create_async_job("embedding_batch", "tenant-a", "search", {"input": ["two"]}, 1,
+            idempotency_key="request-2", idempotency_scope="tenant-a:search", max_queued_for_tenant=1)
+
+
+def test_async_jobs_dispatch_fairly_across_tenants(tmp_path):
+    store = create_usage_store(str(tmp_path / "fair-jobs.sqlite3"))
+    first_a = store.create_async_job("embedding_batch", "tenant-a", "a", {}, 1)
+    second_a = store.create_async_job("embedding_batch", "tenant-a", "a", {}, 1)
+    first_b = store.create_async_job("embedding_batch", "tenant-b", "b", {}, 1)
+    first_c = store.create_async_job("embedding_batch", "tenant-c", "c", {}, 1)
+    assert store.pending_async_jobs(4) == [first_a["job_id"], first_b["job_id"],
+        first_c["job_id"], second_a["job_id"]]
+    assert store.claim_async_job(first_a["job_id"])
+    assert store.pending_async_jobs(3, {"tenant-a": 1}) == [first_b["job_id"], first_c["job_id"]]
+
+
+def test_fair_dispatch_remembers_tenants_that_recently_ran(tmp_path):
+    store = create_usage_store(str(tmp_path / "fair-job-turns.sqlite3"))
+    first_a = store.create_async_job("embedding_batch", "tenant-a", "a", {}, 1)
+    second_a = store.create_async_job("embedding_batch", "tenant-a", "a", {}, 1)
+    first_b = store.create_async_job("embedding_batch", "tenant-b", "b", {}, 1)
+    assert store.claim_async_job(first_a["job_id"])
+    store.update_async_job(first_a["job_id"], status="completed")
+    assert store.pending_async_jobs(1) == [first_b["job_id"]]
+    assert second_a["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_provider_health_and_circuits_are_operation_scoped():
+    from llm_gateway.circuit import ProviderCircuitBreaker
+    from llm_gateway.provider_health import ProviderHealth
+
+    breaker = ProviderCircuitBreaker(["provider"], failure_threshold=1, recovery_seconds=30)
+    assert await breaker.allow("provider", operation="embeddings")
+    await breaker.failure("provider", operation="embeddings")
+    assert not await breaker.allow("provider", operation="embeddings")
+    assert await breaker.allow("provider", operation="chat")
+    health = ProviderHealth()
+    await health.record("provider", 100, False, operation="embeddings")
+    await health.record("provider", 20, True, operation="chat")
+    snapshot = await health.snapshot_scoped(["provider"], ["chat", "embeddings", "rerank"])
+    assert snapshot["provider"]["embeddings"]["failures"] == 1
+    assert snapshot["provider"]["chat"]["successes"] == 1
+    assert "rerank" not in snapshot["provider"]
+
+
 def test_tenant_job_concurrency_is_enforced_and_retention_prunes_artifacts(tmp_path):
     database = str(tmp_path / "tenant-job-controls.sqlite3")
     store = create_usage_store(database)
@@ -2088,8 +2179,10 @@ async def test_embedding_provider_circuit_state_is_reported_and_skips_open_provi
 
     def upstream(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.host)
-        if request.url.host == "primary.test":
+        if request.url.host == "primary.test" and request.url.path.endswith("/embeddings"):
             return httpx.Response(503)
+        if request.url.path.endswith("/chat/completions"):
+            return success_response()
         inputs = json.loads(request.content)["input"]
         return httpx.Response(200, json={"model": "embed-model", "data": [
             {"index": i, "embedding": [1.0]} for i, _ in enumerate(inputs)],
@@ -2101,9 +2194,13 @@ async def test_embedding_provider_circuit_state_is_reported_and_skips_open_provi
             assert result.status_code == 200
             assert result.json()["gateway"]["provider"] == "backup"
         health = (await client.get("/v1/admin/providers")).json()["providers"]
-        assert health["primary"]["state"] == "open"
-        assert health["primary"]["failures"] == 1
+        assert health["primary"]["operations"]["embeddings"]["state"] == "open"
+        assert health["primary"]["operations"]["embeddings"]["failures"] == 1
+        assert health["primary"]["operations"]["chat"]["state"] == "closed"
         assert calls.count("primary.test") == 1
+        chat = await client.post("/v1/chat/completions", json={"model": "simple",
+            "messages": [{"role": "user", "content": "chat still works"}]})
+        assert chat.status_code == 200
 
 
 @pytest.mark.asyncio
@@ -2136,8 +2233,9 @@ async def test_native_reranker_circuit_state_is_reported_and_falls_back(tmp_path
             assert result.status_code == 200
             assert result.json()["gateway"]["reranker"] == "cosine_similarity"
         health = (await client.get("/v1/admin/providers")).json()["providers"]
-        assert health["cohere"]["state"] == "open"
-        assert health["cohere"]["failures"] == 1
+        assert health["cohere"]["operations"]["rerank"]["state"] == "open"
+        assert health["cohere"]["operations"]["rerank"]["failures"] == 1
+        assert health["cohere"]["operations"]["chat"]["state"] == "closed"
         assert calls == 1
 
 

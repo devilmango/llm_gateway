@@ -99,6 +99,7 @@ security:
 #     allowed_tools: [lookup_order, search_policy]
 #     job_policy:
 #       max_concurrent_jobs: 2
+#       max_queued_jobs: 100
 #       max_job_items: 10000
 #       max_job_input_bytes: 5000000
 #       retention_days: 14

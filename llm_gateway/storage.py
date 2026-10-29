@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -13,6 +14,14 @@ from .config import MIN_TENANT_USAGE_RETENTION_DAYS
 
 class BudgetExceeded(Exception):
     pass
+
+
+class AsyncJobIdempotencyConflict(ValueError):
+    """An idempotency key was reused for a different job request."""
+
+
+class AsyncJobQueueLimitExceeded(ValueError):
+    """The tenant has reached its configured queued job limit."""
 
 
 class UsageStore:
@@ -152,6 +161,13 @@ class UsageStore:
                 if column not in job_columns:
                     db.execute(f"ALTER TABLE async_jobs ADD COLUMN {column} {declaration}")
             db.execute("CREATE INDEX IF NOT EXISTS idx_async_jobs_due ON async_jobs(status, next_attempt_at, created_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_async_jobs_tenant_status_created ON async_jobs(tenant_id, status, created_at)")
+            for column in ("idempotency_scope", "idempotency_key_hash", "request_fingerprint"):
+                if column not in job_columns:
+                    db.execute(f"ALTER TABLE async_jobs ADD COLUMN {column} TEXT")
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_async_jobs_idempotency
+                ON async_jobs(idempotency_scope, job_type, idempotency_key_hash)
+                WHERE idempotency_key_hash IS NOT NULL""")
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.database, timeout=10)
@@ -342,15 +358,39 @@ class UsageStore:
 
     def create_async_job(self, job_type: str, tenant_id: str | None, actor: str | None,
                          payload: dict[str, Any], progress_total: int,
-                         max_attempts: int = 5) -> dict[str, Any]:
+                         max_attempts: int = 5, *, idempotency_key: str | None = None,
+                         idempotency_scope: str | None = None,
+                         max_queued_for_tenant: int | None = None) -> dict[str, Any]:
         job_id, now = "job_" + uuid.uuid4().hex, datetime.now(UTC).isoformat()
+        scope = idempotency_scope or tenant_id or actor or "anonymous"
+        key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest() if idempotency_key else None
+        fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+            separators=(",", ":")).encode("utf-8")).hexdigest() if key_hash else None
+        existing_job_id = None
         with self._lock, self._connect() as db:
-            db.execute("""INSERT INTO async_jobs (job_id, job_type, tenant_id, actor, status,
-                progress_total, max_attempts, payload_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)""",
-                (job_id, job_type, tenant_id, actor, progress_total, max_attempts,
-                 json.dumps(payload, separators=(",", ":")), now, now))
-        return self.async_job(job_id) or {}
+            db.execute("BEGIN IMMEDIATE")
+            if key_hash:
+                existing = db.execute("""SELECT job_id, request_fingerprint FROM async_jobs
+                    WHERE idempotency_scope=? AND job_type=? AND idempotency_key_hash=?""",
+                    (scope, job_type, key_hash)).fetchone()
+                if existing:
+                    if existing["request_fingerprint"] != fingerprint:
+                        raise AsyncJobIdempotencyConflict("Idempotency-Key was reused with a different request")
+                    existing_job_id = existing["job_id"]
+            if existing_job_id is None and tenant_id and max_queued_for_tenant is not None:
+                queued = db.execute("SELECT COUNT(*) FROM async_jobs WHERE tenant_id=? AND status='queued'",
+                                    (tenant_id,)).fetchone()[0]
+                if queued >= max_queued_for_tenant:
+                    raise AsyncJobQueueLimitExceeded("Tenant async job queue limit reached")
+            if existing_job_id is None:
+                db.execute("""INSERT INTO async_jobs (job_id, job_type, tenant_id, actor, status,
+                progress_total, max_attempts, payload_json, created_at, updated_at,
+                idempotency_scope, idempotency_key_hash, request_fingerprint)
+                VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (job_id, job_type, tenant_id, actor, progress_total, max_attempts,
+                 json.dumps(payload, separators=(",", ":")), now, now,
+                     scope if key_hash else None, key_hash, fingerprint))
+        return self.async_job(existing_job_id or job_id) or {}
 
     def async_job(self, job_id: str, *, include_payload: bool = False,
                   include_results: bool = False) -> dict[str, Any] | None:
@@ -449,12 +489,38 @@ class UsageStore:
             "dead_letter": counts.get("dead_letter", 0), "counts_by_status": counts,
             "average_duration_ms": round(float(duration or 0), 2), "recent_durations_ms": durations}
 
-    def pending_async_jobs(self, limit: int = 20) -> list[str]:
+    def pending_async_jobs(self, limit: int = 20,
+                           tenant_limits: dict[str, int] | None = None) -> list[str]:
         now = datetime.now(UTC).isoformat()
         with self._lock, self._connect() as db:
-            rows = db.execute("""SELECT job_id FROM async_jobs WHERE status='queued'
-                AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at LIMIT ?""",
-                (now, limit)).fetchall()
+            blocked: list[str] = []
+            if tenant_limits:
+                running = {row["tenant_id"]: int(row["count"]) for row in db.execute(
+                    "SELECT tenant_id, COUNT(*) AS count FROM async_jobs "
+                    "WHERE status='running' AND tenant_id IS NOT NULL GROUP BY tenant_id").fetchall()}
+                blocked = [tenant_id for tenant_id, cap in tenant_limits.items()
+                           if running.get(tenant_id, 0) >= cap]
+            exclusion = (f" AND (queued.tenant_id IS NULL OR queued.tenant_id NOT IN "
+                         f"({','.join('?' for _ in blocked)}))") if blocked else ""
+            rows = db.execute("""WITH due AS (
+                SELECT queued.job_id, queued.tenant_id, queued.actor, queued.created_at,
+                    CASE WHEN queued.tenant_id IS NOT NULL THEN 'tenant:' || queued.tenant_id
+                        ELSE 'actor:' || COALESCE(queued.actor, '') END AS fairness_key,
+                    (SELECT COUNT(*) FROM async_jobs running WHERE running.status='running'
+                        AND running.tenant_id IS queued.tenant_id
+                        AND (queued.tenant_id IS NOT NULL OR running.actor IS queued.actor)) AS running_count,
+                    (SELECT MAX(previous.started_at) FROM async_jobs previous
+                        WHERE previous.tenant_id IS queued.tenant_id
+                        AND (queued.tenant_id IS NOT NULL OR previous.actor IS queued.actor)) AS last_started_at
+                FROM async_jobs queued WHERE queued.status='queued'""" + exclusion + """
+                    AND (queued.next_attempt_at IS NULL OR queued.next_attempt_at <= ?)
+            ), ranked AS (
+                SELECT job_id, created_at, fairness_key, running_count, last_started_at,
+                    ROW_NUMBER() OVER (PARTITION BY fairness_key ORDER BY created_at, job_id) AS tenant_position
+                FROM due
+            ) SELECT job_id FROM ranked
+                ORDER BY running_count, last_started_at, tenant_position, created_at, fairness_key LIMIT ?""",
+                (*blocked, now, limit)).fetchall()
             return [row["job_id"] for row in rows]
 
     def claim_async_job(self, job_id: str, lease_seconds: int = 300,

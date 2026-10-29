@@ -75,7 +75,12 @@ from .schemas import (
 from .secrets import SecretUnavailable, resolve_secret
 from .service import GatewayService
 from .shadow import promotion_gates, quality_passed, should_sample
-from .storage import BudgetExceeded, create_usage_store
+from .storage import (
+    AsyncJobIdempotencyConflict,
+    AsyncJobQueueLimitExceeded,
+    BudgetExceeded,
+    create_usage_store,
+)
 from .tool_governance import (
     ToolGovernanceError,
     effective_tool_policy,
@@ -186,6 +191,29 @@ def _async_job_response(job: dict[str, Any]) -> dict[str, Any]:
         "duration_ms": duration_ms, "cancel_requested": bool(job.get("cancel_requested", False)),
         "created_at": job.get("created_at"), "updated_at": job.get("updated_at"),
         "completed_at": job.get("completed_at")}
+
+
+def _validated_idempotency_key(value: str | None) -> str | None:
+    if value is None:
+        return None
+    key = value.strip()
+    if not key or len(key) > 200:
+        raise HTTPException(status_code=400, detail="Idempotency-Key must contain 1 to 200 characters")
+    return key
+
+
+async def _submit_async_job(request: Request, job_type: str, tenant_id: str | None, actor: str | None,
+                            payload: dict[str, Any], progress_total: int, max_attempts: int,
+                            idempotency_key: str | None, idempotency_scope: str,
+                            max_queued_for_tenant: int | None = None) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(request.app.state.store.create_async_job, job_type, tenant_id,
+            actor, payload, progress_total, max_attempts, idempotency_key=idempotency_key,
+            idempotency_scope=idempotency_scope, max_queued_for_tenant=max_queued_for_tenant)
+    except AsyncJobIdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except AsyncJobQueueLimitExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "5"}) from exc
 
 
 async def _check_job_cancelled(app: FastAPI, job_id: str) -> None:
@@ -409,7 +437,12 @@ async def _async_job_dispatch_loop(app: FastAPI) -> None:
                 max_delay_seconds=float(server.get("async_job_retry_max_delay_seconds", 300)))
             available = max(capacity - len(app.state.job_tasks), 0)
             if available:
-                pending = await asyncio.to_thread(app.state.store.pending_async_jobs, available)
+                tenants = app.state.config.get("tenants",
+                    app.state.config.get("security", {}).get("tenants", {}))
+                tenant_limits = {tenant_id: int(tenant.get("job_policy", {}).get("max_concurrent_jobs"))
+                    for tenant_id, tenant in tenants.items()
+                    if tenant.get("job_policy", {}).get("max_concurrent_jobs") is not None}
+                pending = await asyncio.to_thread(app.state.store.pending_async_jobs, available, tenant_limits)
                 for job_id in pending:
                     task = asyncio.create_task(_run_async_job(app, job_id))
                     app.state.job_tasks.add(task)
@@ -825,7 +858,7 @@ def create_app(config: dict[str, Any] | None = None,
                     routing_decisions.append({"provider": provider_name, "model": configured_model,
                         "decision": "skipped", "reason": "embeddings_capability_unavailable", "attempt_count": 0})
                     continue
-                if not await request.app.state.gateway.breaker.allow(provider_name):
+                if not await request.app.state.gateway.breaker.allow(provider_name, operation="embeddings"):
                     routing_decisions.append({"provider": provider_name, "model": configured_model,
                         "decision": "skipped", "reason": "circuit_open", "attempt_count": 0})
                     continue
@@ -854,9 +887,9 @@ def create_app(config: dict[str, Any] | None = None,
                         async with request.app.state.gateway._concurrency():
                             result = await request.app.state.gateway.client.embed(provider_name,
                                 configured_model, [inputs[input_index] for input_index in missing_indexes], request_id)
-                        await request.app.state.gateway.breaker.success(provider_name)
+                        await request.app.state.gateway.breaker.success(provider_name, operation="embeddings")
                         await request.app.state.gateway.provider_health.record(provider_name,
-                            (time.perf_counter() - provider_started) * 1000, True)
+                            (time.perf_counter() - provider_started) * 1000, True, operation="embeddings")
                         usage = result["usage"]
                         for result_index, input_index in enumerate(missing_indexes):
                             vector = result["data"][result_index]
@@ -865,7 +898,7 @@ def create_app(config: dict[str, Any] | None = None,
                                 await request.app.state.gateway.embedding_cache.put(
                                     cache_keys[input_index], vector, cache_ttl)
                     else:
-                        await request.app.state.gateway.breaker.abandon(provider_name)
+                        await request.app.state.gateway.breaker.abandon(provider_name, operation="embeddings")
                         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                     vectors = [cached_vectors[input_index] for input_index in range(len(inputs))]
                     cached = bool(cache_keys and cached_vectors)
@@ -884,13 +917,16 @@ def create_app(config: dict[str, Any] | None = None,
                     status = "success"
                     break
                 except RateLimitExceeded as exc:
-                    await request.app.state.gateway.breaker.abandon(provider_name)
+                    await request.app.state.gateway.breaker.abandon(provider_name, operation="embeddings")
                     status, error_type = "rejected", "provider_rate_limit_exceeded"
                     raise HTTPException(status_code=429, detail="Provider request quota exceeded") from exc
                 except ProviderError as exc:
-                    await request.app.state.gateway.breaker.failure(provider_name)
+                    if exc.retryable:
+                        await request.app.state.gateway.breaker.failure(provider_name, operation="embeddings")
+                    else:
+                        await request.app.state.gateway.breaker.abandon(provider_name, operation="embeddings")
                     await request.app.state.gateway.provider_health.record(provider_name,
-                        (time.perf_counter() - provider_started) * 1000, False)
+                        (time.perf_counter() - provider_started) * 1000, False, operation="embeddings")
                     error_type = type(exc).__name__
                     routing_decisions.append({"provider": provider_name, "model": configured_model,
                         "decision": "skipped", "reason": "provider_error", "attempt_count": 1})
@@ -936,6 +972,7 @@ def create_app(config: dict[str, Any] | None = None,
     @app.post("/v1/embeddings")
     async def embeddings(body: EmbeddingsRequest, request: Request,
                          response: Response,
+                         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
                          tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
         inputs = [body.input] if isinstance(body.input, str) else body.input
         if body.model not in cfg.get("embedding_routes", {}):
@@ -952,11 +989,15 @@ def create_app(config: dict[str, Any] | None = None,
                     raise HTTPException(status_code=413, detail="Embedding job exceeds tenant item limit")
                 if input_bytes > int(job_policy.get("max_job_input_bytes", 20_000_000)):
                     raise HTTPException(status_code=413, detail="Embedding job exceeds tenant input size limit")
-            job = await asyncio.to_thread(request.app.state.store.create_async_job,
-                "embedding_batch", tenant["id"] if tenant else None, body.application,
+            tenant_id = tenant["id"] if tenant else None
+            job_policy = tenant["config"].get("job_policy", {}) if tenant else {}
+            job = await _submit_async_job(request, "embedding_batch", tenant_id, body.application,
                 {"model": body.model, "input": inputs, "application": body.application,
                  "cost_center": body.cost_center}, len(inputs),
-                int(cfg["server"].get("async_job_max_attempts", 5)))
+                int(cfg["server"].get("async_job_max_attempts", 5)),
+                _validated_idempotency_key(idempotency_key),
+                f"tenant:{tenant_id}:application:{body.application}" if tenant_id else
+                    f"application:{body.application}", job_policy.get("max_queued_jobs"))
             response.status_code = 202
             return _async_job_response(job)
         vectors, info = await run_retrieval(request, body.model, inputs,
@@ -971,6 +1012,7 @@ def create_app(config: dict[str, Any] | None = None,
 
     @app.post("/v1/embeddings/jobs", status_code=202)
     async def create_embedding_job(body: EmbeddingBatchJobRequest, request: Request,
+                                   idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
                                    tenant: dict[str, Any] | None = Depends(authenticate_client)) -> dict[str, Any]:  # noqa: B008
         if body.model not in cfg.get("embedding_routes", {}):
             raise HTTPException(status_code=400, detail=f"Unknown embedding route {body.model!r}")
@@ -984,9 +1026,13 @@ def create_app(config: dict[str, Any] | None = None,
                 raise HTTPException(status_code=413, detail="Embedding job exceeds tenant item limit")
             if input_bytes > int(job_policy.get("max_job_input_bytes", 20_000_000)):
                 raise HTTPException(status_code=413, detail="Embedding job exceeds tenant input size limit")
-        job = await asyncio.to_thread(request.app.state.store.create_async_job,
-            "embedding_batch", tenant["id"] if tenant else None, body.application,
-            body.model_dump(), len(body.input), int(cfg["server"].get("async_job_max_attempts", 5)))
+        tenant_id = tenant["id"] if tenant else None
+        job_policy = tenant["config"].get("job_policy", {}) if tenant else {}
+        job = await _submit_async_job(request, "embedding_batch", tenant_id, body.application,
+            body.model_dump(), len(body.input), int(cfg["server"].get("async_job_max_attempts", 5)),
+            _validated_idempotency_key(idempotency_key),
+            f"tenant:{tenant_id}:application:{body.application}" if tenant_id else
+                f"application:{body.application}", job_policy.get("max_queued_jobs"))
         return _async_job_response(job)
 
     @app.get("/v1/embeddings/jobs/{job_id}")
@@ -1090,7 +1136,7 @@ def create_app(config: dict[str, Any] | None = None,
                             ledger_application, estimated_cost, float(policy["monthly_limit_usd"]))
                     await request.app.state.gateway.limiter.acquire(provider_name,
                         int(provider_cfg.get("requests_per_minute", 600)))
-                    if not await request.app.state.gateway.breaker.allow(provider_name):
+                    if not await request.app.state.gateway.breaker.allow(provider_name, operation="rerank"):
                         native_error = ProviderError("provider circuit is open", retryable=True)
                         await asyncio.to_thread(request.app.state.store.record_routing_decisions,
                             request_id, ledger_application, body.model, [{"provider": provider_name,
@@ -1101,9 +1147,9 @@ def create_app(config: dict[str, Any] | None = None,
                     async with request.app.state.gateway._concurrency():
                         result = await request.app.state.gateway.client.rerank(provider_name, upstream_model,
                             body.query, body.documents, body.top_n or len(body.documents), request_id)
-                    await request.app.state.gateway.breaker.success(provider_name)
+                    await request.app.state.gateway.breaker.success(provider_name, operation="rerank")
                     await request.app.state.gateway.provider_health.record(provider_name,
-                        (time.perf_counter() - provider_started) * 1000, True)
+                        (time.perf_counter() - provider_started) * 1000, True, operation="rerank")
                     usage = result["usage"]
                     if "rerank_cost_per_1k_documents" in price:
                         cost = estimated_cost
@@ -1146,9 +1192,12 @@ def create_app(config: dict[str, Any] | None = None,
                 except ProviderError as exc:
                     native_error = exc
                     if provider_started is not None:
-                        await request.app.state.gateway.breaker.failure(provider_name)
+                        if exc.retryable:
+                            await request.app.state.gateway.breaker.failure(provider_name, operation="rerank")
+                        else:
+                            await request.app.state.gateway.breaker.abandon(provider_name, operation="rerank")
                         await request.app.state.gateway.provider_health.record(provider_name,
-                            (time.perf_counter() - provider_started) * 1000, False)
+                            (time.perf_counter() - provider_started) * 1000, False, operation="rerank")
                     elapsed_ms = int((time.perf_counter() - native_started) * 1000)
                     await asyncio.to_thread(request.app.state.store.record, {
                         "request_id": request_id, "occurred_at": datetime.now(UTC).isoformat(),
@@ -1714,7 +1763,8 @@ def create_app(config: dict[str, Any] | None = None,
     @app.get("/v1/admin/tenants/{tenant_id}/data-export",
              dependencies=[Depends(admin_dependency("tenant_data"))])
     async def export_tenant_data(tenant_id: str, request: Request, response: Response,
-                                 async_job: bool = Query(default=False, alias="async")) -> dict[str, Any]:
+                                 async_job: bool = Query(default=False, alias="async"),
+                                 idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
         tenant_cfg = configured_tenants().get(tenant_id)
         if tenant_cfg is None:
             raise HTTPException(status_code=404, detail="Unknown tenant")
@@ -1725,9 +1775,11 @@ def create_app(config: dict[str, Any] | None = None,
         counts = await asyncio.to_thread(request.app.state.store.tenant_data_counts, tenant_id)
         threshold = int(cfg.get("tenant_data", {}).get("async_threshold_records", 10_000))
         if async_job or sum(counts.values()) > threshold:
-            job = await asyncio.to_thread(request.app.state.store.create_async_job, "tenant_export",
-                tenant_id, actor, {"retention_days": int(retention_days)}, sum(counts.values()),
-                int(cfg["server"].get("async_job_max_attempts", 5)))
+            job = await _submit_async_job(request, "tenant_export", tenant_id, actor,
+                {"retention_days": int(retention_days)}, sum(counts.values()),
+                int(cfg["server"].get("async_job_max_attempts", 5)),
+                _validated_idempotency_key(idempotency_key), f"admin:{actor}:tenant:{tenant_id}",
+                tenant_cfg.get("job_policy", {}).get("max_queued_jobs"))
             response.status_code = 202
             return _async_job_response(job)
         exported = await asyncio.to_thread(request.app.state.store.export_tenant_data, tenant_id, actor)
@@ -1740,7 +1792,8 @@ def create_app(config: dict[str, Any] | None = None,
     async def delete_tenant_data(tenant_id: str, request: Request,
                                  response: Response,
                                  confirm_tenant_id: str = Query(..., min_length=1, max_length=120),
-                                 async_job: bool = Query(default=False, alias="async")) -> dict[str, Any]:
+                                 async_job: bool = Query(default=False, alias="async"),
+                                 idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
         tenant_cfg = configured_tenants().get(tenant_id)
         if tenant_cfg is None:
             raise HTTPException(status_code=404, detail="Unknown tenant")
@@ -1753,9 +1806,11 @@ def create_app(config: dict[str, Any] | None = None,
         counts = await asyncio.to_thread(request.app.state.store.tenant_data_counts, tenant_id)
         threshold = int(cfg.get("tenant_data", {}).get("async_threshold_records", 10_000))
         if async_job or sum(counts.values()) > threshold:
-            job = await asyncio.to_thread(request.app.state.store.create_async_job, "tenant_delete",
-                tenant_id, actor, {"retention_days": int(retention_days)}, sum(counts.values()),
-                int(cfg["server"].get("async_job_max_attempts", 5)))
+            job = await _submit_async_job(request, "tenant_delete", tenant_id, actor,
+                {"retention_days": int(retention_days)}, sum(counts.values()),
+                int(cfg["server"].get("async_job_max_attempts", 5)),
+                _validated_idempotency_key(idempotency_key), f"admin:{actor}:tenant:{tenant_id}",
+                tenant_cfg.get("job_policy", {}).get("max_queued_jobs"))
             response.status_code = 202
             return _async_job_response(job)
         counts = await asyncio.to_thread(request.app.state.store.delete_tenant_data, tenant_id, actor)
@@ -1966,8 +2021,17 @@ def create_app(config: dict[str, Any] | None = None,
     async def provider_health(request: Request) -> dict[str, Any]:
         states = await request.app.state.gateway.breaker.snapshot()
         performance = await request.app.state.gateway.health_snapshot()
+        operations = ["chat", "embeddings", "rerank"]
+        scoped_states = await request.app.state.gateway.breaker.snapshot_scoped(operations)
+        scoped_performance = await request.app.state.gateway.provider_health.snapshot_scoped(
+            list(cfg["providers"]), operations)
         return {"providers": {name: {"kind": provider["kind"], "capabilities": provider_capabilities(provider),
                                     **states.get(name, {"state": "closed", "failures": 0})}
+                                    | {"operations": {operation: {
+                                        **scoped_states.get(name, {}).get(operation,
+                                            {"state": "closed", "failures": 0, "retry_after_seconds": 0.0}),
+                                        **scoped_performance.get(name, {}).get(operation, {})}
+                                        for operation in operations}}
                               | performance.get(name, {})
                               for name, provider in cfg["providers"].items()}}
 
@@ -2096,7 +2160,8 @@ def create_app(config: dict[str, Any] | None = None,
     @app.post("/v1/admin/retrieval/evaluation-jobs", status_code=202,
               dependencies=[Depends(admin_dependency("report"))])
     async def create_retrieval_evaluation_job(body: RetrievalEvaluationJobCreate,
-                                              request: Request) -> dict[str, Any]:
+                                              request: Request,
+                                              idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
         routes = cfg.get("embedding_routes", {})
         for route_name in (body.baseline_route, body.candidate_route):
             route = routes.get(route_name)
@@ -2105,9 +2170,10 @@ def create_app(config: dict[str, Any] | None = None,
             if not provider_capabilities(cfg["providers"][route["provider"]]).get("reranking", False):
                 raise HTTPException(status_code=400, detail=f"Retrieval route {route_name!r} cannot rerank documents")
         payload = body.model_dump()
-        job = await asyncio.to_thread(request.app.state.store.create_async_job,
-            "retrieval_evaluation", None, getattr(request.state, "admin_actor", "unknown-admin"),
-            payload, len(body.cases), int(cfg["server"].get("async_job_max_attempts", 5)))
+        actor = getattr(request.state, "admin_actor", "unknown-admin")
+        job = await _submit_async_job(request, "retrieval_evaluation", None, actor,
+            payload, len(body.cases), int(cfg["server"].get("async_job_max_attempts", 5)),
+            _validated_idempotency_key(idempotency_key), f"admin:{actor}")
         return _async_job_response(job)
 
     @app.get("/v1/admin/retrieval/evaluation-jobs/{job_id}",

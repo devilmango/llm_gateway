@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -9,7 +10,11 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from .config import MIN_TENANT_USAGE_RETENTION_DAYS
-from .storage import BudgetExceeded
+from .storage import (
+    AsyncJobIdempotencyConflict,
+    AsyncJobQueueLimitExceeded,
+    BudgetExceeded,
+)
 
 
 class PostgresUsageStore:
@@ -141,6 +146,11 @@ class PostgresUsageStore:
             "ALTER TABLE async_jobs ADD COLUMN IF NOT EXISTS next_attempt_at TEXT",
             "ALTER TABLE async_jobs ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE",
             "CREATE INDEX IF NOT EXISTS idx_async_jobs_due ON async_jobs(status, next_attempt_at, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_async_jobs_tenant_status_created ON async_jobs(tenant_id, status, created_at)",
+            "ALTER TABLE async_jobs ADD COLUMN IF NOT EXISTS idempotency_scope TEXT",
+            "ALTER TABLE async_jobs ADD COLUMN IF NOT EXISTS idempotency_key_hash TEXT",
+            "ALTER TABLE async_jobs ADD COLUMN IF NOT EXISTS request_fingerprint TEXT",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_async_jobs_idempotency ON async_jobs(idempotency_scope, job_type, idempotency_key_hash) WHERE idempotency_key_hash IS NOT NULL",
         ]
         with self.pool.connection() as conn, conn.cursor() as cursor:
             for statement in statements:
@@ -347,15 +357,43 @@ class PostgresUsageStore:
 
     def create_async_job(self, job_type: str, tenant_id: str | None, actor: str | None,
                          payload: dict[str, Any], progress_total: int,
-                         max_attempts: int = 5) -> dict[str, Any]:
+                         max_attempts: int = 5, *, idempotency_key: str | None = None,
+                         idempotency_scope: str | None = None,
+                         max_queued_for_tenant: int | None = None) -> dict[str, Any]:
         job_id, now = "job_" + uuid.uuid4().hex, datetime.now(UTC).isoformat()
+        scope = idempotency_scope or tenant_id or actor or "anonymous"
+        key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest() if idempotency_key else None
+        fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+            separators=(",", ":")).encode("utf-8")).hexdigest() if key_hash else None
+        existing_job_id = None
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
-            cursor.execute("""INSERT INTO async_jobs (job_id, job_type, tenant_id, actor, status,
-                progress_total, max_attempts, payload_json, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, 'queued', %s, %s, %s::jsonb, %s, %s)""",
-                (job_id, job_type, tenant_id, actor, progress_total, max_attempts,
-                 json.dumps(payload, separators=(",", ":")), now, now))
-        return self.async_job(job_id) or {}
+            if key_hash:
+                cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"async-idempotency:{scope}:{job_type}:{key_hash}",))
+                cursor.execute("""SELECT job_id, request_fingerprint FROM async_jobs
+                    WHERE idempotency_scope=%s AND job_type=%s AND idempotency_key_hash=%s""",
+                    (scope, job_type, key_hash))
+                existing = cursor.fetchone()
+                if existing:
+                    if existing["request_fingerprint"] != fingerprint:
+                        raise AsyncJobIdempotencyConflict("Idempotency-Key was reused with a different request")
+                    existing_job_id = existing["job_id"]
+            if existing_job_id is None:
+                if tenant_id and (max_queued_for_tenant is not None or key_hash):
+                    cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("async-queue-tenant:" + tenant_id,))
+                if tenant_id and max_queued_for_tenant is not None:
+                    cursor.execute("SELECT COUNT(*) AS count FROM async_jobs WHERE tenant_id=%s AND status='queued'",
+                                   (tenant_id,))
+                    if int(cursor.fetchone()["count"]) >= max_queued_for_tenant:
+                        raise AsyncJobQueueLimitExceeded("Tenant async job queue limit reached")
+                cursor.execute("""INSERT INTO async_jobs (job_id, job_type, tenant_id, actor, status,
+                    progress_total, max_attempts, payload_json, created_at, updated_at,
+                    idempotency_scope, idempotency_key_hash, request_fingerprint)
+                    VALUES (%s, %s, %s, %s, 'queued', %s, %s, %s::jsonb, %s, %s, %s, %s, %s)""",
+                    (job_id, job_type, tenant_id, actor, progress_total, max_attempts,
+                     json.dumps(payload, separators=(",", ":")), now, now,
+                     scope if key_hash else None, key_hash, fingerprint))
+        return self.async_job(existing_job_id or job_id) or {}
 
     def async_job(self, job_id: str, *, include_payload: bool = False,
                   include_results: bool = False) -> dict[str, Any] | None:
@@ -460,12 +498,38 @@ class PostgresUsageStore:
             "dead_letter": counts.get("dead_letter", 0), "counts_by_status": counts,
             "average_duration_ms": round(float(average or 0), 2), "recent_durations_ms": durations}
 
-    def pending_async_jobs(self, limit: int = 20) -> list[str]:
+    def pending_async_jobs(self, limit: int = 20,
+                           tenant_limits: dict[str, int] | None = None) -> list[str]:
         now = datetime.now(UTC).isoformat()
         with self.pool.connection() as conn, conn.cursor() as cursor:
-            cursor.execute("""SELECT job_id FROM async_jobs WHERE status='queued'
-                AND (next_attempt_at IS NULL OR next_attempt_at <= %s) ORDER BY created_at LIMIT %s""",
-                (now, limit))
+            blocked: list[str] = []
+            if tenant_limits:
+                cursor.execute("SELECT tenant_id, COUNT(*) AS count FROM async_jobs "
+                    "WHERE status='running' AND tenant_id IS NOT NULL GROUP BY tenant_id")
+                running = {row["tenant_id"]: int(row["count"]) for row in cursor.fetchall()}
+                blocked = [tenant_id for tenant_id, cap in tenant_limits.items()
+                           if running.get(tenant_id, 0) >= cap]
+            exclusion = (f" AND (queued.tenant_id IS NULL OR queued.tenant_id NOT IN "
+                         f"({','.join('%s' for _ in blocked)}))") if blocked else ""
+            cursor.execute("""WITH due AS (
+                SELECT queued.job_id, queued.tenant_id, queued.actor, queued.created_at,
+                    CASE WHEN queued.tenant_id IS NOT NULL THEN 'tenant:' || queued.tenant_id
+                        ELSE 'actor:' || COALESCE(queued.actor, '') END AS fairness_key,
+                    (SELECT COUNT(*) FROM async_jobs running WHERE running.status='running'
+                        AND running.tenant_id IS NOT DISTINCT FROM queued.tenant_id
+                        AND (queued.tenant_id IS NOT NULL OR running.actor IS NOT DISTINCT FROM queued.actor)) AS running_count,
+                    (SELECT MAX(previous.started_at) FROM async_jobs previous
+                        WHERE previous.tenant_id IS NOT DISTINCT FROM queued.tenant_id
+                        AND (queued.tenant_id IS NOT NULL OR previous.actor IS NOT DISTINCT FROM queued.actor)) AS last_started_at
+                FROM async_jobs queued WHERE queued.status='queued'""" + exclusion + """
+                    AND (queued.next_attempt_at IS NULL OR queued.next_attempt_at <= %s)
+            ), ranked AS (
+                SELECT job_id, created_at, fairness_key, running_count, last_started_at,
+                    ROW_NUMBER() OVER (PARTITION BY fairness_key ORDER BY created_at, job_id) AS tenant_position
+                FROM due
+            ) SELECT job_id FROM ranked
+                ORDER BY running_count, last_started_at, tenant_position, created_at, fairness_key LIMIT %s""",
+                (*blocked, now, limit))
             return [row["job_id"] for row in cursor.fetchall()]
 
     def claim_async_job(self, job_id: str, lease_seconds: int = 300,
