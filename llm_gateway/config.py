@@ -8,6 +8,7 @@ from typing import Any
 import yaml
 
 from .capabilities import provider_capabilities
+from .webhook_security import validate_webhook_url
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::-([^}]*))?\}")
 MIN_TENANT_USAGE_RETENTION_DAYS = 35
@@ -27,6 +28,16 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
             raise ValueError(f"server.{key} must be a non-negative number")
     if server.get("async_job_retry_max_delay_seconds", 300) < server.get("async_job_retry_base_delay_seconds", 1):
         raise ValueError("server.async_job_retry_max_delay_seconds must be at least the retry base delay")
+    for key, default in (("webhook_circuit_failure_threshold", 3),
+                         ("webhook_circuit_recovery_seconds", 30)):
+        value = server.get(key, default)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"server.{key} must be a positive integer")
+    dns_timeout = server.get("webhook_dns_timeout_seconds", 2.0)
+    if not isinstance(dns_timeout, (int, float)) or isinstance(dns_timeout, bool) or dns_timeout <= 0:
+        raise ValueError("server.webhook_dns_timeout_seconds must be a positive number")
+    if not isinstance(server.get("webhooks_allow_private_targets", False), bool):
+        raise TypeError("server.webhooks_allow_private_targets must be a boolean")
     async_jobs = config.get("async_jobs", {})
     if not isinstance(async_jobs, dict):
         raise TypeError("async_jobs must be an object")
@@ -36,12 +47,10 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
     valid_job_events = {"queued", "progress", "completed", "cancelled", "dead_letter"}
     for application, webhook in job_webhooks.items():
         if (not isinstance(application, str) or not application or not isinstance(webhook, dict)
-                or not isinstance(webhook.get("url"), str)
-                or not webhook["url"].startswith(("https://", "http://"))):
+                or not isinstance(webhook.get("url"), str)):
             raise ValueError("async_jobs.webhooks entries require an application and HTTP(S) url")
-        secret_env = webhook.get("secret_env")
-        if secret_env is not None and (not isinstance(secret_env, str) or not secret_env):
-            raise ValueError("async_jobs.webhooks secret_env must be a non-empty string")
+        validate_webhook_url(webhook["url"], resolve_dns=False, allow_private_targets=True)
+        _validate_webhook_signing(webhook, "async_jobs.webhooks")
         events = webhook.get("events", list(valid_job_events))
         if not isinstance(events, list) or any(event not in valid_job_events for event in events):
             raise ValueError("async_jobs.webhooks events must contain supported job lifecycle events")
@@ -56,6 +65,23 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
     threshold = tenant_data.get("async_threshold_records", 10_000)
     if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 1:
         raise ValueError("tenant_data.async_threshold_records must be a positive integer")
+    budget_config = config.get("budgets", {})
+    if not isinstance(budget_config, dict):
+        raise TypeError("budgets must be an object")
+    budget_policies = [("default", budget_config.get("default", {})),
+        *[(f"applications.{name}", policy)
+          for name, policy in budget_config.get("applications", {}).items()]]
+    for policy_name, policy in budget_policies:
+        if not isinstance(policy, dict):
+            raise TypeError(f"budgets.{policy_name} must be an object")
+        webhook_url = policy.get("alert_webhook_url")
+        if webhook_url is not None:
+            if not isinstance(webhook_url, str):
+                raise ValueError(f"budgets.{policy_name}.alert_webhook_url must be a URL")
+            validate_webhook_url(webhook_url, resolve_dns=False, allow_private_targets=True)
+            _validate_webhook_signing({"secret_env": policy.get("alert_webhook_secret_env"),
+                "signing_keys": policy.get("alert_signing_keys", {}),
+                "active_key_id": policy.get("alert_active_key_id")}, f"budgets.{policy_name}")
     for provider_name, provider in config.get("providers", {}).items():
         batch_size = provider.get("max_embedding_batch_size")
         if batch_size is not None and (not isinstance(batch_size, int) or isinstance(batch_size, bool)
@@ -80,12 +106,10 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
     if not isinstance(approval_webhooks, dict):
         raise TypeError("tool_governance.approval_webhooks must be an application map")
     for application, webhook in approval_webhooks.items():
-        if (not application or not isinstance(webhook, dict) or not isinstance(webhook.get("url"), str)
-                or not webhook["url"].startswith(("https://", "http://"))):
+        if not application or not isinstance(webhook, dict) or not isinstance(webhook.get("url"), str):
             raise ValueError("tool_governance.approval_webhooks entries require an HTTP(S) url")
-        secret_env = webhook.get("secret_env")
-        if secret_env is not None and (not isinstance(secret_env, str) or not secret_env):
-            raise ValueError("tool_governance.approval_webhooks secret_env must be a non-empty string")
+        validate_webhook_url(webhook["url"], resolve_dns=False, allow_private_targets=True)
+        _validate_webhook_signing(webhook, "tool_governance.approval_webhooks")
     tenants = config.get("tenants", config.get("security", {}).get("tenants", {}))
     for tenant_id, tenant in tenants.items():
         if not isinstance(tenant, dict):
@@ -127,6 +151,23 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
             if retention_days < MIN_TENANT_USAGE_RETENTION_DAYS:
                 raise ValueError(f"Tenant {tenant_id!r} usage_retention_days must be at least "
                                  f"{MIN_TENANT_USAGE_RETENTION_DAYS} to preserve current-month budget accounting")
+
+
+def _validate_webhook_signing(webhook: dict[str, Any], section: str) -> None:
+    secret_env = webhook.get("secret_env")
+    if secret_env is not None and (not isinstance(secret_env, str) or not secret_env):
+        raise ValueError(f"{section} secret_env must be a non-empty string")
+    signing_keys = webhook.get("signing_keys", {})
+    active_key_id = webhook.get("active_key_id")
+    if not isinstance(signing_keys, dict) or any(
+            not isinstance(key_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", key_id)
+            or not isinstance(env_name, str) or not env_name
+            for key_id, env_name in signing_keys.items()):
+        raise ValueError(f"{section} signing_keys must map key IDs to environment variable names")
+    if signing_keys and active_key_id not in signing_keys:
+        raise ValueError(f"{section} active_key_id must name an entry in signing_keys")
+    if active_key_id is not None and not signing_keys:
+        raise ValueError(f"{section} active_key_id requires signing_keys")
 
 
 def _expand_env(value: Any) -> Any:

@@ -8,10 +8,12 @@ import json
 import logging
 import math
 import os
+import random
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from io import StringIO
 from types import SimpleNamespace
 from typing import Any
@@ -48,6 +50,9 @@ from .observability import (
     TOKENS,
     TOOL_EXECUTIONS_OVERDUE,
     TOOL_EXECUTIONS_PENDING,
+    WEBHOOK_CIRCUIT_STATE,
+    WEBHOOK_DELIVERIES,
+    WEBHOOK_DELIVERY_LATENCY,
     gen_ai_provider_name,
     initialize_tracing,
     metrics_response,
@@ -88,6 +93,7 @@ from .tool_governance import (
     requested_tool_names,
 )
 from .tool_validation import validate_tool_calls
+from .webhook_security import UnsafeWebhookTarget, validate_webhook_url
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("llm_gateway")
@@ -101,40 +107,127 @@ async def _deliver_webhook_batch(app: FastAPI, batch_size: int = 20) -> None:
         return
     events = await asyncio.to_thread(store.due_webhooks, batch_size)
     for event in events:
+        endpoint = hashlib.sha256(event["webhook_url"].encode()).hexdigest()[:16]
+        event_type = event.get("event_type") or "unspecified"
+        circuits = getattr(app.state, "webhook_circuits", {})
+        circuit = circuits.setdefault(endpoint, {"failures": 0, "open_until": None})
+        now = datetime.now(UTC)
+        open_until = circuit.get("open_until")
+        if open_until and open_until > now:
+            WEBHOOK_CIRCUIT_STATE.labels(endpoint=endpoint).set(1)
+            WEBHOOK_DELIVERIES.labels(endpoint=endpoint, event_type=event_type, outcome="circuit_open").inc()
+            await asyncio.to_thread(store.defer_webhook, event["event_id"], open_until)
+            continue
+        circuit["open_until"] = None
+        WEBHOOK_CIRCUIT_STATE.labels(endpoint=endpoint).set(0)
+        started = time.perf_counter()
+        attempts = int(event["attempts"]) + 1
         try:
+            allow_private = bool(app.state.config.get("server", {}).get("webhooks_allow_private_targets", False))
+            dns_timeout = float(app.state.config.get("server", {}).get("webhook_dns_timeout_seconds", 2.0))
+            await asyncio.wait_for(asyncio.to_thread(validate_webhook_url, event["webhook_url"],
+                allow_private_targets=allow_private), timeout=dns_timeout)
             body = event["body"].encode("utf-8")
             headers = {"Content-Type": "application/json", "Idempotency-Key": event["event_id"]}
             if event.get("event_type"):
                 headers["X-LLM-Gateway-Event"] = event["event_type"]
                 headers["X-LLM-Gateway-Event-Id"] = event["event_id"]
-            secret = os.getenv(event.get("secret_env") or "", "")
+            signing_keys = event.get("signing_keys_json") or {}
+            if isinstance(signing_keys, str):
+                signing_keys = json.loads(signing_keys)
+            active_key_id = event.get("active_key_id")
+            if not signing_keys and event.get("secret_env"):
+                active_key_id = "default"
+                signing_keys = {active_key_id: event["secret_env"]}
+            secret = os.getenv(signing_keys.get(active_key_id, ""), "") if active_key_id else ""
+            if active_key_id and not secret:
+                raise ValueError("webhook_signing_key_unavailable")
             if secret:
-                signature = hmac.new(secret.encode("utf-8"), body, "sha256").hexdigest()
-                headers["X-LLM-Gateway-Signature"] = f"sha256={signature}"
+                timestamp = str(int(datetime.now(UTC).timestamp()))
+                signed_payload = timestamp.encode("ascii") + b"." + body
+                signature = hmac.new(secret.encode("utf-8"), signed_payload, "sha256").hexdigest()
+                headers["X-LLM-Gateway-Signature"] = f"t={timestamp},kid={active_key_id},v1={signature}"
+                headers["X-LLM-Gateway-Key-Id"] = active_key_id
             response = await app.state.http.post(event["webhook_url"], content=body,
-                                                  headers=headers, timeout=3.0)
-            attempts = int(event["attempts"]) + 1
-            if not response.is_error:
+                headers=headers, timeout=3.0, follow_redirects=False)
+            latency = time.perf_counter() - started
+            if 200 <= response.status_code < 300:
+                circuit["failures"] = 0
+                circuit["open_until"] = None
+                WEBHOOK_CIRCUIT_STATE.labels(endpoint=endpoint).set(0)
+                WEBHOOK_DELIVERIES.labels(endpoint=endpoint, event_type=event_type, outcome="delivered").inc()
+                WEBHOOK_DELIVERY_LATENCY.labels(endpoint=endpoint, event_type=event_type,
+                    outcome="delivered").observe(latency)
                 await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
                     status="delivered", delivered_at=datetime.now(UTC), last_error=None,
                     http_status=response.status_code)
             elif response.status_code < 500 and response.status_code != 429:
+                circuit["failures"] += 1
+                _update_webhook_circuit(app, endpoint, circuit)
+                WEBHOOK_DELIVERIES.labels(endpoint=endpoint, event_type=event_type, outcome="dead_letter").inc()
+                WEBHOOK_DELIVERY_LATENCY.labels(endpoint=endpoint, event_type=event_type,
+                    outcome="dead_letter").observe(latency)
                 await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
                     status="dead_letter", last_error=f"HTTP{response.status_code}",
                     http_status=response.status_code)
             else:
+                circuit["failures"] += 1
+                _update_webhook_circuit(app, endpoint, circuit)
                 status = "dead_letter" if attempts >= 8 else "pending"
-                delay = min(300, 2 ** min(attempts, 8))
+                delay = _webhook_retry_delay(attempts, response.headers.get("Retry-After"), now)
+                outcome = "dead_letter" if status == "dead_letter" else "retry"
+                WEBHOOK_DELIVERIES.labels(endpoint=endpoint, event_type=event_type, outcome=outcome).inc()
+                WEBHOOK_DELIVERY_LATENCY.labels(endpoint=endpoint, event_type=event_type,
+                    outcome=outcome).observe(latency)
                 await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
                     status=status, next_attempt_at=datetime.now(UTC) + timedelta(seconds=delay),
                     last_error=f"HTTP{response.status_code}", http_status=response.status_code)
-        except (httpx.HTTPError, ValueError) as exc:
-            attempts = int(event["attempts"]) + 1
+        except UnsafeWebhookTarget as exc:
+            latency = time.perf_counter() - started
+            WEBHOOK_DELIVERIES.labels(endpoint=endpoint, event_type=event_type, outcome="blocked").inc()
+            WEBHOOK_DELIVERY_LATENCY.labels(endpoint=endpoint, event_type=event_type, outcome="blocked").observe(latency)
+            await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
+                status="dead_letter", last_error=str(exc))
+        except (httpx.HTTPError, ValueError, OSError) as exc:
+            latency = time.perf_counter() - started
+            circuit["failures"] += 1
+            _update_webhook_circuit(app, endpoint, circuit)
             status = "dead_letter" if attempts >= 8 else "pending"
-            delay = min(300, 2 ** min(attempts, 8))
+            delay = _webhook_retry_delay(attempts, None, now)
+            outcome = "dead_letter" if status == "dead_letter" else "retry"
+            WEBHOOK_DELIVERIES.labels(endpoint=endpoint, event_type=event_type, outcome=outcome).inc()
+            WEBHOOK_DELIVERY_LATENCY.labels(endpoint=endpoint, event_type=event_type,
+                outcome=outcome).observe(latency)
             await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
                 status=status, next_attempt_at=datetime.now(UTC) + timedelta(seconds=delay),
                 last_error=type(exc).__name__)
+
+
+def _update_webhook_circuit(app: FastAPI, endpoint: str, circuit: dict[str, Any]) -> None:
+    server = app.state.config.get("server", {})
+    threshold = max(1, int(server.get("webhook_circuit_failure_threshold", 3)))
+    if circuit["failures"] >= threshold:
+        recovery = max(1, int(server.get("webhook_circuit_recovery_seconds", 30)))
+        circuit["open_until"] = datetime.now(UTC) + timedelta(seconds=recovery)
+    WEBHOOK_CIRCUIT_STATE.labels(endpoint=endpoint).set(
+        1 if circuit.get("open_until") and circuit["open_until"] > datetime.now(UTC) else 0)
+
+
+def _webhook_retry_delay(attempts: int, retry_after: str | None, now: datetime) -> float:
+    backoff = min(300.0, float(2 ** min(attempts, 8)))
+    delay = min(300.0, random.uniform(backoff * 0.5, backoff * 1.5))
+    if retry_after:
+        try:
+            delay = max(delay, max(0.0, float(retry_after)))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                delay = max(delay, (retry_at - now).total_seconds(), 0.0)
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return delay
 
 
 async def _webhook_delivery_loop(app: FastAPI) -> None:
@@ -238,7 +331,8 @@ async def _emit_async_job_event(app: FastAPI, job: dict[str, Any], event_type: s
         "job_type": job["job_type"], "application": application, "tenant_id": tenant_id,
         "status": job.get("status"), "progress": {"completed": int(job.get("progress_completed", 0)),
             "total": int(job.get("progress_total", 0))}, "occurred_at": datetime.now(UTC).isoformat()}
-    await asyncio.to_thread(app.state.store.enqueue_webhook, event, webhook["url"], webhook.get("secret_env"))
+    await asyncio.to_thread(app.state.store.enqueue_webhook, event, webhook["url"], webhook.get("secret_env"),
+        signing_keys=webhook.get("signing_keys"), active_key_id=webhook.get("active_key_id"))
 
 
 async def _update_async_job(app: FastAPI, job_id: str, **changes: Any) -> None:
@@ -577,6 +671,7 @@ def create_app(config: dict[str, Any] | None = None,
         app.state.job_tasks = set()
         app.state.config = cfg
         app.state.shadow_tasks = set()
+        app.state.webhook_circuits = {}
         redis_client = shared_redis
         owns_redis = False
         app.state.store = None
@@ -761,7 +856,9 @@ def create_app(config: dict[str, Any] | None = None,
             alert_identity = f"{application}:{event['occurred_at'][:7]}:{alert['threshold']}"
             alert_id = hashlib.sha256(alert_identity.encode("utf-8")).hexdigest()
             event["alert_id"] = alert_id
-            await asyncio.to_thread(request.app.state.store.enqueue_webhook, event, webhook_url, secret_env)
+            await asyncio.to_thread(request.app.state.store.enqueue_webhook, event, webhook_url, secret_env,
+                signing_keys=policy.get("alert_signing_keys"),
+                active_key_id=policy.get("alert_active_key_id"))
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -1137,11 +1234,11 @@ def create_app(config: dict[str, Any] | None = None,
             "pagination": {"offset": offset, "limit": limit, "total": len(items),
                            "has_more": offset + len(page) < len(items)}}
 
-    @app.get("/v1/admin/async-jobs", dependencies=[Depends(admin_dependency("report"))])
+    @app.get("/v1/admin/async-jobs", dependencies=[Depends(admin_dependency("async_jobs:read"))])
     async def async_job_queue_report(request: Request) -> dict[str, Any]:
         return await asyncio.to_thread(request.app.state.store.async_job_stats)
 
-    @app.delete("/v1/admin/async-jobs/{job_id}", dependencies=[Depends(admin_dependency("report"))])
+    @app.delete("/v1/admin/async-jobs/{job_id}", dependencies=[Depends(admin_dependency("async_jobs:cancel"))])
     async def cancel_async_job(job_id: str, request: Request) -> dict[str, Any]:
         before = await asyncio.to_thread(request.app.state.store.async_job, job_id, include_payload=True)
         job = await asyncio.to_thread(request.app.state.store.cancel_async_job, job_id)
@@ -1151,7 +1248,7 @@ def create_app(config: dict[str, Any] | None = None,
             await _emit_async_job_event(request.app, {**job, "payload": (before or {}).get("payload")}, "cancelled")
         return _async_job_response(job)
 
-    @app.get("/v1/admin/async-jobs/{job_id}/webhooks", dependencies=[Depends(admin_dependency("report"))])
+    @app.get("/v1/admin/async-jobs/{job_id}/webhooks", dependencies=[Depends(admin_dependency("async_jobs:read"))])
     async def async_job_webhook_history(job_id: str, request: Request) -> dict[str, Any]:
         job = await asyncio.to_thread(request.app.state.store.async_job, job_id)
         if job is None:
@@ -1159,7 +1256,7 @@ def create_app(config: dict[str, Any] | None = None,
         events = await asyncio.to_thread(request.app.state.store.async_job_webhook_events, job_id)
         return {"job_id": job_id, "events": events}
 
-    @app.post("/v1/admin/async-jobs/{job_id}/retry", dependencies=[Depends(admin_dependency("report"))])
+    @app.post("/v1/admin/async-jobs/{job_id}/retry", dependencies=[Depends(admin_dependency("async_jobs:retry"))])
     async def retry_dead_letter_async_job(job_id: str, request: Request,
                                           confirm_job_id: str = Query(..., min_length=1)) -> dict[str, Any]:
         if confirm_job_id != job_id:
@@ -2162,7 +2259,8 @@ def create_app(config: dict[str, Any] | None = None,
                 "tool_call_id": body.tool_call_id, "decision": body.decision,
                 "actor": result.get("actor", actor), "expires_at": result.get("expires_at")}
             await asyncio.to_thread(request.app.state.store.enqueue_webhook,
-                event, webhook["url"], webhook.get("secret_env"))
+                event, webhook["url"], webhook.get("secret_env"),
+                signing_keys=webhook.get("signing_keys"), active_key_id=webhook.get("active_key_id"))
         return result
 
     @app.get("/v1/tool-approvals/{request_id}/{tool_call_id}")

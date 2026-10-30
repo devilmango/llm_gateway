@@ -21,15 +21,18 @@ from pydantic import ValidationError
 from llm_gateway.client import ToolApprovalError, execute_tool_with_approval
 from llm_gateway.evaluation import compare_routes, evaluate_cases
 from llm_gateway.main import _deliver_webhook_batch, _emit_async_job_event, create_app
+from llm_gateway.observability import metrics_response
 from llm_gateway.providers import ProviderClient
 from llm_gateway.schemas import ChatRequest
 from llm_gateway.storage import create_usage_store
+from llm_gateway.webhook_security import UnsafeWebhookTarget, validate_webhook_url
 
 
 def config(database: str) -> dict:
     return {
         "server": {"database": database, "request_timeout_seconds": 2, "max_retries": 1,
-                   "retry_base_delay_seconds": 0, "max_concurrent_requests": 10},
+                   "retry_base_delay_seconds": 0, "max_concurrent_requests": 10,
+                   "webhooks_allow_private_targets": True},
         "security": {"redact_pii": True},
         "budgets": {"default": {}, "applications": {}},
         "providers": {
@@ -306,14 +309,19 @@ async def test_webhook_delivery_signs_event_and_records_result(tmp_path, monkeyp
     received = []
 
     def delivery(request: httpx.Request) -> httpx.Response:
-        expected = "sha256=" + hmac.new(b"webhook-secret", request.content, hashlib.sha256).hexdigest()
-        assert hmac.compare_digest(request.headers["X-LLM-Gateway-Signature"], expected)
+        fields = dict(part.split("=", 1) for part in request.headers["X-LLM-Gateway-Signature"].split(","))
+        signed = fields["t"].encode() + b"." + request.content
+        expected = hmac.new(b"webhook-secret", signed, hashlib.sha256).hexdigest()
+        assert fields["kid"] == request.headers["X-LLM-Gateway-Key-Id"] == "default"
+        assert hmac.compare_digest(fields["v1"], expected)
         assert request.headers["Idempotency-Key"] == "stable-alert-id"
         received.append(request.content)
         return httpx.Response(204)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(delivery))
-    app = SimpleNamespace(state=SimpleNamespace(store=store, http=client))
+    app = SimpleNamespace(state=SimpleNamespace(store=store, http=client,
+        config={"server": {"webhooks_allow_private_targets": True,
+            "webhook_circuit_failure_threshold": 100}}, webhook_circuits={}))
     await _deliver_webhook_batch(app)
     assert len(received) == 1
     assert store.webhook_events()[0]["status"] == "delivered"
@@ -327,7 +335,9 @@ async def test_webhook_transient_failures_dead_letter_and_redrive(tmp_path):
     store = create_usage_store(str(tmp_path / "outbox-retries.sqlite3"))
     store.enqueue_webhook({"alert_id": "retry-alert", "application": "app"}, "https://alerts.test/hook")
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(503)))
-    app = SimpleNamespace(state=SimpleNamespace(store=store, http=client))
+    app = SimpleNamespace(state=SimpleNamespace(store=store, http=client,
+        config={"server": {"webhooks_allow_private_targets": True,
+            "webhook_circuit_failure_threshold": 100}}, webhook_circuits={}))
     for attempt in range(8):
         if attempt:
             store.update_webhook("retry-alert", attempts=attempt, status="pending", next_attempt_at=datetime.now(UTC))
@@ -1059,6 +1069,32 @@ async def test_admin_keys_support_scopes_rotation_and_revocation(tmp_path, monke
         assert (await client.get("/v1/admin/budgets", headers=headers)).status_code == 403
         old_headers = {"Authorization": "Bearer old-report-key"}
         assert (await client.get("/v1/admin/report", headers=old_headers)).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_async_job_admin_scopes_separate_read_cancel_and_retry(tmp_path, monkeypatch):
+    for name, value in (("REPORT_KEY", "report-key"), ("JOB_READ_KEY", "job-read-key"),
+                        ("JOB_CANCEL_KEY", "job-cancel-key"), ("JOB_RETRY_KEY", "job-retry-key")):
+        monkeypatch.setenv(name, value)
+    cfg = config(str(tmp_path / "job-scopes.sqlite3"))
+    cfg["security"]["admin_api_keys"] = [
+        {"id": "report", "api_key_env": "REPORT_KEY", "scopes": ["report"]},
+        {"id": "job-reader", "api_key_env": "JOB_READ_KEY", "scopes": ["async_jobs:read"]},
+        {"id": "job-canceller", "api_key_env": "JOB_CANCEL_KEY", "scopes": ["async_jobs:cancel"]},
+        {"id": "job-retry", "api_key_env": "JOB_RETRY_KEY", "scopes": ["async_jobs:retry"]},
+    ]
+    async with gateway_client(cfg, httpx.MockTransport(lambda request: success_response())) as client:
+        report = {"Authorization": "Bearer report-key"}
+        reader = {"Authorization": "Bearer job-read-key"}
+        canceller = {"Authorization": "Bearer job-cancel-key"}
+        retryer = {"Authorization": "Bearer job-retry-key"}
+        missing_retry = "/v1/admin/async-jobs/missing/retry?confirm_job_id=missing"
+        assert (await client.get("/v1/admin/async-jobs", headers=report)).status_code == 403
+        assert (await client.post(missing_retry, headers=report)).status_code == 403
+        assert (await client.get("/v1/admin/async-jobs", headers=reader)).status_code == 200
+        assert (await client.delete("/v1/admin/async-jobs/missing", headers=reader)).status_code == 403
+        assert (await client.delete("/v1/admin/async-jobs/missing", headers=canceller)).status_code == 404
+        assert (await client.post(missing_retry, headers=retryer)).status_code == 404
 
 
 def test_provider_normalization_preserves_tool_calls_without_text():
@@ -2099,9 +2135,10 @@ async def test_signed_job_webhook_delivery_records_attempt_history(tmp_path, mon
         return httpx.Response(204)
 
     app = SimpleNamespace(state=SimpleNamespace(
-        config={"async_jobs": {"webhooks": {"search": {
-            "url": "https://hooks.test/jobs", "secret_env": "JOB_EVENT_SECRET"}}}},
-        store=store, http=httpx.AsyncClient(transport=httpx.MockTransport(receive))))
+        config={"server": {"webhooks_allow_private_targets": True}, "async_jobs": {"webhooks": {"search": {
+            "url": "https://hooks.test/jobs", "signing_keys": {"2026-10": "JOB_EVENT_SECRET"},
+            "active_key_id": "2026-10"}}}},
+        webhook_circuits={}, store=store, http=httpx.AsyncClient(transport=httpx.MockTransport(receive))))
     job = store.create_async_job("embedding_batch", "tenant-a", "operator",
         {"application": "search", "input": ["private input must not be included"]}, progress_total=1)
 
@@ -2110,8 +2147,12 @@ async def test_signed_job_webhook_delivery_records_attempt_history(tmp_path, mon
 
     event = store.async_job_webhook_events(job["job_id"])[0]
     request = requests[0]
-    expected = "sha256=" + hmac.new(b"job-event-secret", request.content, hashlib.sha256).hexdigest()
-    assert request.headers["X-LLM-Gateway-Signature"] == expected
+    fields = dict(part.split("=", 1) for part in request.headers["X-LLM-Gateway-Signature"].split(","))
+    signed = fields["t"].encode() + b"." + request.content
+    expected = hmac.new(b"job-event-secret", signed, hashlib.sha256).hexdigest()
+    assert fields["kid"] == "2026-10"
+    assert request.headers["X-LLM-Gateway-Key-Id"] == "2026-10"
+    assert fields["v1"] == expected
     assert request.headers["X-LLM-Gateway-Event"] == "queued"
     assert request.headers["Idempotency-Key"] == event["event_id"]
     assert b"private input" not in request.content
@@ -2119,6 +2160,76 @@ async def test_signed_job_webhook_delivery_records_attempt_history(tmp_path, mon
     assert len(event["delivery_history"]) == 1
     assert event["delivery_history"][0]["http_status"] == 204
     await app.state.http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_webhook_retry_after_and_endpoint_circuit_breaker(tmp_path):
+    store = create_usage_store(str(tmp_path / "webhook-circuit.sqlite3"))
+    store.enqueue_webhook({"alert_id": "first", "application": "app"}, "https://hooks.test/events")
+    store.enqueue_webhook({"alert_id": "second", "application": "app"}, "https://hooks.test/events")
+    requests = []
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(429, headers={"Retry-After": "120"})
+
+    app = SimpleNamespace(state=SimpleNamespace(store=store,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(unavailable)),
+        config={"server": {"webhooks_allow_private_targets": True,
+            "webhook_circuit_failure_threshold": 1, "webhook_circuit_recovery_seconds": 30}},
+        webhook_circuits={}))
+    await _deliver_webhook_batch(app)
+    assert len(requests) == 1
+    with store._connect() as db:
+        rows = {row["event_id"]: row for row in db.execute(
+            "SELECT event_id, status, attempts, next_attempt_at FROM webhook_outbox").fetchall()}
+    assert rows["first"]["status"] == "pending"
+    assert rows["first"]["attempts"] == 1
+    assert (datetime.fromisoformat(rows["first"]["next_attempt_at"]) - datetime.now(UTC)).total_seconds() >= 118
+    assert rows["second"]["status"] == "pending"
+    assert rows["second"]["attempts"] == 0
+    exposition = metrics_response()[0].decode()
+    assert "llm_gateway_webhook_deliveries_total" in exposition
+    assert "llm_gateway_webhook_delivery_duration_seconds" in exposition
+    assert "llm_gateway_webhook_circuit_state" in exposition
+    await app.state.http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_webhook_redirect_is_not_followed(tmp_path):
+    store = create_usage_store(str(tmp_path / "webhook-redirect.sqlite3"))
+    store.enqueue_webhook({"alert_id": "redirect", "application": "app"}, "https://hooks.test/events")
+    requests = []
+
+    def redirect(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(302, headers={"Location": "http://127.0.0.1/admin"})
+
+    app = SimpleNamespace(state=SimpleNamespace(store=store,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(redirect)),
+        config={"server": {"webhooks_allow_private_targets": True}}, webhook_circuits={}))
+    await _deliver_webhook_batch(app)
+    assert len(requests) == 1
+    assert store.webhook_events()[0]["status"] == "dead_letter"
+    await app.state.http.aclose()
+
+
+@pytest.mark.parametrize("url", [
+    "https://user:pass@example.com/hook", "https://localhost/hook",
+    "https://127.0.0.1/hook", "https://[::1]/hook", "http://example.com:8080/hook",
+])
+def test_webhook_target_validation_rejects_unsafe_destinations(url):
+    with pytest.raises(UnsafeWebhookTarget):
+        validate_webhook_url(url, resolve_dns=False)
+
+
+def test_webhook_target_validation_rejects_private_dns_results(monkeypatch):
+    monkeypatch.setattr("llm_gateway.webhook_security.socket.getaddrinfo", lambda *args, **kwargs: [
+        (2, 1, 6, "", ("8.8.8.8", 443)),
+        (2, 1, 6, "", ("10.0.0.8", 443)),
+    ])
+    with pytest.raises(UnsafeWebhookTarget, match="private_webhook_target_not_allowed"):
+        validate_webhook_url("https://hooks.example.com/events")
 
 
 @pytest.mark.asyncio

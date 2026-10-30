@@ -70,12 +70,15 @@ class PostgresUsageStore:
                 secret_env TEXT, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
                 created_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT,
-                job_id TEXT, event_type TEXT, updated_at TEXT
+                job_id TEXT, event_type TEXT, updated_at TEXT,
+                signing_keys_json JSONB, active_key_id TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS idx_webhook_outbox_due ON webhook_outbox(status, next_attempt_at)",
             "ALTER TABLE webhook_outbox ADD COLUMN IF NOT EXISTS job_id TEXT",
             "ALTER TABLE webhook_outbox ADD COLUMN IF NOT EXISTS event_type TEXT",
             "ALTER TABLE webhook_outbox ADD COLUMN IF NOT EXISTS updated_at TEXT",
+            "ALTER TABLE webhook_outbox ADD COLUMN IF NOT EXISTS signing_keys_json JSONB",
+            "ALTER TABLE webhook_outbox ADD COLUMN IF NOT EXISTS active_key_id TEXT",
             "CREATE INDEX IF NOT EXISTS idx_webhook_outbox_job ON webhook_outbox(job_id, created_at)",
             """CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
                 id BIGSERIAL PRIMARY KEY, event_id TEXT NOT NULL, attempted_at TEXT NOT NULL,
@@ -324,9 +327,16 @@ class PostgresUsageStore:
             for table in ("tool_call_audits", "tool_execution_outcomes"):
                 cursor.execute(f"DELETE FROM {table} WHERE tenant_id=%s", (tenant_id,))
                 counts[table] = cursor.rowcount
-            for table in ("budget_reservations", "budget_alerts", "webhook_outbox"):
+            for table in ("budget_reservations", "budget_alerts"):
                 cursor.execute(f"DELETE FROM {table} WHERE left(application, length(%s))=%s", (prefix, prefix))
                 counts[table] = cursor.rowcount
+            cursor.execute("""DELETE FROM webhook_delivery_attempts WHERE event_id IN
+                (SELECT event_id FROM webhook_outbox WHERE left(application,length(%s))=%s OR application=%s)""",
+                (prefix, prefix, tenant_id))
+            counts["webhook_delivery_attempts"] = cursor.rowcount
+            cursor.execute("DELETE FROM webhook_outbox WHERE left(application,length(%s))=%s OR application=%s",
+                (prefix, prefix, tenant_id))
+            counts["webhook_outbox"] = cursor.rowcount
             cursor.execute("DELETE FROM async_jobs WHERE tenant_id=%s AND job_id != COALESCE(%s, '')",
                            (tenant_id, preserve_job_id))
             counts["async_jobs"] = cursor.rowcount
@@ -692,18 +702,22 @@ class PostgresUsageStore:
         return crossed
 
     def enqueue_webhook(self, event: dict[str, Any], webhook_url: str, secret_env: str | None = None,
-                        now: datetime | None = None) -> None:
+                        now: datetime | None = None, *, signing_keys: dict[str, str] | None = None,
+                        active_key_id: str | None = None) -> None:
         import json
         now = now or datetime.now(UTC)
         with self.pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute("""INSERT INTO webhook_outbox
                 (event_id, application, webhook_url, secret_env, body, status, attempts,
-                 next_attempt_at, created_at, job_id, event_type, updated_at)
-                VALUES (%s,%s,%s,%s,%s,'pending',0,%s,%s,%s,%s,%s)
+                 next_attempt_at, created_at, job_id, event_type, updated_at,
+                 signing_keys_json, active_key_id)
+                VALUES (%s,%s,%s,%s,%s,'pending',0,%s,%s,%s,%s,%s,%s::jsonb,%s)
                 ON CONFLICT (event_id) DO NOTHING""",
                 (event.get("event_id") or event.get("alert_id"), event["application"], webhook_url, secret_env,
                  json.dumps(event, separators=(",", ":"), sort_keys=True), now.isoformat(), now.isoformat(),
-                 event.get("job_id"), event.get("type"), now.isoformat()))
+                 event.get("job_id"), event.get("type") or event.get("event"), now.isoformat(),
+                 json.dumps(signing_keys, separators=(",", ":"), sort_keys=True) if signing_keys else None,
+                 active_key_id))
 
     def due_webhooks(self, limit: int = 20, now: datetime | None = None) -> list[dict[str, Any]]:
         now = now or datetime.now(UTC)
@@ -728,6 +742,11 @@ class PostgresUsageStore:
             cursor.execute("""INSERT INTO webhook_delivery_attempts
                 (event_id,attempted_at,attempt,outcome,http_status,error) VALUES (%s,%s,%s,%s,%s,%s)""",
                 (event_id, now.isoformat(), attempts, status, http_status, last_error))
+
+    def defer_webhook(self, event_id: str, next_attempt_at: datetime) -> None:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("UPDATE webhook_outbox SET status='pending', next_attempt_at=%s, updated_at=%s WHERE event_id=%s",
+                (next_attempt_at.isoformat(), datetime.now(UTC).isoformat(), event_id))
 
     def redrive_webhook(self, event_id: str, now: datetime | None = None) -> bool:
         now = now or datetime.now(UTC)

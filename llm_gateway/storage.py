@@ -77,10 +77,11 @@ class UsageStore:
                 secret_env TEXT, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
                 created_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT,
-                job_id TEXT, event_type TEXT, updated_at TEXT
+                job_id TEXT, event_type TEXT, updated_at TEXT,
+                signing_keys_json TEXT, active_key_id TEXT
             )""")
             webhook_columns = {row[1] for row in db.execute("PRAGMA table_info(webhook_outbox)")}
-            for column in ("job_id", "event_type", "updated_at"):
+            for column in ("job_id", "event_type", "updated_at", "signing_keys_json", "active_key_id"):
                 if column not in webhook_columns:
                     db.execute(f"ALTER TABLE webhook_outbox ADD COLUMN {column} TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS idx_webhook_outbox_due ON webhook_outbox(status, next_attempt_at)")
@@ -330,9 +331,16 @@ class UsageStore:
             for table in ("tool_call_audits", "tool_execution_outcomes"):
                 cursor = db.execute(f"DELETE FROM {table} WHERE tenant_id=?", (tenant_id,))
                 counts[table] = cursor.rowcount
-            for table in ("budget_reservations", "budget_alerts", "webhook_outbox"):
+            for table in ("budget_reservations", "budget_alerts"):
                 cursor = db.execute(f"DELETE FROM {table} WHERE substr(application,1,length(?))=?", (prefix, prefix))
                 counts[table] = cursor.rowcount
+            cursor = db.execute("""DELETE FROM webhook_delivery_attempts WHERE event_id IN
+                (SELECT event_id FROM webhook_outbox WHERE substr(application,1,length(?))=? OR application=?)""",
+                (prefix, prefix, tenant_id))
+            counts["webhook_delivery_attempts"] = cursor.rowcount
+            cursor = db.execute("DELETE FROM webhook_outbox WHERE substr(application,1,length(?))=? OR application=?",
+                (prefix, prefix, tenant_id))
+            counts["webhook_outbox"] = cursor.rowcount
             cursor = db.execute("DELETE FROM async_jobs WHERE tenant_id=? AND job_id != COALESCE(?, '')",
                                 (tenant_id, preserve_job_id))
             counts["async_jobs"] = cursor.rowcount
@@ -693,17 +701,21 @@ class UsageStore:
         return crossed
 
     def enqueue_webhook(self, event: dict[str, Any], webhook_url: str, secret_env: str | None = None,
-                        now: datetime | None = None) -> None:
+                        now: datetime | None = None, *, signing_keys: dict[str, str] | None = None,
+                        active_key_id: str | None = None) -> None:
         now = now or datetime.now(UTC)
         import json
         with self._lock, self._connect() as db:
             db.execute("""INSERT OR IGNORE INTO webhook_outbox
                 (event_id, application, webhook_url, secret_env, body, status, attempts,
-                 next_attempt_at, created_at, job_id, event_type, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                 next_attempt_at, created_at, job_id, event_type, updated_at,
+                 signing_keys_json, active_key_id)
+                VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)""",
                 (event.get("event_id") or event.get("alert_id"), event["application"], webhook_url, secret_env,
                  json.dumps(event, separators=(",", ":"), sort_keys=True), now.isoformat(), now.isoformat(),
-                 event.get("job_id"), event.get("type"), now.isoformat()))
+                 event.get("job_id"), event.get("type") or event.get("event"), now.isoformat(),
+                 json.dumps(signing_keys, separators=(",", ":"), sort_keys=True) if signing_keys else None,
+                 active_key_id))
 
     def due_webhooks(self, limit: int = 20, now: datetime | None = None) -> list[dict[str, Any]]:
         now = now or datetime.now(UTC)
@@ -734,6 +746,11 @@ class UsageStore:
                 (event_id, attempted_at, attempt, outcome, http_status, error)
                 VALUES (?, ?, ?, ?, ?, ?)""",
                 (event_id, now.isoformat(), attempts, status, http_status, last_error))
+
+    def defer_webhook(self, event_id: str, next_attempt_at: datetime) -> None:
+        with self._lock, self._connect() as db:
+            db.execute("UPDATE webhook_outbox SET status='pending', next_attempt_at=?, updated_at=? WHERE event_id=?",
+                (next_attempt_at.isoformat(), datetime.now(UTC).isoformat(), event_id))
 
     def redrive_webhook(self, event_id: str, now: datetime | None = None) -> bool:
         now = now or datetime.now(UTC)

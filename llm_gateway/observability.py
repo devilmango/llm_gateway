@@ -32,6 +32,20 @@ LATENCY = Histogram("llm_gateway_request_duration_seconds", "End-to-end request 
                     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60))
 PROVIDER_LATENCY = Histogram("llm_gateway_provider_request_duration_seconds", "Provider request duration by outcome", ["provider", "outcome"], registry=REGISTRY,
                              buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60))
+WEBHOOK_DELIVERIES = Counter(
+    "llm_gateway_webhook_deliveries_total", "Webhook delivery attempts by endpoint and outcome",
+    ["endpoint", "event_type", "outcome"], registry=REGISTRY,
+)
+WEBHOOK_DELIVERY_LATENCY = Histogram(
+    "llm_gateway_webhook_delivery_duration_seconds", "Webhook request duration by endpoint and outcome",
+    ["endpoint", "event_type", "outcome"], registry=REGISTRY,
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5, 10),
+)
+WEBHOOK_CIRCUIT_STATE = Gauge(
+    "llm_gateway_webhook_circuit_state", "Webhook endpoint circuit state (closed=0, open=1)",
+    ["endpoint"], registry=REGISTRY,
+)
+WEBHOOK_CIRCUIT_STATE.labels(endpoint="uninitialized").set(0)
 
 # GenAI semantic-convention metric names and bounded attributes. These mirror the
 # corresponding OTel instruments so Prometheus dashboards can use the same concepts.

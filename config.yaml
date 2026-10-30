@@ -10,6 +10,10 @@ server:
   async_job_max_attempts: 5
   async_job_retry_base_delay_seconds: 1
   async_job_retry_max_delay_seconds: 300
+  webhook_circuit_failure_threshold: 3
+  webhook_circuit_recovery_seconds: 30
+  webhook_dns_timeout_seconds: 2
+  webhooks_allow_private_targets: false
 
 # Optional signed lifecycle notifications for asynchronous jobs. Webhooks are
 # matched by application name, tenant ID, "tenant:application", or "*".
@@ -19,7 +23,10 @@ async_jobs:
   # webhooks:
   #   support-router:
   #     url: https://hooks.example.com/llm-gateway/jobs
-  #     secret_env: JOB_WEBHOOK_SECRET
+  #     signing_keys:
+  #       2026-10: JOB_WEBHOOK_SECRET_2026_10
+  #       2026-07: JOB_WEBHOOK_SECRET_2026_07
+  #     active_key_id: 2026-10
   #     events: [queued, progress, completed, cancelled, dead_letter]
 
 # Job artifacts are written outside the usage database. Use `local` for a
@@ -87,7 +94,8 @@ security:
   #     scopes: [report]
   #   - id: platform-operations
   #     api_key_env: GATEWAY_OPERATIONS_KEY
-  #     scopes: [budgets, providers, webhooks, audit, tenant_data]
+  #     scopes: [budgets, providers, webhooks, audit, tenant_data,
+  #              async_jobs:read, async_jobs:cancel, async_jobs:retry]
   #     enabled: true
   # OIDC/JWT admin and client authentication (requires issuer, audience and JWKS URL).
   # oidc:
