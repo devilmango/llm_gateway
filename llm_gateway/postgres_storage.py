@@ -14,7 +14,9 @@ from .storage import (
     AsyncJobIdempotencyConflict,
     AsyncJobQueueLimitExceeded,
     BudgetExceeded,
+    WebhookEndpointBusy,
 )
+from .webhook_security import webhook_endpoint_id
 
 
 class PostgresUsageStore:
@@ -85,6 +87,14 @@ class PostgresUsageStore:
                 attempt INTEGER NOT NULL, outcome TEXT NOT NULL, http_status INTEGER, error TEXT
             )""",
             "CREATE INDEX IF NOT EXISTS idx_webhook_attempts_event ON webhook_delivery_attempts(event_id, attempt)",
+            "ALTER TABLE webhook_delivery_attempts ADD COLUMN IF NOT EXISTS duration_ms INTEGER",
+            """CREATE TABLE IF NOT EXISTS webhook_endpoint_controls (
+                webhook_url TEXT PRIMARY KEY, paused BOOLEAN NOT NULL DEFAULT FALSE,
+                reset_at TEXT, updated_at TEXT, updated_by TEXT
+            )""",
+            """INSERT INTO webhook_endpoint_controls (webhook_url)
+                SELECT DISTINCT webhook_url FROM webhook_outbox WHERE TRUE
+                ON CONFLICT (webhook_url) DO NOTHING""",
             """CREATE TABLE IF NOT EXISTS admin_audit_events (
                 id BIGSERIAL PRIMARY KEY, occurred_at TEXT NOT NULL,
                 actor TEXT NOT NULL, action TEXT NOT NULL, status_code INTEGER NOT NULL
@@ -531,12 +541,17 @@ class PostgresUsageStore:
             cursor.execute("""SELECT started_at, completed_at FROM async_jobs WHERE started_at IS NOT NULL
                 ORDER BY started_at DESC LIMIT 100""")
             rows = cursor.fetchall()
+            cursor.execute("SELECT MIN(started_at) AS started_at FROM async_jobs WHERE status='running'")
+            oldest_running = cursor.fetchone()["started_at"]
         durations = [max(0, int((datetime.fromisoformat(row["completed_at"])
             - datetime.fromisoformat(row["started_at"])).total_seconds() * 1000))
             for row in rows if row["completed_at"]]
+        oldest_running_seconds = (max(0, int((datetime.now(UTC) - datetime.fromisoformat(oldest_running)).total_seconds()))
+                                  if oldest_running else 0)
         return {"queue_depth": counts.get("queued", 0), "running": counts.get("running", 0),
             "dead_letter": counts.get("dead_letter", 0), "counts_by_status": counts,
-            "average_duration_ms": round(float(average or 0), 2), "recent_durations_ms": durations}
+            "average_duration_ms": round(float(average or 0), 2), "recent_durations_ms": durations,
+            "oldest_running_seconds": oldest_running_seconds}
 
     def pending_async_jobs(self, limit: int = 20,
                            tenant_limits: dict[str, int] | None = None) -> list[str]:
@@ -707,6 +722,8 @@ class PostgresUsageStore:
         import json
         now = now or datetime.now(UTC)
         with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("INSERT INTO webhook_endpoint_controls (webhook_url) VALUES (%s) ON CONFLICT (webhook_url) DO NOTHING",
+                           (webhook_url,))
             cursor.execute("""INSERT INTO webhook_outbox
                 (event_id, application, webhook_url, secret_env, body, status, attempts,
                  next_attempt_at, created_at, job_id, event_type, updated_at,
@@ -723,8 +740,10 @@ class PostgresUsageStore:
         now = now or datetime.now(UTC)
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
             cursor.execute("""WITH due AS (
-                SELECT event_id FROM webhook_outbox WHERE status IN ('pending','processing') AND next_attempt_at <= %s
-                ORDER BY created_at LIMIT %s FOR UPDATE SKIP LOCKED
+                SELECT w.event_id FROM webhook_outbox w
+                JOIN webhook_endpoint_controls c ON c.webhook_url=w.webhook_url
+                WHERE w.status IN ('pending','processing') AND w.next_attempt_at <= %s AND c.paused=FALSE
+                ORDER BY w.created_at LIMIT %s FOR UPDATE OF w,c SKIP LOCKED
             ) UPDATE webhook_outbox AS w SET status='processing', next_attempt_at=%s
               FROM due WHERE w.event_id=due.event_id RETURNING w.*""",
                 (now.isoformat(), limit, (now + timedelta(seconds=60)).isoformat()))
@@ -732,7 +751,8 @@ class PostgresUsageStore:
 
     def update_webhook(self, event_id: str, *, attempts: int, status: str,
                        next_attempt_at: datetime | None = None, delivered_at: datetime | None = None,
-                       last_error: str | None = None, http_status: int | None = None) -> None:
+                       last_error: str | None = None, http_status: int | None = None,
+                       duration_ms: int | None = None) -> None:
         now = datetime.now(UTC)
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
             cursor.execute("""UPDATE webhook_outbox SET attempts=%s,status=%s,next_attempt_at=%s,
@@ -740,21 +760,128 @@ class PostgresUsageStore:
                 (attempts, status, (next_attempt_at or datetime.now(UTC)).isoformat(),
                  delivered_at.isoformat() if delivered_at else None, last_error, now.isoformat(), event_id))
             cursor.execute("""INSERT INTO webhook_delivery_attempts
-                (event_id,attempted_at,attempt,outcome,http_status,error) VALUES (%s,%s,%s,%s,%s,%s)""",
-                (event_id, now.isoformat(), attempts, status, http_status, last_error))
+                (event_id,attempted_at,attempt,outcome,http_status,error,duration_ms) VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                (event_id, now.isoformat(), attempts, status, http_status, last_error, duration_ms))
 
     def defer_webhook(self, event_id: str, next_attempt_at: datetime) -> None:
         with self.pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute("UPDATE webhook_outbox SET status='pending', next_attempt_at=%s, updated_at=%s WHERE event_id=%s",
                 (next_attempt_at.isoformat(), datetime.now(UTC).isoformat(), event_id))
 
-    def redrive_webhook(self, event_id: str, now: datetime | None = None) -> bool:
+    def redrive_webhook(self, event_id: str, now: datetime | None = None,
+                        actor: str | None = None) -> bool:
         now = now or datetime.now(UTC)
-        with self.pool.connection() as conn, conn.cursor() as cursor:
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
             cursor.execute("""UPDATE webhook_outbox SET status='pending', attempts=0, next_attempt_at=%s,
                 delivered_at=NULL,last_error=NULL WHERE event_id=%s AND status='dead_letter'""",
                 (now.isoformat(), event_id))
-            return bool(cursor.rowcount)
+            redriven = bool(cursor.rowcount)
+            if redriven and actor:
+                cursor.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (%s,%s,%s,%s)",
+                               (now.isoformat(), actor, f"webhook_redrive:{event_id}", 202))
+            return redriven
+
+    def prune_webhook_history(self, retention_days: int, now: datetime | None = None) -> dict[str, int]:
+        if not isinstance(retention_days, int) or isinstance(retention_days, bool) or retention_days < 1:
+            raise ValueError("retention_days must be a positive integer")
+        cutoff = ((now or datetime.now(UTC)) - timedelta(days=retention_days)).isoformat()
+        terminal = "SELECT event_id FROM webhook_outbox WHERE status IN ('delivered','dead_letter') AND COALESCE(delivered_at,updated_at,created_at) < %s"
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute(f"DELETE FROM webhook_delivery_attempts WHERE event_id IN ({terminal})", (cutoff,))
+            attempts = cursor.rowcount
+            cursor.execute(f"DELETE FROM webhook_outbox WHERE event_id IN ({terminal})", (cutoff,))
+            return {"events": int(cursor.rowcount), "attempts": int(attempts)}
+
+    def webhook_endpoint_report(self, window_hours: int = 24,
+                                now: datetime | None = None) -> list[dict[str, Any]]:
+        if window_hours < 1:
+            raise ValueError("window_hours must be positive")
+        now = now or datetime.now(UTC)
+        since = (now - timedelta(hours=window_hours)).isoformat()
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("""SELECT c.webhook_url,c.paused,c.reset_at,c.updated_at,c.updated_by,
+                SUM(CASE WHEN w.status='pending' THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN w.status='processing' THEN 1 ELSE 0 END) AS active_count,
+                MIN(CASE WHEN w.status='pending' THEN w.created_at END) AS oldest_pending_at
+                FROM webhook_endpoint_controls c LEFT JOIN webhook_outbox w ON w.webhook_url=c.webhook_url
+                GROUP BY c.webhook_url,c.paused,c.reset_at,c.updated_at,c.updated_by ORDER BY c.webhook_url""")
+            rows = cursor.fetchall()
+            cursor.execute("""SELECT w.webhook_url,COUNT(a.id) AS attempt_count,
+                SUM(CASE WHEN a.outcome='delivered' THEN 1 ELSE 0 END) AS success_count,
+                AVG(a.duration_ms) AS average_latency_ms
+                FROM webhook_outbox w JOIN webhook_delivery_attempts a ON a.event_id=w.event_id
+                WHERE a.attempted_at>=%s GROUP BY w.webhook_url""", (since,))
+            attempts = cursor.fetchall()
+        attempt_stats = {row["webhook_url"]: row for row in attempts}
+        report = []
+        for row in rows:
+            stats = attempt_stats.get(row["webhook_url"], {})
+            attempt_count = int(stats.get("attempt_count") or 0)
+            success_count = int(stats.get("success_count") or 0)
+            oldest = datetime.fromisoformat(row["oldest_pending_at"]) if row["oldest_pending_at"] else None
+            report.append({"endpoint_id": webhook_endpoint_id(row["webhook_url"]),
+                "webhook_url": row["webhook_url"], "paused": bool(row["paused"]),
+                "pending_count": int(row["pending_count"] or 0),
+                "active_deliveries": int(row["active_count"] or 0),
+                "oldest_pending_age_seconds": (max(0, int((now-oldest).total_seconds())) if oldest else 0),
+                "attempt_count": attempt_count, "success_count": success_count,
+                "success_rate": success_count / attempt_count if attempt_count else None,
+                "average_latency_ms": round(float(stats["average_latency_ms"]), 2)
+                    if stats.get("average_latency_ms") is not None else None,
+                "reset_at": row["reset_at"], "updated_at": row["updated_at"],
+                "updated_by": row["updated_by"]})
+        return report
+
+    def _webhook_endpoint_url(self, cursor, endpoint_id: str) -> str | None:
+        cursor.execute("SELECT webhook_url FROM webhook_endpoint_controls")
+        matches = [row["webhook_url"] for row in cursor.fetchall()
+                   if webhook_endpoint_id(row["webhook_url"]) == endpoint_id]
+        return matches[0] if len(matches) == 1 else None
+
+    def set_webhook_endpoint_paused(self, endpoint_id: str, paused: bool, actor: str,
+                                    now: datetime | None = None) -> dict[str, Any] | None:
+        now = now or datetime.now(UTC)
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            url = self._webhook_endpoint_url(cursor, endpoint_id)
+            if url is None:
+                return None
+            cursor.execute("SELECT webhook_url FROM webhook_endpoint_controls WHERE webhook_url=%s FOR UPDATE", (url,))
+            cursor.execute("""UPDATE webhook_endpoint_controls SET paused=%s,updated_at=%s,updated_by=%s
+                WHERE webhook_url=%s""", (paused, now.isoformat(), actor, url))
+            cursor.execute("SELECT COUNT(*) AS count FROM webhook_outbox WHERE webhook_url=%s AND status='processing'",
+                           (url,))
+            active = int(cursor.fetchone()["count"])
+            action = "pause" if paused else "resume"
+            cursor.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (%s,%s,%s,200)",
+                           (now.isoformat(), actor, f"webhook_endpoint_{action}:{endpoint_id}"))
+            return {"endpoint_id": endpoint_id, "paused": paused, "active_deliveries": active,
+                    "updated_at": now.isoformat(), "updated_by": actor}
+
+    def reset_webhook_endpoint_circuit(self, endpoint_id: str, actor: str,
+                                       now: datetime | None = None) -> dict[str, Any] | None:
+        now = now or datetime.now(UTC)
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            url = self._webhook_endpoint_url(cursor, endpoint_id)
+            if url is None:
+                return None
+            cursor.execute("SELECT paused FROM webhook_endpoint_controls WHERE webhook_url=%s FOR UPDATE", (url,))
+            cursor.execute("SELECT COUNT(*) AS count FROM webhook_outbox WHERE webhook_url=%s AND status='processing'",
+                           (url,))
+            if int(cursor.fetchone()["count"]):
+                raise WebhookEndpointBusy(endpoint_id)
+            cursor.execute("UPDATE webhook_endpoint_controls SET reset_at=%s,updated_at=%s,updated_by=%s WHERE webhook_url=%s",
+                           (now.isoformat(), now.isoformat(), actor, url))
+            cursor.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (%s,%s,%s,200)",
+                           (now.isoformat(), actor, f"webhook_circuit_reset:{endpoint_id}"))
+            return {"endpoint_id": endpoint_id, "reset_at": now.isoformat(), "updated_by": actor}
+
+    def webhook_endpoint_control(self, webhook_url: str) -> dict[str, Any]:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT paused,reset_at FROM webhook_endpoint_controls WHERE webhook_url=%s",
+                           (webhook_url,))
+            row = cursor.fetchone()
+            return {"paused": bool(row["paused"]), "reset_at": row["reset_at"]} if row else {
+                "paused": False, "reset_at": None}
 
     def webhook_events(self, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         with self.pool.connection() as conn, conn.cursor() as cursor:

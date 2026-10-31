@@ -28,6 +28,10 @@ PROVIDER_CIRCUIT_STATE = Gauge("llm_gateway_provider_circuit_state", "Provider c
 IN_FLIGHT = Gauge("llm_gateway_requests_in_flight", "Requests currently being handled", registry=REGISTRY)
 TOOL_EXECUTIONS_PENDING = Gauge("llm_gateway_tool_executions_pending", "Generated tool calls without a reported outcome", registry=REGISTRY)
 TOOL_EXECUTIONS_OVERDUE = Gauge("llm_gateway_tool_executions_overdue", "Generated tool calls past the execution outcome deadline", registry=REGISTRY)
+ASYNC_JOBS_QUEUED = Gauge("llm_gateway_async_jobs_queued", "Async jobs waiting for dispatch", registry=REGISTRY)
+ASYNC_JOBS_RUNNING = Gauge("llm_gateway_async_jobs_running", "Async jobs currently running", registry=REGISTRY)
+ASYNC_JOBS_DEAD_LETTER = Gauge("llm_gateway_async_jobs_dead_letter", "Async jobs in dead-letter state", registry=REGISTRY)
+ASYNC_JOB_OLDEST_RUNNING_SECONDS = Gauge("llm_gateway_async_job_oldest_running_seconds", "Age of the oldest running async job", registry=REGISTRY)
 LATENCY = Histogram("llm_gateway_request_duration_seconds", "End-to-end request duration", ["route", "status"], registry=REGISTRY,
                     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60))
 PROVIDER_LATENCY = Histogram("llm_gateway_provider_request_duration_seconds", "Provider request duration by outcome", ["provider", "outcome"], registry=REGISTRY,
@@ -40,6 +44,22 @@ WEBHOOK_DELIVERY_LATENCY = Histogram(
     "llm_gateway_webhook_delivery_duration_seconds", "Webhook request duration by endpoint and outcome",
     ["endpoint", "event_type", "outcome"], registry=REGISTRY,
     buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5, 10),
+)
+WEBHOOK_OLDEST_PENDING_SECONDS = Gauge(
+    "llm_gateway_webhook_oldest_pending_seconds", "Age of oldest pending webhook event by endpoint",
+    ["endpoint"], registry=REGISTRY,
+)
+WEBHOOK_ENDPOINT_PAUSED = Gauge(
+    "llm_gateway_webhook_endpoint_paused", "Whether operator controls have paused an endpoint (1=paused)",
+    ["endpoint"], registry=REGISTRY,
+)
+WEBHOOK_DELIVERY_SUCCESS_RATE = Gauge(
+    "llm_gateway_webhook_delivery_success_rate_24h", "Webhook successful delivery attempts divided by all attempts in the last 24 hours",
+    ["endpoint"], registry=REGISTRY,
+)
+WEBHOOK_DELIVERY_ATTEMPTS_24H = Gauge(
+    "llm_gateway_webhook_delivery_attempts_24h", "Webhook delivery attempt count in the last 24 hours",
+    ["endpoint"], registry=REGISTRY,
 )
 WEBHOOK_CIRCUIT_STATE = Gauge(
     "llm_gateway_webhook_circuit_state", "Webhook endpoint circuit state (closed=0, open=1)",

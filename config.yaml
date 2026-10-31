@@ -12,6 +12,7 @@ server:
   async_job_retry_max_delay_seconds: 300
   webhook_circuit_failure_threshold: 3
   webhook_circuit_recovery_seconds: 30
+  webhook_retention_days: 90
   webhook_dns_timeout_seconds: 2
   webhooks_allow_private_targets: false
 

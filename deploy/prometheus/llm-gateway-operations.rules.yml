@@ -1,0 +1,66 @@
+groups:
+  - name: llm-gateway-operations
+    interval: 30s
+    rules:
+      - alert: LLMGatewayAsyncJobQueueGrowing
+        expr: |
+          delta(llm_gateway_async_jobs_queued[10m]) > 25
+          and llm_gateway_async_jobs_queued > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM gateway async job queue is growing"
+          description: "The queued job count grew by more than 25 in 10 minutes and remains above 50. Check worker capacity and provider health."
+
+      - alert: LLMGatewayAsyncJobLongRunning
+        expr: llm_gateway_async_job_oldest_running_seconds > 1800
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "An LLM gateway async job is running for too long"
+          description: "The oldest running async job has exceeded 30 minutes. Inspect the job report and worker logs."
+
+      - alert: LLMGatewayAsyncJobDeadLetter
+        expr: llm_gateway_async_jobs_dead_letter > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM gateway has dead-letter async jobs"
+          description: "At least one async job is dead-lettered. Review its error and retry only after correcting the cause."
+
+      - alert: LLMGatewayWebhookDeliveryFailures
+        expr: |
+          sum by (endpoint, event_type) (
+            increase(llm_gateway_webhook_deliveries_total{outcome=~"retry|dead_letter|blocked"}[10m])
+          ) >= 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Repeated LLM gateway webhook delivery failures"
+          description: "Webhook endpoint {{ $labels.endpoint }} for event type {{ $labels.event_type }} has failed at least five times in 10 minutes."
+
+      - alert: LLMGatewayWebhookDeliveryDelayed
+        expr: |
+          (llm_gateway_webhook_oldest_pending_seconds > 300)
+          and on (endpoint) (llm_gateway_webhook_endpoint_paused == 0)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM gateway webhook delivery is delayed"
+          description: "Webhook endpoint {{ $labels.endpoint }} has a pending event older than five minutes. Check endpoint state, worker capacity, and circuit status."
+
+      - alert: LLMGatewayWebhookDeliverySuccessRateLow
+        expr: |
+          (llm_gateway_webhook_delivery_success_rate_24h < 0.95)
+          and on (endpoint) (llm_gateway_webhook_delivery_attempts_24h >= 10)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM gateway webhook delivery success rate is low"
+          description: "Webhook endpoint {{ $labels.endpoint }} has succeeded on fewer than 95% of its last-24-hour delivery attempts."

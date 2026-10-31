@@ -300,6 +300,24 @@ Async jobs use capped exponential retry backoff, cooperative cancellation at wor
 
 Configure optional lifecycle notifications under `async_jobs.webhooks`, keyed by application, tenant ID, `tenant:application`, or `*`. Each entry accepts an HTTP(S) `url`, optional `secret_env` or rotating `signing_keys` plus `active_key_id`, and an optional event list (`queued`, `progress`, `completed`, `cancelled`, `dead_letter`). Signed deliveries include `X-LLM-Gateway-Signature: t=<unix-seconds>,kid=<key-id>,v1=<hex HMAC-SHA256>`; the HMAC covers `<timestamp>.<exact request body>`. Consumers can reject stale timestamps and select the verification secret by key ID. Keep old key environment variables available until events queued under that key are delivered or dead-lettered; newly queued events use the new active key. The gateway does not follow redirects, rejects credential-bearing URLs and local/private destinations, and resolves DNS before delivery with a bounded timeout. Set `server.webhooks_allow_private_targets: true` only for trusted deployments that intentionally deliver to private addresses. Delivery uses the durable webhook outbox, jittered exponential retry, `Retry-After`, and per-endpoint circuit breakers. Job events also include `X-LLM-Gateway-Event` and `X-LLM-Gateway-Event-Id`; consumers should deduplicate by `Idempotency-Key`. Inspect a job's delivery state and per-attempt outcomes with `GET /v1/admin/async-jobs/{job_id}/webhooks` (requires `async_jobs:read`). Prometheus exports `llm_gateway_webhook_deliveries_total`, `llm_gateway_webhook_delivery_duration_seconds`, and `llm_gateway_webhook_circuit_state`.
 
+Webhook outbox events and delivery attempts are retained for 90 days by default. Set `server.webhook_retention_days` to a positive number to change this window. A daily maintenance pass deletes only delivered or dead-letter events whose terminal timestamp is older than the window, along with their attempt history; pending and processing deliveries are retained. Operators with the `webhooks` admin scope can redrive one dead-letter event with `POST /v1/admin/webhooks/{event_id}/redrive`. The event is reset for delivery and an audit row records the operator identity and event ID. Load [`deploy/prometheus/llm-gateway-operations.rules.yml`](deploy/prometheus/llm-gateway-operations.rules.yml) alongside the SLO rules to alert on sustained queue growth, long-running jobs, dead-letter jobs, and repeated webhook delivery failures.
+
+The receiver helper in [`llm_gateway/webhook_client.py`](llm_gateway/webhook_client.py) validates the timestamped HMAC header, rejects stale signatures and mismatched event IDs, supports overlapping key IDs during rotation, and detects duplicate event IDs within a bounded in-memory window. Supply every currently accepted key ID and secret during rotation:
+
+```python
+from llm_gateway.webhook_client import WebhookVerifier
+
+verifier = WebhookVerifier({
+    "2026-10": current_secret,
+    "2026-07": previous_secret,
+})
+verified = verifier.verify(request.headers, await request.body())
+```
+
+The helper's deduplication cache is process-local. Receivers running multiple replicas should also persist the verified event ID in their shared idempotency store before applying side effects.
+
+`GET /v1/admin/webhooks/report?window_hours=24` summarizes pending age, attempt success rate, and average delivery latency by stable endpoint ID. The `webhooks` scope also controls endpoint operations: `POST /v1/admin/webhooks/endpoints/{endpoint_id}/pause`, `/resume`, and `/circuit/reset`. Pausing stops new claims and allows already active deliveries to finish; circuit reset returns HTTP 409 while an endpoint has an active delivery. Each successful control action records the endpoint ID and operator in the audit log. Prometheus exposes the oldest pending age, last-24-hour success ratio and attempt count per endpoint, alongside the existing delivery latency histogram.
+
 Operators can retry only dead-letter jobs with a retained payload using `POST /v1/admin/async-jobs/{job_id}/retry?confirm_job_id={job_id}`. The exact ID confirmation prevents accidental retries, the operation resets the attempt counter and queue state, and the operator identity plus job ID are written to the admin audit log. The endpoint requires `async_jobs:retry`; cancellation requires `async_jobs:cancel`.
 
 Large job output is written outside the database. The default local backend writes to `gateway-artifacts/`; configure a shared S3 bucket for multi-replica deployments:
@@ -460,7 +478,11 @@ Use `response_format: {"type":"json_schema","json_schema":{"name":"order_status"
 | `GET` | `/v1/admin/shadow-reports` | Compare sampled candidate quality, cost, latency, failures, and shadow promotion gates. |
 | `POST` | `/v1/admin/promotions/evaluate` | Combine a saved evaluation comparison, shadow gates, and current route/application SLOs. |
 | `GET` | `/v1/admin/webhooks` | Inspect pending, delivered, and dead-letter budget alert events. |
+| `GET` | `/v1/admin/webhooks/report` | Report pending age, success rate, and latency by webhook endpoint. |
 | `POST` | `/v1/admin/webhooks/{event_id}/redrive` | Retry a dead-letter alert event. |
+| `POST` | `/v1/admin/webhooks/endpoints/{endpoint_id}/pause` | Pause new deliveries; active deliveries finish. |
+| `POST` | `/v1/admin/webhooks/endpoints/{endpoint_id}/resume` | Resume endpoint deliveries. |
+| `POST` | `/v1/admin/webhooks/endpoints/{endpoint_id}/circuit/reset` | Reset an endpoint circuit when no delivery is active. |
 | `GET` | `/metrics` | Prometheus metrics in exposition format. |
 | `GET` | `/docs` | FastAPI Swagger UI. |
 
@@ -495,7 +517,7 @@ slos:
       latency_target_ms: 3000
 ```
 
-`GET /v1/admin/slos?window_hours=24` reports observed availability, latency compliance, and each objective's error-budget burn rate and remaining percentage by application and route. Latency compliance measures requests within `latency_target_ms`; availability counts requests with status `success`. Example Prometheus rules are in [`deploy/prometheus/llm-gateway-slo.rules.yml`](deploy/prometheus/llm-gateway-slo.rules.yml). Load the file using Prometheus `rule_files`; the example alerts use a 14.4x short-window burn threshold.
+`GET /v1/admin/slos?window_hours=24` reports observed availability, latency compliance, and each objective's error-budget burn rate and remaining percentage by application and route. Latency compliance measures requests within `latency_target_ms`; availability counts requests with status `success`. Example Prometheus rules are in [`deploy/prometheus/llm-gateway-slo.rules.yml`](deploy/prometheus/llm-gateway-slo.rules.yml) and [`deploy/prometheus/llm-gateway-operations.rules.yml`](deploy/prometheus/llm-gateway-operations.rules.yml). Load the files using Prometheus `rule_files`; the operations rules cover job queue growth and duration, job dead letters, repeated webhook failures, webhook delivery delay, and low endpoint success rate.
 
 ### Context-aware canary routing
 
@@ -663,7 +685,7 @@ When Redis is configured, circuit states and the single half-open recovery probe
 ## Security and privacy
 
 - Set `GATEWAY_API_KEY` to protect all `/v1` endpoints with bearer authentication.
-- Configure `security.admin_api_keys` for scoped admin access. Supported scopes include `report`, `budgets`, `providers`, `webhooks`, `audit`, `tool_approvals`, `async_jobs:read`, `async_jobs:cancel`, and `async_jobs:retry`. A `report` key cannot inspect or operate async jobs unless it also has an async job scope. Rotate by enabling a replacement key before disabling the old entry; changing the configured key list requires a restart, while changing a referenced secret file takes effect on the next request.
+- Configure `security.admin_api_keys` for scoped admin access. Supported scopes include `report`, `budgets`, `providers`, `webhooks`, `webhooks:pause`, `webhooks:circuit_reset`, `audit`, `tool_approvals`, `async_jobs:read`, `async_jobs:cancel`, and `async_jobs:retry`. The broad `webhooks` scope retains access to endpoint reports, redrive, and endpoint controls; the narrower scopes grant pause/resume or circuit reset only. A `report` key cannot inspect or operate async jobs unless it also has an async job scope. Rotate by enabling a replacement key before disabling the old entry; changing the configured key list requires a restart, while changing a referenced secret file takes effect on the next request.
 - Configure `security.oidc` with issuer, audience, and JWKS URL to validate signed JWTs. Admin tokens need `llm-gateway:<scope>` or `admin:*`; client access uses the `client` scope when OIDC is enabled without tenant keys. Access tokens are validated offline, so revocation takes effect when the token expires unless the identity provider issues a replacement or rejection is reflected by a new JWKS key set.
 - Authenticated admin calls are recorded in the audit table and exposed at `/v1/admin/audit`. The audit log stores actor, path, status, and time; it omits tokens, prompts, and request bodies.
 - When using tenant credentials, configure separate admin credentials; tenant keys are restricted to allowed routes and applications.

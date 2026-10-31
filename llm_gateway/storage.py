@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import MIN_TENANT_USAGE_RETENTION_DAYS
+from .webhook_security import webhook_endpoint_id
 
 
 class BudgetExceeded(Exception):
@@ -22,6 +23,10 @@ class AsyncJobIdempotencyConflict(ValueError):
 
 class AsyncJobQueueLimitExceeded(ValueError):
     """The tenant has reached its configured queued job limit."""
+
+
+class WebhookEndpointBusy(ValueError):
+    """An endpoint circuit cannot be reset while a delivery is in flight."""
 
 
 class UsageStore:
@@ -92,6 +97,15 @@ class UsageStore:
                 outcome TEXT NOT NULL, http_status INTEGER, error TEXT
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_webhook_attempts_event ON webhook_delivery_attempts(event_id, attempt)")
+            attempt_columns = {row[1] for row in db.execute("PRAGMA table_info(webhook_delivery_attempts)")}
+            if "duration_ms" not in attempt_columns:
+                db.execute("ALTER TABLE webhook_delivery_attempts ADD COLUMN duration_ms INTEGER")
+            db.execute("""CREATE TABLE IF NOT EXISTS webhook_endpoint_controls (
+                webhook_url TEXT PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0,
+                reset_at TEXT, updated_at TEXT, updated_by TEXT
+            )""")
+            db.execute("""INSERT OR IGNORE INTO webhook_endpoint_controls (webhook_url)
+                SELECT DISTINCT webhook_url FROM webhook_outbox""")
             db.execute("""CREATE TABLE IF NOT EXISTS admin_audit_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL,
                 actor TEXT NOT NULL, action TEXT NOT NULL, status_code INTEGER NOT NULL
@@ -521,13 +535,17 @@ class UsageStore:
                 FROM async_jobs WHERE status='completed' AND started_at IS NOT NULL AND completed_at IS NOT NULL""").fetchone()[0]
             latest = db.execute("""SELECT started_at, completed_at FROM async_jobs
                 WHERE started_at IS NOT NULL ORDER BY started_at DESC LIMIT 100""").fetchall()
+            oldest_running = db.execute("SELECT MIN(started_at) FROM async_jobs WHERE status='running'").fetchone()[0]
         counts = {row["status"]: int(row["count"]) for row in rows}
         durations = [max(0, int((datetime.fromisoformat(row["completed_at"])
             - datetime.fromisoformat(row["started_at"])).total_seconds() * 1000))
             for row in latest if row["completed_at"]]
+        oldest_running_seconds = (max(0, int((datetime.now(UTC) - datetime.fromisoformat(oldest_running)).total_seconds()))
+                                  if oldest_running else 0)
         return {"queue_depth": counts.get("queued", 0), "running": counts.get("running", 0),
             "dead_letter": counts.get("dead_letter", 0), "counts_by_status": counts,
-            "average_duration_ms": round(float(duration or 0), 2), "recent_durations_ms": durations}
+            "average_duration_ms": round(float(duration or 0), 2), "recent_durations_ms": durations,
+            "oldest_running_seconds": oldest_running_seconds}
 
     def pending_async_jobs(self, limit: int = 20,
                            tenant_limits: dict[str, int] | None = None) -> list[str]:
@@ -706,6 +724,7 @@ class UsageStore:
         now = now or datetime.now(UTC)
         import json
         with self._lock, self._connect() as db:
+            db.execute("INSERT OR IGNORE INTO webhook_endpoint_controls (webhook_url) VALUES (?)", (webhook_url,))
             db.execute("""INSERT OR IGNORE INTO webhook_outbox
                 (event_id, application, webhook_url, secret_env, body, status, attempts,
                  next_attempt_at, created_at, job_id, event_type, updated_at,
@@ -721,8 +740,10 @@ class UsageStore:
         now = now or datetime.now(UTC)
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            due = db.execute("""SELECT event_id FROM webhook_outbox
-                WHERE status IN ('pending','processing') AND next_attempt_at <= ? ORDER BY created_at LIMIT ?""",
+            due = db.execute("""SELECT w.event_id FROM webhook_outbox w
+                JOIN webhook_endpoint_controls c ON c.webhook_url=w.webhook_url
+                WHERE w.status IN ('pending','processing') AND w.next_attempt_at <= ? AND c.paused=0
+                ORDER BY w.created_at LIMIT ?""",
                 (now.isoformat(), limit)).fetchall()
             ids = [row[0] for row in due]
             for event_id in ids:
@@ -735,7 +756,8 @@ class UsageStore:
 
     def update_webhook(self, event_id: str, *, attempts: int, status: str,
                        next_attempt_at: datetime | None = None, delivered_at: datetime | None = None,
-                       last_error: str | None = None, http_status: int | None = None) -> None:
+                       last_error: str | None = None, http_status: int | None = None,
+                       duration_ms: int | None = None) -> None:
         now = datetime.now(UTC)
         with self._lock, self._connect() as db:
             db.execute("""UPDATE webhook_outbox SET attempts=?, status=?, next_attempt_at=?,
@@ -743,22 +765,126 @@ class UsageStore:
                 (attempts, status, (next_attempt_at or datetime.now(UTC)).isoformat(),
                  delivered_at.isoformat() if delivered_at else None, last_error, now.isoformat(), event_id))
             db.execute("""INSERT INTO webhook_delivery_attempts
-                (event_id, attempted_at, attempt, outcome, http_status, error)
-                VALUES (?, ?, ?, ?, ?, ?)""",
-                (event_id, now.isoformat(), attempts, status, http_status, last_error))
+                (event_id, attempted_at, attempt, outcome, http_status, error, duration_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (event_id, now.isoformat(), attempts, status, http_status, last_error, duration_ms))
 
     def defer_webhook(self, event_id: str, next_attempt_at: datetime) -> None:
         with self._lock, self._connect() as db:
             db.execute("UPDATE webhook_outbox SET status='pending', next_attempt_at=?, updated_at=? WHERE event_id=?",
                 (next_attempt_at.isoformat(), datetime.now(UTC).isoformat(), event_id))
 
-    def redrive_webhook(self, event_id: str, now: datetime | None = None) -> bool:
+    def redrive_webhook(self, event_id: str, now: datetime | None = None,
+                        actor: str | None = None) -> bool:
         now = now or datetime.now(UTC)
         with self._lock, self._connect() as db:
             cursor = db.execute("""UPDATE webhook_outbox SET status='pending', attempts=0,
                 next_attempt_at=?, delivered_at=NULL, last_error=NULL
                 WHERE event_id=? AND status='dead_letter'""", (now.isoformat(), event_id))
-            return bool(cursor.rowcount)
+            redriven = bool(cursor.rowcount)
+            if redriven and actor:
+                db.execute("INSERT INTO admin_audit_events (occurred_at, actor, action, status_code) VALUES (?,?,?,?)",
+                           (now.isoformat(), actor, f"webhook_redrive:{event_id}", 202))
+            return redriven
+
+    def prune_webhook_history(self, retention_days: int, now: datetime | None = None) -> dict[str, int]:
+        if not isinstance(retention_days, int) or isinstance(retention_days, bool) or retention_days < 1:
+            raise ValueError("retention_days must be a positive integer")
+        cutoff = ((now or datetime.now(UTC)) - timedelta(days=retention_days)).isoformat()
+        terminal = "SELECT event_id FROM webhook_outbox WHERE status IN ('delivered','dead_letter') AND COALESCE(delivered_at,updated_at,created_at) < ?"
+        with self._lock, self._connect() as db:
+            attempts = db.execute(f"DELETE FROM webhook_delivery_attempts WHERE event_id IN ({terminal})", (cutoff,)).rowcount
+            events = db.execute(f"DELETE FROM webhook_outbox WHERE event_id IN ({terminal})", (cutoff,)).rowcount
+            return {"events": int(events), "attempts": int(attempts)}
+
+    def webhook_endpoint_report(self, window_hours: int = 24,
+                                now: datetime | None = None) -> list[dict[str, Any]]:
+        if window_hours < 1:
+            raise ValueError("window_hours must be positive")
+        now = now or datetime.now(UTC)
+        since = (now - timedelta(hours=window_hours)).isoformat()
+        with self._lock, self._connect() as db:
+            rows = db.execute("""SELECT c.webhook_url,c.paused,c.reset_at,c.updated_at,c.updated_by,
+                SUM(CASE WHEN w.status='pending' THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN w.status='processing' THEN 1 ELSE 0 END) AS active_count,
+                MIN(CASE WHEN w.status='pending' THEN w.created_at END) AS oldest_pending_at
+                FROM webhook_endpoint_controls c LEFT JOIN webhook_outbox w ON w.webhook_url=c.webhook_url
+                GROUP BY c.webhook_url,c.paused,c.reset_at,c.updated_at,c.updated_by ORDER BY c.webhook_url""").fetchall()
+            attempts = db.execute("""SELECT w.webhook_url,COUNT(a.id) AS attempt_count,
+                SUM(CASE WHEN a.outcome='delivered' THEN 1 ELSE 0 END) AS success_count,
+                AVG(a.duration_ms) AS average_latency_ms
+                FROM webhook_outbox w JOIN webhook_delivery_attempts a ON a.event_id=w.event_id
+                WHERE a.attempted_at>=? GROUP BY w.webhook_url""", (since,)).fetchall()
+        attempt_stats = {row["webhook_url"]: dict(row) for row in attempts}
+        report = []
+        for row in rows:
+            stats = attempt_stats.get(row["webhook_url"], {})
+            attempt_count = int(stats.get("attempt_count") or 0)
+            success_count = int(stats.get("success_count") or 0)
+            oldest = datetime.fromisoformat(row["oldest_pending_at"]) if row["oldest_pending_at"] else None
+            report.append({"endpoint_id": webhook_endpoint_id(row["webhook_url"]),
+                "webhook_url": row["webhook_url"], "paused": bool(row["paused"]),
+                "pending_count": int(row["pending_count"] or 0),
+                "active_deliveries": int(row["active_count"] or 0),
+                "oldest_pending_age_seconds": (max(0, int((now-oldest).total_seconds())) if oldest else 0),
+                "attempt_count": attempt_count, "success_count": success_count,
+                "success_rate": success_count / attempt_count if attempt_count else None,
+                "average_latency_ms": round(float(stats["average_latency_ms"]), 2)
+                    if stats.get("average_latency_ms") is not None else None,
+                "reset_at": row["reset_at"], "updated_at": row["updated_at"],
+                "updated_by": row["updated_by"]})
+        return report
+
+    def set_webhook_endpoint_paused(self, endpoint_id: str, paused: bool, actor: str,
+                                    now: datetime | None = None) -> dict[str, Any] | None:
+        from .webhook_security import webhook_endpoint_id
+
+        now = now or datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            matches = [row[0] for row in db.execute("SELECT webhook_url FROM webhook_endpoint_controls").fetchall()
+                       if webhook_endpoint_id(row[0]) == endpoint_id]
+            if len(matches) != 1:
+                return None
+            url = matches[0]
+            db.execute("""UPDATE webhook_endpoint_controls SET paused=?,updated_at=?,updated_by=?
+                WHERE webhook_url=?""", (int(paused), now.isoformat(), actor, url))
+            active = int(db.execute("SELECT COUNT(*) FROM webhook_outbox WHERE webhook_url=? AND status='processing'",
+                                    (url,)).fetchone()[0])
+            action = "pause" if paused else "resume"
+            db.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (?,?,?,200)",
+                       (now.isoformat(), actor, f"webhook_endpoint_{action}:{endpoint_id}"))
+            return {"endpoint_id": endpoint_id, "paused": paused, "active_deliveries": active,
+                    "updated_at": now.isoformat(), "updated_by": actor}
+
+    def reset_webhook_endpoint_circuit(self, endpoint_id: str, actor: str,
+                                       now: datetime | None = None) -> dict[str, Any] | None:
+        from .webhook_security import webhook_endpoint_id
+
+        now = now or datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            matches = [row[0] for row in db.execute("SELECT webhook_url FROM webhook_endpoint_controls").fetchall()
+                       if webhook_endpoint_id(row[0]) == endpoint_id]
+            if len(matches) != 1:
+                return None
+            url = matches[0]
+            active = int(db.execute("SELECT COUNT(*) FROM webhook_outbox WHERE webhook_url=? AND status='processing'",
+                                    (url,)).fetchone()[0])
+            if active:
+                raise WebhookEndpointBusy(endpoint_id)
+            db.execute("UPDATE webhook_endpoint_controls SET reset_at=?,updated_at=?,updated_by=? WHERE webhook_url=?",
+                       (now.isoformat(), now.isoformat(), actor, url))
+            db.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (?,?,?,200)",
+                       (now.isoformat(), actor, f"webhook_circuit_reset:{endpoint_id}"))
+            return {"endpoint_id": endpoint_id, "reset_at": now.isoformat(), "updated_by": actor}
+
+    def webhook_endpoint_control(self, webhook_url: str) -> dict[str, Any]:
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT paused,reset_at FROM webhook_endpoint_controls WHERE webhook_url=?",
+                             (webhook_url,)).fetchone()
+            return {"paused": bool(row["paused"]), "reset_at": row["reset_at"]} if row else {
+                "paused": False, "reset_at": None}
 
     def webhook_events(self, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock, self._connect() as db:

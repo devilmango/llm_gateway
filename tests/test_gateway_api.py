@@ -25,7 +25,11 @@ from llm_gateway.observability import metrics_response
 from llm_gateway.providers import ProviderClient
 from llm_gateway.schemas import ChatRequest
 from llm_gateway.storage import create_usage_store
-from llm_gateway.webhook_security import UnsafeWebhookTarget, validate_webhook_url
+from llm_gateway.webhook_security import (
+    UnsafeWebhookTarget,
+    validate_webhook_url,
+    webhook_endpoint_id,
+)
 
 
 def config(database: str) -> dict:
@@ -345,11 +349,95 @@ async def test_webhook_transient_failures_dead_letter_and_redrive(tmp_path):
     event = store.webhook_events()[0]
     assert event["status"] == "dead_letter"
     assert event["attempts"] == 8
-    assert store.redrive_webhook("retry-alert") is True
+    assert store.redrive_webhook("retry-alert", actor="ops-user") is True
     assert store.webhook_events("pending")[0]["event_id"] == "retry-alert"
+    audit = store.audit_events(limit=1)[0]
+    assert audit["actor"] == "ops-user"
+    assert audit["action"] == "webhook_redrive:retry-alert"
+    assert audit["status_code"] == 202
     await client.aclose()
     if hasattr(store, "close"):
         store.close()
+
+
+def test_webhook_history_retention_removes_old_terminal_events_only(tmp_path):
+    store = create_usage_store(str(tmp_path / "webhook-retention.sqlite3"))
+    now = datetime.now(UTC)
+    old = (now - timedelta(days=45)).isoformat()
+    recent = (now - timedelta(days=5)).isoformat()
+    with store._connect() as db:
+        for event_id, status, created_at, delivered_at, updated_at in (
+            ("old-delivered", "delivered", old, old, old),
+            ("old-dead", "dead_letter", old, None, old),
+            ("recent-dead", "dead_letter", recent, None, recent),
+            ("old-pending", "pending", old, None, old),
+        ):
+            db.execute("""INSERT INTO webhook_outbox
+                (event_id,application,webhook_url,body,status,next_attempt_at,created_at,delivered_at,updated_at)
+                VALUES (?, 'app', 'https://hooks.test', '{}', ?, ?, ?, ?, ?)""",
+                (event_id, status, now.isoformat(), created_at, delivered_at, updated_at))
+            db.execute("""INSERT INTO webhook_delivery_attempts
+                (event_id,attempted_at,attempt,outcome) VALUES (?, ?, 1, 'failed')""",
+                (event_id, old,))
+    assert store.prune_webhook_history(30, now=now) == {"events": 2, "attempts": 2}
+    assert {event["event_id"] for event in store.webhook_events()} == {"recent-dead", "old-pending"}
+    with store._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM webhook_delivery_attempts").fetchone()[0] == 2
+    if hasattr(store, "close"):
+        store.close()
+
+
+def test_webhook_endpoint_report_pause_resume_and_active_circuit_reset_guard(tmp_path):
+    store = create_usage_store(str(tmp_path / "webhook-endpoint-controls.sqlite3"))
+    now = datetime.now(UTC)
+    url = "https://hooks.example.test/events"
+    store.enqueue_webhook({"event_id": "delivered", "application": "app"}, url)
+    store.update_webhook("delivered", attempts=1, status="delivered", delivered_at=now, duration_ms=40)
+    store.enqueue_webhook({"event_id": "pending", "application": "app"}, url)
+    endpoint_id = webhook_endpoint_id(url)
+
+    report = store.webhook_endpoint_report(now=now)[0]
+    assert report["endpoint_id"] == endpoint_id
+    assert report["pending_count"] == 1
+    assert report["success_rate"] == 1
+    assert report["average_latency_ms"] == 40
+    paused = store.set_webhook_endpoint_paused(endpoint_id, True, "operator", now=now)
+    assert paused["paused"] is True
+    assert store.due_webhooks() == []
+    resumed = store.set_webhook_endpoint_paused(endpoint_id, False, "operator", now=now)
+    assert resumed["paused"] is False
+    assert len(store.due_webhooks()) == 1
+    with pytest.raises(ValueError, match=endpoint_id):
+        store.reset_webhook_endpoint_circuit(endpoint_id, "operator", now=now)
+    store.defer_webhook("pending", now + timedelta(seconds=60))
+    reset = store.reset_webhook_endpoint_circuit(endpoint_id, "operator", now=now)
+    assert reset["endpoint_id"] == endpoint_id
+    audits = store.audit_events(limit=10)
+    assert any(item["action"] == f"webhook_endpoint_pause:{endpoint_id}" for item in audits)
+    assert any(item["action"] == f"webhook_endpoint_resume:{endpoint_id}" for item in audits)
+    assert any(item["action"] == f"webhook_circuit_reset:{endpoint_id}" for item in audits)
+    if hasattr(store, "close"):
+        store.close()
+
+
+def test_operations_prometheus_rules_are_valid_and_cover_required_alerts():
+    from pathlib import Path
+
+    import yaml
+
+    rules_path = Path(__file__).parents[1] / "deploy/prometheus/llm-gateway-operations.rules.yml"
+    rules = yaml.safe_load(rules_path.read_text())
+    alerts = {rule["alert"]: rule for group in rules["groups"] for rule in group["rules"] if "alert" in rule}
+    assert {"LLMGatewayAsyncJobQueueGrowing", "LLMGatewayAsyncJobLongRunning",
+            "LLMGatewayAsyncJobDeadLetter", "LLMGatewayWebhookDeliveryFailures",
+            "LLMGatewayWebhookDeliveryDelayed", "LLMGatewayWebhookDeliverySuccessRateLow"} <= alerts.keys()
+
+
+def test_webhook_retention_configuration_requires_positive_days(tmp_path):
+    cfg = config(str(tmp_path / "invalid-webhook-retention.sqlite3"))
+    cfg["server"]["webhook_retention_days"] = 0
+    with pytest.raises(ValueError, match="webhook_retention_days must be a positive integer"):
+        create_app(cfg)
 
 
 @pytest.mark.asyncio
@@ -1069,6 +1157,94 @@ async def test_admin_keys_support_scopes_rotation_and_revocation(tmp_path, monke
         assert (await client.get("/v1/admin/budgets", headers=headers)).status_code == 403
         old_headers = {"Authorization": "Bearer old-report-key"}
         assert (await client.get("/v1/admin/report", headers=old_headers)).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_webhook_redrive_requires_scope_and_records_operator_audit(tmp_path, monkeypatch):
+    monkeypatch.setenv("WEBHOOK_OPS_KEY", "webhook-ops-key")
+    monkeypatch.delenv("GATEWAY_API_KEY", raising=False)
+    database = str(tmp_path / "webhook-admin.sqlite3")
+    store = create_usage_store(database)
+    store.enqueue_webhook({"event_id": "event", "application": "app", "event": "test"},
+                          "https://hooks.test/events")
+    store.update_webhook("event", attempts=8, status="dead_letter", last_error="delivery failed")
+    if hasattr(store, "close"):
+        store.close()
+    cfg = config(database)
+    cfg["security"]["admin_api_keys"] = [
+        {"id": "webhook-operator", "api_key_env": "WEBHOOK_OPS_KEY", "scopes": ["webhooks"]},
+    ]
+    async with gateway_client(cfg, httpx.MockTransport(lambda request: success_response())) as client:
+        denied = await client.post("/v1/admin/webhooks/event/redrive",
+                                   headers={"Authorization": "Bearer unauthorized"})
+        assert denied.status_code == 401
+        response = await client.post("/v1/admin/webhooks/event/redrive",
+                                     headers={"Authorization": "Bearer webhook-ops-key"})
+        assert response.status_code == 200
+        assert response.json() == {"event_id": "event", "status": "pending"}
+    store = create_usage_store(database)
+    audit = store.audit_events(limit=10)
+    assert any(row["actor"] == "webhook-operator" and row["action"] == "webhook_redrive:event"
+               for row in audit)
+    if hasattr(store, "close"):
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_endpoint_controls_require_scope_and_are_audited(tmp_path, monkeypatch):
+    monkeypatch.setenv("WEBHOOK_OPS_KEY", "webhook-ops-key")
+    monkeypatch.setenv("WEBHOOK_PAUSE_KEY", "webhook-pause-key")
+    monkeypatch.delenv("GATEWAY_API_KEY", raising=False)
+    database = str(tmp_path / "webhook-controls-api.sqlite3")
+    store = create_usage_store(database)
+    url = "https://hooks.example.test/ops"
+    store.enqueue_webhook({"event_id": "future-event", "application": "app"}, url,
+                          now=datetime.now(UTC) + timedelta(hours=1))
+    if hasattr(store, "close"):
+        store.close()
+    cfg = config(database)
+    cfg["security"]["admin_api_keys"] = [
+        {"id": "webhook-operator", "api_key_env": "WEBHOOK_OPS_KEY", "scopes": ["webhooks"]},
+        {"id": "webhook-pauser", "api_key_env": "WEBHOOK_PAUSE_KEY", "scopes": ["webhooks:pause"]},
+    ]
+    async with gateway_client(cfg, httpx.MockTransport(lambda request: success_response())) as client:
+        denied = await client.get("/v1/admin/webhooks/report",
+                                  headers={"Authorization": "Bearer unauthorized"})
+        assert denied.status_code == 401
+        headers = {"Authorization": "Bearer webhook-ops-key"}
+        pause_headers = {"Authorization": "Bearer webhook-pause-key"}
+        report = await client.get("/v1/admin/webhooks/report", headers=headers)
+        endpoint = report.json()["endpoints"][0]
+        assert endpoint["endpoint_id"] == webhook_endpoint_id(url)
+        assert endpoint["host"] == "hooks.example.test"
+        assert (await client.get("/v1/admin/webhooks/report", headers=pause_headers)).status_code == 403
+        pause = await client.post(f"/v1/admin/webhooks/endpoints/{endpoint['endpoint_id']}/pause",
+                                  headers=pause_headers)
+        assert pause.status_code == 200
+        assert pause.json()["paused"] is True
+        resume = await client.post(f"/v1/admin/webhooks/endpoints/{endpoint['endpoint_id']}/resume",
+                                   headers=headers)
+        assert resume.status_code == 200
+        denied_reset = await client.post(
+            f"/v1/admin/webhooks/endpoints/{endpoint['endpoint_id']}/circuit/reset", headers=pause_headers)
+        assert denied_reset.status_code == 403
+        reset = await client.post(
+            f"/v1/admin/webhooks/endpoints/{endpoint['endpoint_id']}/circuit/reset", headers=headers)
+        assert reset.status_code == 200
+        metrics = await client.get("/metrics")
+        assert metrics.status_code == 200
+        assert "llm_gateway_webhook_oldest_pending_seconds" in metrics.text
+        assert "llm_gateway_webhook_delivery_success_rate_24h" in metrics.text
+    store = create_usage_store(database)
+    audit = store.audit_events(limit=20)
+    assert any(row["actor"] == "webhook-pauser" and row["action"] ==
+               f"webhook_endpoint_pause:{endpoint['endpoint_id']}" for row in audit)
+    assert any(row["actor"] == "webhook-operator" and row["action"] ==
+               f"webhook_endpoint_resume:{endpoint['endpoint_id']}" for row in audit)
+    assert any(row["actor"] == "webhook-operator" and row["action"] ==
+               f"webhook_circuit_reset:{endpoint['endpoint_id']}" for row in audit)
+    if hasattr(store, "close"):
+        store.close()
 
 
 @pytest.mark.asyncio

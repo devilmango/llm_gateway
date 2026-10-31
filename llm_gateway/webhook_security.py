@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import socket
 from urllib.parse import urlsplit
@@ -7,6 +8,11 @@ from urllib.parse import urlsplit
 
 class UnsafeWebhookTarget(ValueError):
     """A webhook target violates the gateway's outbound network policy."""
+
+
+def webhook_endpoint_id(url: str) -> str:
+    """Return a stable, non-reversible identifier suitable for logs and admin APIs."""
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
 
 
 def validate_webhook_url(url: str, *, resolve_dns: bool = True,

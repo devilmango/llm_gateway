@@ -17,6 +17,7 @@ from email.utils import parsedate_to_datetime
 from io import StringIO
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -33,6 +34,10 @@ from .evaluation import compare_saved_runs, retrieval_metrics
 from .idempotency import IdempotencyRegistry
 from .limiting import RateLimitExceeded
 from .observability import (
+    ASYNC_JOB_OLDEST_RUNNING_SECONDS,
+    ASYNC_JOBS_DEAD_LETTER,
+    ASYNC_JOBS_QUEUED,
+    ASYNC_JOBS_RUNNING,
     CACHE_HITS,
     COST,
     FALLBACKS,
@@ -52,7 +57,11 @@ from .observability import (
     TOOL_EXECUTIONS_PENDING,
     WEBHOOK_CIRCUIT_STATE,
     WEBHOOK_DELIVERIES,
+    WEBHOOK_DELIVERY_ATTEMPTS_24H,
     WEBHOOK_DELIVERY_LATENCY,
+    WEBHOOK_DELIVERY_SUCCESS_RATE,
+    WEBHOOK_ENDPOINT_PAUSED,
+    WEBHOOK_OLDEST_PENDING_SECONDS,
     gen_ai_provider_name,
     initialize_tracing,
     metrics_response,
@@ -84,6 +93,7 @@ from .storage import (
     AsyncJobIdempotencyConflict,
     AsyncJobQueueLimitExceeded,
     BudgetExceeded,
+    WebhookEndpointBusy,
     create_usage_store,
 )
 from .tool_governance import (
@@ -93,7 +103,11 @@ from .tool_governance import (
     requested_tool_names,
 )
 from .tool_validation import validate_tool_calls
-from .webhook_security import UnsafeWebhookTarget, validate_webhook_url
+from .webhook_security import (
+    UnsafeWebhookTarget,
+    validate_webhook_url,
+    webhook_endpoint_id,
+)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("llm_gateway")
@@ -107,11 +121,19 @@ async def _deliver_webhook_batch(app: FastAPI, batch_size: int = 20) -> None:
         return
     events = await asyncio.to_thread(store.due_webhooks, batch_size)
     for event in events:
-        endpoint = hashlib.sha256(event["webhook_url"].encode()).hexdigest()[:16]
+        endpoint = webhook_endpoint_id(event["webhook_url"])
         event_type = event.get("event_type") or "unspecified"
         circuits = getattr(app.state, "webhook_circuits", {})
         circuit = circuits.setdefault(endpoint, {"failures": 0, "open_until": None})
         now = datetime.now(UTC)
+        controls = await asyncio.to_thread(store.webhook_endpoint_control, event["webhook_url"])
+        reset_at = controls.get("reset_at")
+        if reset_at and reset_at != circuit.get("reset_at"):
+            circuit.update(failures=0, open_until=None, reset_at=reset_at)
+            WEBHOOK_CIRCUIT_STATE.labels(endpoint=endpoint).set(0)
+        if controls["paused"]:
+            await asyncio.to_thread(store.defer_webhook, event["event_id"], now + timedelta(seconds=60))
+            continue
         open_until = circuit.get("open_until")
         if open_until and open_until > now:
             WEBHOOK_CIRCUIT_STATE.labels(endpoint=endpoint).set(1)
@@ -160,7 +182,7 @@ async def _deliver_webhook_batch(app: FastAPI, batch_size: int = 20) -> None:
                     outcome="delivered").observe(latency)
                 await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
                     status="delivered", delivered_at=datetime.now(UTC), last_error=None,
-                    http_status=response.status_code)
+                    http_status=response.status_code, duration_ms=round(latency * 1000))
             elif response.status_code < 500 and response.status_code != 429:
                 circuit["failures"] += 1
                 _update_webhook_circuit(app, endpoint, circuit)
@@ -169,7 +191,7 @@ async def _deliver_webhook_batch(app: FastAPI, batch_size: int = 20) -> None:
                     outcome="dead_letter").observe(latency)
                 await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
                     status="dead_letter", last_error=f"HTTP{response.status_code}",
-                    http_status=response.status_code)
+                    http_status=response.status_code, duration_ms=round(latency * 1000))
             else:
                 circuit["failures"] += 1
                 _update_webhook_circuit(app, endpoint, circuit)
@@ -181,13 +203,14 @@ async def _deliver_webhook_batch(app: FastAPI, batch_size: int = 20) -> None:
                     outcome=outcome).observe(latency)
                 await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
                     status=status, next_attempt_at=datetime.now(UTC) + timedelta(seconds=delay),
-                    last_error=f"HTTP{response.status_code}", http_status=response.status_code)
+                    last_error=f"HTTP{response.status_code}", http_status=response.status_code,
+                    duration_ms=round(latency * 1000))
         except UnsafeWebhookTarget as exc:
             latency = time.perf_counter() - started
             WEBHOOK_DELIVERIES.labels(endpoint=endpoint, event_type=event_type, outcome="blocked").inc()
             WEBHOOK_DELIVERY_LATENCY.labels(endpoint=endpoint, event_type=event_type, outcome="blocked").observe(latency)
             await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
-                status="dead_letter", last_error=str(exc))
+                status="dead_letter", last_error=str(exc), duration_ms=round(latency * 1000))
         except (httpx.HTTPError, ValueError, OSError) as exc:
             latency = time.perf_counter() - started
             circuit["failures"] += 1
@@ -200,7 +223,7 @@ async def _deliver_webhook_batch(app: FastAPI, batch_size: int = 20) -> None:
                 outcome=outcome).observe(latency)
             await asyncio.to_thread(store.update_webhook, event["event_id"], attempts=attempts,
                 status=status, next_attempt_at=datetime.now(UTC) + timedelta(seconds=delay),
-                last_error=type(exc).__name__)
+                last_error=type(exc).__name__, duration_ms=round(latency * 1000))
 
 
 def _update_webhook_circuit(app: FastAPI, endpoint: str, circuit: dict[str, Any]) -> None:
@@ -231,8 +254,17 @@ def _webhook_retry_delay(attempts: int, retry_after: str | None, now: datetime) 
 
 
 async def _webhook_delivery_loop(app: FastAPI) -> None:
+    last_prune = 0.0
     while True:
         try:
+            now = time.monotonic()
+            if now - last_prune >= 24 * 60 * 60:
+                retention_days = int(app.state.config.get("server", {}).get("webhook_retention_days", 90))
+                pruned = await asyncio.to_thread(app.state.store.prune_webhook_history, retention_days)
+                if pruned["events"] or pruned["attempts"]:
+                    logger.info("webhook_history_retention events=%s attempts=%s",
+                                pruned["events"], pruned["attempts"])
+                last_prune = now
             await _deliver_webhook_batch(app)
         except asyncio.CancelledError:
             raise
@@ -778,6 +810,12 @@ def create_app(config: dict[str, Any] | None = None,
         except SecretUnavailable as exc:
             raise HTTPException(status_code=503, detail="Configured credential is unavailable") from exc
 
+    def required_scope_aliases(scope: str) -> set[str]:
+        aliases = {scope, f"llm-gateway:{scope}", "admin:*"}
+        if scope.startswith("webhooks:"):
+            aliases.update({"webhooks", "llm-gateway:webhooks"})
+        return aliases
+
     async def validate_admin(authorization: str | None, scope: str = "") -> str:
         provided = authorization.removeprefix("Bearer ") if authorization else ""
         oidc = cfg.get("security", {}).get("oidc", {})
@@ -800,7 +838,7 @@ def create_app(config: dict[str, Any] | None = None,
             if isinstance(role_claim, str):
                 role_claim = [role_claim]
             scopes = set(str(claims.get("scope", "")).split()) | set(role_claim)
-            if scope and not ({scope, f"llm-gateway:{scope}", "admin:*"} & scopes):
+            if scope and not (required_scope_aliases(scope) & scopes):
                 raise HTTPException(status_code=403, detail="OIDC principal lacks required scope")
             return str(claims.get("sub", "oidc-principal"))
         key_records = cfg.get("security", {}).get("admin_api_keys", [])
@@ -810,7 +848,7 @@ def create_app(config: dict[str, Any] | None = None,
                     if record.get("enabled", True) else ""
                 if expected and hmac.compare_digest(provided, expected):
                     scopes = set(record.get("scopes", []))
-                    if "*" not in scopes and scope not in scopes:
+                    if "*" not in scopes and not (required_scope_aliases(scope) & scopes):
                         raise HTTPException(status_code=403, detail="Admin key lacks required scope")
                     return str(record.get("id", "scoped-admin-key"))
             raise HTTPException(status_code=401, detail="Invalid gateway credentials")
@@ -887,6 +925,26 @@ def create_app(config: dict[str, Any] | None = None,
                                           timeout_seconds, None, 1)
         TOOL_EXECUTIONS_PENDING.set(pending["pending_count"])
         TOOL_EXECUTIONS_OVERDUE.set(pending["overdue_count"])
+        job_stats = await asyncio.to_thread(request.app.state.store.async_job_stats)
+        ASYNC_JOBS_QUEUED.set(job_stats["queue_depth"])
+        ASYNC_JOBS_RUNNING.set(job_stats["running"])
+        ASYNC_JOBS_DEAD_LETTER.set(job_stats["dead_letter"])
+        ASYNC_JOB_OLDEST_RUNNING_SECONDS.set(job_stats["oldest_running_seconds"])
+        webhook_report = await asyncio.to_thread(request.app.state.store.webhook_endpoint_report, 24)
+        for endpoint in webhook_report:
+            endpoint_id = endpoint["endpoint_id"]
+            circuit = request.app.state.webhook_circuits.setdefault(
+                endpoint_id, {"failures": 0, "open_until": None})
+            reset_at = endpoint.get("reset_at")
+            if reset_at and reset_at != circuit.get("reset_at"):
+                circuit.update(failures=0, open_until=None, reset_at=reset_at)
+            is_open = bool(circuit.get("open_until") and circuit["open_until"] > datetime.now(UTC))
+            WEBHOOK_OLDEST_PENDING_SECONDS.labels(endpoint=endpoint_id).set(
+                endpoint["oldest_pending_age_seconds"])
+            WEBHOOK_ENDPOINT_PAUSED.labels(endpoint=endpoint_id).set(int(endpoint["paused"]))
+            WEBHOOK_DELIVERY_ATTEMPTS_24H.labels(endpoint=endpoint_id).set(endpoint["attempt_count"])
+            WEBHOOK_DELIVERY_SUCCESS_RATE.labels(endpoint=endpoint_id).set(endpoint["success_rate"] or 0.0)
+            WEBHOOK_CIRCUIT_STATE.labels(endpoint=endpoint_id).set(int(is_open))
         body, content_type = metrics_response()
         return Response(content=body, media_type=content_type)
 
@@ -2487,9 +2545,53 @@ def create_app(config: dict[str, Any] | None = None,
         events = await asyncio.to_thread(request.app.state.store.webhook_events, status, limit)
         return {"events": events}
 
+    @app.get("/v1/admin/webhooks/report", dependencies=[Depends(admin_dependency("webhooks"))])
+    async def webhook_delivery_report(request: Request,
+                                      window_hours: int = Query(default=24, ge=1, le=720)) -> dict[str, Any]:
+        endpoints = await asyncio.to_thread(request.app.state.store.webhook_endpoint_report, window_hours)
+        for endpoint in endpoints:
+            endpoint["host"] = urlsplit(endpoint.pop("webhook_url")).hostname
+        return {"window_hours": window_hours, "endpoints": endpoints}
+
+    @app.post("/v1/admin/webhooks/endpoints/{endpoint_id}/pause",
+              dependencies=[Depends(admin_dependency("webhooks:pause"))])
+    async def pause_webhook_endpoint(endpoint_id: str, request: Request) -> dict[str, Any]:
+        actor = request.state.admin_actor
+        result = await asyncio.to_thread(request.app.state.store.set_webhook_endpoint_paused,
+                                          endpoint_id, True, actor)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Webhook endpoint was not found")
+        result["in_flight_deliveries_allowed_to_finish"] = result.pop("active_deliveries")
+        return result
+
+    @app.post("/v1/admin/webhooks/endpoints/{endpoint_id}/resume",
+              dependencies=[Depends(admin_dependency("webhooks:pause"))])
+    async def resume_webhook_endpoint(endpoint_id: str, request: Request) -> dict[str, Any]:
+        result = await asyncio.to_thread(request.app.state.store.set_webhook_endpoint_paused,
+                                          endpoint_id, False, request.state.admin_actor)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Webhook endpoint was not found")
+        return result
+
+    @app.post("/v1/admin/webhooks/endpoints/{endpoint_id}/circuit/reset",
+              dependencies=[Depends(admin_dependency("webhooks:circuit_reset"))])
+    async def reset_webhook_endpoint_circuit(endpoint_id: str, request: Request) -> dict[str, Any]:
+        try:
+            result = await asyncio.to_thread(request.app.state.store.reset_webhook_endpoint_circuit,
+                                             endpoint_id, request.state.admin_actor)
+        except WebhookEndpointBusy as exc:
+            raise HTTPException(status_code=409,
+                detail="Cannot reset the endpoint circuit while a delivery is active") from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="Webhook endpoint was not found")
+        WEBHOOK_CIRCUIT_STATE.labels(endpoint=endpoint_id).set(0)
+        return result
+
     @app.post("/v1/admin/webhooks/{event_id}/redrive", dependencies=[Depends(admin_dependency("webhooks"))])
     async def redrive_webhook(event_id: str, request: Request) -> dict[str, Any]:
-        redriven = await asyncio.to_thread(request.app.state.store.redrive_webhook, event_id)
+        actor = getattr(request.state, "admin_actor", None)
+        redriven = await asyncio.to_thread(request.app.state.store.redrive_webhook,
+                                           event_id, None, actor)
         if not redriven:
             raise HTTPException(status_code=404, detail="Dead-letter webhook event not found")
         return {"event_id": event_id, "status": "pending"}
