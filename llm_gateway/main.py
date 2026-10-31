@@ -254,17 +254,8 @@ def _webhook_retry_delay(attempts: int, retry_after: str | None, now: datetime) 
 
 
 async def _webhook_delivery_loop(app: FastAPI) -> None:
-    last_prune = 0.0
     while True:
         try:
-            now = time.monotonic()
-            if now - last_prune >= 24 * 60 * 60:
-                retention_days = int(app.state.config.get("server", {}).get("webhook_retention_days", 90))
-                pruned = await asyncio.to_thread(app.state.store.prune_webhook_history, retention_days)
-                if pruned["events"] or pruned["attempts"]:
-                    logger.info("webhook_history_retention events=%s attempts=%s",
-                                pruned["events"], pruned["attempts"])
-                last_prune = now
             await _deliver_webhook_batch(app)
         except asyncio.CancelledError:
             raise
@@ -274,39 +265,62 @@ async def _webhook_delivery_loop(app: FastAPI) -> None:
 
 
 async def _tenant_retention_loop(app: FastAPI, tenants: dict[str, Any]) -> None:
+    last_run = 0.0
     while True:
-        for tenant_id, tenant in tenants.items():
-            retention_days = tenant.get("data_policy", {}).get("usage_retention_days")
-            if retention_days is not None:
-                try:
-                    deleted = await asyncio.to_thread(app.state.store.prune_tenant_requests,
-                                                      tenant_id, int(retention_days))
-                    if deleted:
-                        logger.info("tenant_usage_retention tenant=%s deleted=%s", redact(tenant_id), deleted)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("tenant_usage_retention_failed tenant=%s", redact(tenant_id))
-            job_retention = tenant.get("job_policy", {}).get("retention_days")
-            if job_retention is not None:
-                try:
-                    keys = await asyncio.to_thread(app.state.store.expired_tenant_async_job_artifacts,
-                                                   tenant_id, int(job_retention))
-                    for key in keys:
-                        try:
-                            await asyncio.to_thread(app.state.artifacts.delete, key)
-                        except FileNotFoundError:
-                            pass
-                    pruned = await asyncio.to_thread(app.state.store.prune_tenant_async_jobs,
-                                                     tenant_id, int(job_retention))
-                    if pruned:
-                        logger.info("tenant_job_retention tenant=%s deleted=%s artifacts=%s",
-                                    redact(tenant_id), pruned, len(keys))
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("tenant_job_retention_failed tenant=%s", redact(tenant_id))
-        await asyncio.sleep(24 * 60 * 60)
+        try:
+            now = time.monotonic()
+            server = app.state.config.get("server", {})
+            lease_seconds = int(server.get("maintenance_lease_seconds", 3600))
+            if now - last_run >= 24 * 60 * 60:
+                leader = await asyncio.to_thread(app.state.store.acquire_maintenance_lease,
+                    "retention", app.state.maintenance_owner, lease_seconds)
+                if leader:
+                    last_run = now
+                    for tenant_id, tenant in tenants.items():
+                        retention_days = tenant.get("data_policy", {}).get("usage_retention_days")
+                        if retention_days is not None:
+                            try:
+                                deleted = await asyncio.to_thread(app.state.store.prune_tenant_requests,
+                                                                  tenant_id, int(retention_days))
+                                if deleted:
+                                    logger.info("tenant_usage_retention tenant=%s deleted=%s", redact(tenant_id), deleted)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                logger.exception("tenant_usage_retention_failed tenant=%s", redact(tenant_id))
+                        job_retention = tenant.get("job_policy", {}).get("retention_days")
+                        if job_retention is not None:
+                            try:
+                                keys = await asyncio.to_thread(app.state.store.expired_tenant_async_job_artifacts,
+                                                               tenant_id, int(job_retention))
+                                for key in keys:
+                                    try:
+                                        await asyncio.to_thread(app.state.artifacts.delete, key)
+                                    except FileNotFoundError:
+                                        pass
+                                pruned = await asyncio.to_thread(app.state.store.prune_tenant_async_jobs,
+                                                                 tenant_id, int(job_retention))
+                                if pruned:
+                                    logger.info("tenant_job_retention tenant=%s deleted=%s artifacts=%s",
+                                                redact(tenant_id), pruned, len(keys))
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                logger.exception("tenant_job_retention_failed tenant=%s", redact(tenant_id))
+                    webhook_days = int(server.get("webhook_retention_days", 90))
+                    pruned = await asyncio.to_thread(app.state.store.prune_webhook_history, webhook_days)
+                    if pruned["events"] or pruned["attempts"]:
+                        logger.info("webhook_history_retention events=%s attempts=%s", pruned["events"], pruned["attempts"])
+                    audit_days = int(server.get("admin_audit_retention_days", 3650))
+                    audit_pruned = await asyncio.to_thread(app.state.store.prune_admin_audit_events, audit_days)
+                    if audit_pruned["deleted"]:
+                        logger.info("admin_audit_retention deleted=%s anchor_id=%s",
+                                    audit_pruned["deleted"], audit_pruned["anchor_id"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("retention_maintenance_failed")
+        await asyncio.sleep(60)
 
 
 def _async_job_response(job: dict[str, Any]) -> dict[str, Any]:
@@ -604,22 +618,28 @@ async def _run_async_job(app: FastAPI, job_id: str) -> None:
 
 
 async def _async_job_dispatch_loop(app: FastAPI) -> None:
+    last_recovery = 0.0
     while True:
         try:
             capacity = int(app.state.config.get("server", {}).get("async_job_concurrency", 4))
             server = app.state.config.get("server", {})
-            expired_ids = await asyncio.to_thread(app.state.store.expired_async_job_leases)
-            expired_jobs = {job_id: await asyncio.to_thread(app.state.store.async_job,
-                job_id, include_payload=True) for job_id in expired_ids}
-            await asyncio.to_thread(app.state.store.recover_stalled_async_jobs,
-                max_attempts=int(server.get("async_job_max_attempts", 5)),
-                base_delay_seconds=float(server.get("async_job_retry_base_delay_seconds", 1)),
-                max_delay_seconds=float(server.get("async_job_retry_max_delay_seconds", 300)))
-            for job_id, before in expired_jobs.items():
-                recovered = await asyncio.to_thread(app.state.store.async_job, job_id)
-                if before and recovered and recovered["status"] in {"cancelled", "dead_letter"}:
-                    recovered["payload"] = before.get("payload")
-                    await _emit_async_job_event(app, recovered, recovered["status"])
+            if time.monotonic() - last_recovery >= 15:
+                acquired = await asyncio.to_thread(app.state.store.acquire_maintenance_lease,
+                    "async-job-recovery", app.state.maintenance_owner, 30)
+                last_recovery = time.monotonic()
+                if acquired:
+                    expired_ids = await asyncio.to_thread(app.state.store.expired_async_job_leases)
+                    expired_jobs = {job_id: await asyncio.to_thread(app.state.store.async_job,
+                        job_id, include_payload=True) for job_id in expired_ids}
+                    await asyncio.to_thread(app.state.store.recover_stalled_async_jobs,
+                        max_attempts=int(server.get("async_job_max_attempts", 5)),
+                        base_delay_seconds=float(server.get("async_job_retry_base_delay_seconds", 1)),
+                        max_delay_seconds=float(server.get("async_job_retry_max_delay_seconds", 300)))
+                    for job_id, before in expired_jobs.items():
+                        recovered = await asyncio.to_thread(app.state.store.async_job, job_id)
+                        if before and recovered and recovered["status"] in {"cancelled", "dead_letter"}:
+                            recovered["payload"] = before.get("payload")
+                            await _emit_async_job_event(app, recovered, recovered["status"])
             available = max(capacity - len(app.state.job_tasks), 0)
             if available:
                 tenants = app.state.config.get("tenants",
@@ -702,6 +722,7 @@ def create_app(config: dict[str, Any] | None = None,
         app.state.job_dispatch_task = None
         app.state.job_tasks = set()
         app.state.config = cfg
+        app.state.maintenance_owner = f"{os.getpid()}:{uuid.uuid4()}"
         app.state.shadow_tasks = set()
         app.state.webhook_circuits = {}
         redis_client = shared_redis
@@ -2284,6 +2305,16 @@ def create_app(config: dict[str, Any] | None = None,
     async def audit_events(request: Request, limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
         events = await asyncio.to_thread(request.app.state.store.audit_events, limit)
         return {"events": events}
+
+    @app.get("/v1/admin/audit/export", dependencies=[Depends(admin_dependency("audit"))])
+    async def export_admin_audit(request: Request) -> Response:
+        export = await asyncio.to_thread(request.app.state.store.export_audit_events)
+        if not export["chain"]["verified"]:
+            raise HTTPException(status_code=409, detail={"message": "Admin audit chain integrity check failed",
+                "first_invalid_id": export["chain"]["first_invalid_id"]})
+        body = json.dumps(export, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return Response(body, media_type="application/json",
+            headers={"Content-Disposition": 'attachment; filename="llm-gateway-admin-audit.json"'})
 
     @app.get("/v1/admin/tool-audit", dependencies=[Depends(admin_dependency("audit"))])
     async def tool_audit_events(request: Request, tenant_id: str | None = Query(default=None),

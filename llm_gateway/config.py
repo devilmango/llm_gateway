@@ -37,6 +37,13 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
     if (not isinstance(webhook_retention_days, int) or isinstance(webhook_retention_days, bool)
             or webhook_retention_days < 1):
         raise ValueError("server.webhook_retention_days must be a positive integer")
+    audit_retention_days = server.get("admin_audit_retention_days", 3650)
+    if not isinstance(audit_retention_days, int) or isinstance(audit_retention_days, bool) or audit_retention_days < 1:
+        raise ValueError("server.admin_audit_retention_days must be a positive integer")
+    maintenance_lease_seconds = server.get("maintenance_lease_seconds", 3600)
+    if (not isinstance(maintenance_lease_seconds, int) or isinstance(maintenance_lease_seconds, bool)
+            or maintenance_lease_seconds < 30):
+        raise ValueError("server.maintenance_lease_seconds must be an integer of at least 30")
     dns_timeout = server.get("webhook_dns_timeout_seconds", 2.0)
     if not isinstance(dns_timeout, (int, float)) or isinstance(dns_timeout, bool) or dns_timeout <= 0:
         raise ValueError("server.webhook_dns_timeout_seconds must be a positive number")

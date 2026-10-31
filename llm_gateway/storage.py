@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import sqlite3
 import threading
@@ -29,12 +30,23 @@ class WebhookEndpointBusy(ValueError):
     """An endpoint circuit cannot be reset while a delivery is in flight."""
 
 
+AUDIT_GENESIS_HASH = "0" * 64
+
+
+def audit_entry_hash(event_id: int, occurred_at: str, actor: str, action: str,
+                     status_code: int, previous_hash: str) -> str:
+    payload = json.dumps({"id": event_id, "occurred_at": occurred_at, "actor": actor,
+        "action": action, "status_code": int(status_code), "previous_hash": previous_hash},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 class UsageStore:
     """Small durable usage ledger. Stores metadata only, never prompt/response text."""
 
     def __init__(self, database: str) -> None:
         self.database = database
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         if database != ":memory:":
             Path(database).expanduser().parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
@@ -108,8 +120,18 @@ class UsageStore:
                 SELECT DISTINCT webhook_url FROM webhook_outbox""")
             db.execute("""CREATE TABLE IF NOT EXISTS admin_audit_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL,
-                actor TEXT NOT NULL, action TEXT NOT NULL, status_code INTEGER NOT NULL
+                actor TEXT NOT NULL, action TEXT NOT NULL, status_code INTEGER NOT NULL,
+                previous_hash TEXT, entry_hash TEXT
             )""")
+            audit_columns = {row[1] for row in db.execute("PRAGMA table_info(admin_audit_events)")}
+            for column in ("previous_hash", "entry_hash"):
+                if column not in audit_columns:
+                    db.execute(f"ALTER TABLE admin_audit_events ADD COLUMN {column} TEXT")
+            db.execute("""CREATE TABLE IF NOT EXISTS admin_audit_chain_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), anchor_id INTEGER NOT NULL,
+                anchor_hash TEXT NOT NULL
+            )""")
+            db.execute("INSERT OR IGNORE INTO admin_audit_chain_state VALUES (1, 0, ?)", (AUDIT_GENESIS_HASH,))
             db.execute("CREATE INDEX IF NOT EXISTS idx_admin_audit_time ON admin_audit_events(occurred_at)")
             db.execute("""CREATE TABLE IF NOT EXISTS tool_call_audits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL,
@@ -195,12 +217,62 @@ class UsageStore:
             db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_async_jobs_idempotency
                 ON async_jobs(idempotency_scope, job_type, idempotency_key_hash)
                 WHERE idempotency_key_hash IS NOT NULL""")
+            db.execute("""CREATE TABLE IF NOT EXISTS maintenance_leases (
+                lease_name TEXT PRIMARY KEY, owner_id TEXT NOT NULL, lease_until TEXT NOT NULL
+            )""")
+            self._backfill_audit_chain(db)
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.database, timeout=10)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA journal_mode=WAL")
         return db
+
+    @staticmethod
+    def _backfill_audit_chain(db: sqlite3.Connection) -> None:
+        state = db.execute("SELECT anchor_id,anchor_hash FROM admin_audit_chain_state WHERE singleton=1").fetchone()
+        previous = state["anchor_hash"]
+        rows = db.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
+                          "FROM admin_audit_events WHERE id>? ORDER BY id", (state["anchor_id"],)).fetchall()
+        for row in rows:
+            expected = audit_entry_hash(row["id"], row["occurred_at"], row["actor"], row["action"],
+                                        row["status_code"], previous)
+            if row["entry_hash"] is None:
+                db.execute("UPDATE admin_audit_events SET previous_hash=?,entry_hash=? WHERE id=?",
+                           (previous, expected, row["id"]))
+            elif row["previous_hash"] != previous or not hmac.compare_digest(row["entry_hash"], expected):
+                # Preserve the mismatch so the verification endpoint reports legacy tampering.
+                previous = row["entry_hash"]
+                continue
+            previous = expected
+
+    @staticmethod
+    def _append_audit(db: sqlite3.Connection, actor: str, action: str, status_code: int,
+                      occurred_at: str) -> None:
+        if not db.in_transaction:
+            db.execute("BEGIN IMMEDIATE")
+        state = db.execute("SELECT anchor_hash FROM admin_audit_chain_state WHERE singleton=1").fetchone()
+        tail = db.execute("SELECT id,entry_hash FROM admin_audit_events ORDER BY id DESC LIMIT 1").fetchone()
+        previous = tail["entry_hash"] if tail else state["anchor_hash"]
+        cursor = db.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code,previous_hash) "
+                            "VALUES (?,?,?,?,?)", (occurred_at, actor, action, status_code, previous))
+        entry_hash = audit_entry_hash(cursor.lastrowid, occurred_at, actor, action, status_code, previous)
+        db.execute("UPDATE admin_audit_events SET entry_hash=? WHERE id=?", (entry_hash, cursor.lastrowid))
+
+    def acquire_maintenance_lease(self, lease_name: str, owner_id: str, lease_seconds: int,
+                                  now: datetime | None = None) -> bool:
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        now = now or datetime.now(UTC)
+        until = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute("""INSERT INTO maintenance_leases (lease_name,owner_id,lease_until)
+                VALUES (?,?,?) ON CONFLICT(lease_name) DO UPDATE SET
+                owner_id=excluded.owner_id,lease_until=excluded.lease_until
+                WHERE maintenance_leases.lease_until<=? OR maintenance_leases.owner_id=?""",
+                (lease_name, owner_id, until, now.isoformat(), owner_id))
+            return cursor.rowcount == 1
 
     def reserve_budget(self, request_id: str, application: str, amount_usd: float, monthly_limit_usd: float,
                        now: datetime | None = None) -> None:
@@ -468,8 +540,7 @@ class UsageStore:
                 updated_at=? WHERE job_id=? AND status='dead_letter' AND payload_json IS NOT NULL""",
                 (now, job_id))
             if cursor.rowcount:
-                db.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (?,?,?,?)",
-                    (now, actor, f"async_job_requeued:{job_id}", 200))
+                self._append_audit(db, actor, f"async_job_requeued:{job_id}", 200, now)
             return bool(cursor.rowcount)
 
     def async_job_cancel_requested(self, job_id: str) -> bool:
@@ -783,8 +854,7 @@ class UsageStore:
                 WHERE event_id=? AND status='dead_letter'""", (now.isoformat(), event_id))
             redriven = bool(cursor.rowcount)
             if redriven and actor:
-                db.execute("INSERT INTO admin_audit_events (occurred_at, actor, action, status_code) VALUES (?,?,?,?)",
-                           (now.isoformat(), actor, f"webhook_redrive:{event_id}", 202))
+                self._append_audit(db, actor, f"webhook_redrive:{event_id}", 202, now.isoformat())
             return redriven
 
     def prune_webhook_history(self, retention_days: int, now: datetime | None = None) -> dict[str, int]:
@@ -852,8 +922,7 @@ class UsageStore:
             active = int(db.execute("SELECT COUNT(*) FROM webhook_outbox WHERE webhook_url=? AND status='processing'",
                                     (url,)).fetchone()[0])
             action = "pause" if paused else "resume"
-            db.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (?,?,?,200)",
-                       (now.isoformat(), actor, f"webhook_endpoint_{action}:{endpoint_id}"))
+            self._append_audit(db, actor, f"webhook_endpoint_{action}:{endpoint_id}", 200, now.isoformat())
             return {"endpoint_id": endpoint_id, "paused": paused, "active_deliveries": active,
                     "updated_at": now.isoformat(), "updated_by": actor}
 
@@ -875,8 +944,7 @@ class UsageStore:
                 raise WebhookEndpointBusy(endpoint_id)
             db.execute("UPDATE webhook_endpoint_controls SET reset_at=?,updated_at=?,updated_by=? WHERE webhook_url=?",
                        (now.isoformat(), now.isoformat(), actor, url))
-            db.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (?,?,?,200)",
-                       (now.isoformat(), actor, f"webhook_circuit_reset:{endpoint_id}"))
+            self._append_audit(db, actor, f"webhook_circuit_reset:{endpoint_id}", 200, now.isoformat())
             return {"endpoint_id": endpoint_id, "reset_at": now.isoformat(), "updated_by": actor}
 
     def webhook_endpoint_control(self, webhook_url: str) -> dict[str, Any]:
@@ -909,13 +977,68 @@ class UsageStore:
                      now: datetime | None = None) -> None:
         now = now or datetime.now(UTC)
         with self._lock, self._connect() as db:
-            db.execute("INSERT INTO admin_audit_events (occurred_at, actor, action, status_code) VALUES (?,?,?,?)",
-                       (now.isoformat(), actor, action, status_code))
+            self._append_audit(db, actor, action, status_code, now.isoformat())
+
+    @staticmethod
+    def _audit_chain_status(db: sqlite3.Connection) -> dict[str, Any]:
+        state = db.execute("SELECT anchor_id,anchor_hash FROM admin_audit_chain_state WHERE singleton=1").fetchone()
+        rows = db.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
+                          "FROM admin_audit_events WHERE id>? ORDER BY id", (state["anchor_id"],)).fetchall()
+        previous = state["anchor_hash"]
+        invalid_id = None
+        for row in rows:
+            expected = audit_entry_hash(row["id"], row["occurred_at"], row["actor"], row["action"],
+                                        row["status_code"], previous)
+            if row["previous_hash"] != previous or not row["entry_hash"] or not hmac.compare_digest(row["entry_hash"], expected):
+                invalid_id = int(row["id"])
+                break
+            previous = row["entry_hash"]
+        return {"verified": invalid_id is None, "record_count": len(rows),
+                "anchor_id": int(state["anchor_id"]), "anchor_hash": state["anchor_hash"],
+                "head_id": int(rows[-1]["id"]) if rows else int(state["anchor_id"]),
+                "head_hash": previous, "first_invalid_id": invalid_id}
+
+    def audit_chain_status(self) -> dict[str, Any]:
+        with self._lock, self._connect() as db:
+            return self._audit_chain_status(db)
+
+    def export_audit_events(self) -> dict[str, Any]:
+        with self._lock, self._connect() as db:
+            status = self._audit_chain_status(db)
+            events = [dict(row) for row in db.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
+                "FROM admin_audit_events ORDER BY id DESC")]
+        canonical = json.dumps(events, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        return {"format": "llm-gateway-admin-audit-v1", "exported_at": datetime.now(UTC).isoformat(),
+                "chain": status, "export_sha256": hashlib.sha256(canonical).hexdigest(), "events": events}
+
+    def prune_admin_audit_events(self, retention_days: int, now: datetime | None = None) -> dict[str, Any]:
+        if not isinstance(retention_days, int) or isinstance(retention_days, bool) or retention_days < 1:
+            raise ValueError("retention_days must be a positive integer")
+        now = now or datetime.now(UTC)
+        cutoff = (now - timedelta(days=retention_days)).isoformat()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            status = self._audit_chain_status(db)
+            if not status["verified"]:
+                raise ValueError(f"admin audit chain integrity check failed at event {status['first_invalid_id']}")
+            rows = db.execute("SELECT id,occurred_at,entry_hash FROM admin_audit_events ORDER BY id").fetchall()
+            expired = []
+            for row in rows:
+                if row["occurred_at"] >= cutoff:
+                    break
+                expired.append(row)
+            if not expired:
+                return {"deleted": 0, "anchor_id": status["anchor_id"], "anchor_hash": status["anchor_hash"]}
+            anchor = expired[-1]
+            db.execute("DELETE FROM admin_audit_events WHERE id<=?", (anchor["id"],))
+            db.execute("UPDATE admin_audit_chain_state SET anchor_id=?,anchor_hash=? WHERE singleton=1",
+                       (anchor["id"], anchor["entry_hash"]))
+            return {"deleted": len(expired), "anchor_id": int(anchor["id"]), "anchor_hash": anchor["entry_hash"]}
 
     def audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock, self._connect() as db:
             return [dict(row) for row in db.execute(
-                "SELECT occurred_at, actor, action, status_code FROM admin_audit_events ORDER BY id DESC LIMIT ?",
+                "SELECT id, occurred_at, actor, action, status_code, previous_hash, entry_hash FROM admin_audit_events ORDER BY id DESC LIMIT ?",
                 (limit,)).fetchall()]
 
     def record_tool_call_audits(self, request_id: str, tenant_id: str | None, application: str,

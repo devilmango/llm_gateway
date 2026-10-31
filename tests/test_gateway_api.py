@@ -1115,6 +1115,10 @@ async def test_oidc_scopes_audit_log_and_dashboard(tmp_path, monkeypatch):
         audit = await client.get("/v1/admin/audit", headers={"Authorization": "Bearer audit-token"})
         assert audit.status_code == 200
         assert audit.json()["events"][0]["actor"] == "finance-user"
+        exported = await client.get("/v1/admin/audit/export", headers={"Authorization": "Bearer audit-token"})
+        assert exported.status_code == 200
+        assert exported.json()["chain"]["verified"] is True
+        assert len(exported.json()["export_sha256"]) == 64
 
 
 @pytest.mark.asyncio
@@ -2977,3 +2981,39 @@ async def test_shadow_candidate_obeys_tenant_provider_policy(tmp_path, monkeypat
                 "application": "support-router", "messages": [{"role": "user", "content": "hello"}]})
         assert response.status_code == 200
         assert hosts == ["primary.test"]
+
+
+def test_admin_audit_hash_chain_export_retention_and_tamper_detection(tmp_path):
+    store = create_usage_store(str(tmp_path / "audit-integrity.sqlite3"))
+    old = datetime(2025, 1, 1, tzinfo=UTC)
+    fresh = datetime(2026, 10, 31, tzinfo=UTC)
+    store.record_audit("operator", "settings_updated", 200, old)
+    store.record_audit("operator", "job_requeued", 202, fresh)
+
+    export = store.export_audit_events()
+    assert export["chain"]["verified"] is True
+    assert len(export["events"]) == 2
+    assert len(export["export_sha256"]) == 64
+
+    pruned = store.prune_admin_audit_events(365, now=fresh)
+    assert pruned["deleted"] == 1
+    assert store.audit_chain_status()["verified"] is True
+    assert store.audit_chain_status()["anchor_id"] == 1
+    assert len(store.export_audit_events()["events"]) == 1
+
+    with sqlite3.connect(store.database) as db:
+        db.execute("UPDATE admin_audit_events SET action='tampered' WHERE id=2")
+    assert store.audit_chain_status()["verified"] is False
+    with pytest.raises(ValueError, match="integrity check failed"):
+        store.prune_admin_audit_events(365, now=fresh)
+
+
+def test_maintenance_lease_is_exclusive_and_recovers_after_expiry(tmp_path):
+    database = str(tmp_path / "maintenance-leases.sqlite3")
+    first = create_usage_store(database)
+    second = create_usage_store(database)
+    now = datetime(2026, 10, 31, tzinfo=UTC)
+    assert first.acquire_maintenance_lease("retention", "replica-a", 60, now)
+    assert second.acquire_maintenance_lease("retention", "replica-b", 60, now) is False
+    assert second.acquire_maintenance_lease("retention", "replica-b", 60,
+        now + timedelta(seconds=61)) is True

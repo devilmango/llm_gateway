@@ -11,10 +11,12 @@ from psycopg_pool import ConnectionPool
 
 from .config import MIN_TENANT_USAGE_RETENTION_DAYS
 from .storage import (
+    AUDIT_GENESIS_HASH,
     AsyncJobIdempotencyConflict,
     AsyncJobQueueLimitExceeded,
     BudgetExceeded,
     WebhookEndpointBusy,
+    audit_entry_hash,
 )
 from .webhook_security import webhook_endpoint_id
 
@@ -97,9 +99,20 @@ class PostgresUsageStore:
                 ON CONFLICT (webhook_url) DO NOTHING""",
             """CREATE TABLE IF NOT EXISTS admin_audit_events (
                 id BIGSERIAL PRIMARY KEY, occurred_at TEXT NOT NULL,
-                actor TEXT NOT NULL, action TEXT NOT NULL, status_code INTEGER NOT NULL
+                actor TEXT NOT NULL, action TEXT NOT NULL, status_code INTEGER NOT NULL,
+                previous_hash TEXT, entry_hash TEXT
             )""",
+            "ALTER TABLE admin_audit_events ADD COLUMN IF NOT EXISTS previous_hash TEXT",
+            "ALTER TABLE admin_audit_events ADD COLUMN IF NOT EXISTS entry_hash TEXT",
             "CREATE INDEX IF NOT EXISTS idx_admin_audit_time ON admin_audit_events(occurred_at)",
+            """CREATE TABLE IF NOT EXISTS admin_audit_chain_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1), anchor_id BIGINT NOT NULL,
+                anchor_hash TEXT NOT NULL
+            )""",
+            "INSERT INTO admin_audit_chain_state VALUES (1,0,'" + AUDIT_GENESIS_HASH + "') ON CONFLICT (singleton) DO NOTHING",
+            """CREATE TABLE IF NOT EXISTS maintenance_leases (
+                lease_name TEXT PRIMARY KEY, owner_id TEXT NOT NULL, lease_until TEXT NOT NULL
+            )""",
             """CREATE TABLE IF NOT EXISTS tool_call_audits (
                 id BIGSERIAL PRIMARY KEY, request_id TEXT NOT NULL, tenant_id TEXT,
                 application TEXT NOT NULL, occurred_at TEXT NOT NULL, tool_name TEXT NOT NULL,
@@ -178,6 +191,55 @@ class PostgresUsageStore:
         with self.pool.connection() as conn, conn.cursor() as cursor:
             for statement in statements:
                 cursor.execute(statement)
+        self._backfill_audit_chain()
+
+    def _backfill_audit_chain(self) -> None:
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('llm_gateway_admin_audit_chain'))")
+            cursor.execute("SELECT anchor_id,anchor_hash FROM admin_audit_chain_state WHERE singleton=1")
+            state = cursor.fetchone()
+            previous = state["anchor_hash"]
+            cursor.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
+                           "FROM admin_audit_events WHERE id>%s ORDER BY id FOR UPDATE", (state["anchor_id"],))
+            for row in cursor.fetchall():
+                expected = audit_entry_hash(row["id"], row["occurred_at"], row["actor"], row["action"],
+                                            row["status_code"], previous)
+                if row["entry_hash"] is None:
+                    cursor.execute("UPDATE admin_audit_events SET previous_hash=%s,entry_hash=%s WHERE id=%s",
+                                   (previous, expected, row["id"]))
+                elif row["previous_hash"] != previous or row["entry_hash"] != expected:
+                    previous = row["entry_hash"]
+                    continue
+                previous = expected
+
+    @staticmethod
+    def _append_audit(cursor, actor: str, action: str, status_code: int, occurred_at: str) -> None:
+        cursor.execute("SELECT pg_advisory_xact_lock(hashtext('llm_gateway_admin_audit_chain'))")
+        cursor.execute("SELECT anchor_hash FROM admin_audit_chain_state WHERE singleton=1")
+        state = cursor.fetchone()
+        cursor.execute("SELECT id,entry_hash FROM admin_audit_events ORDER BY id DESC LIMIT 1 FOR UPDATE")
+        tail = cursor.fetchone()
+        previous = tail["entry_hash"] if tail else state["anchor_hash"]
+        cursor.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code,previous_hash) "
+                       "VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                       (occurred_at, actor, action, status_code, previous))
+        event_id = cursor.fetchone()["id"]
+        digest = audit_entry_hash(event_id, occurred_at, actor, action, status_code, previous)
+        cursor.execute("UPDATE admin_audit_events SET entry_hash=%s WHERE id=%s", (digest, event_id))
+
+    def acquire_maintenance_lease(self, lease_name: str, owner_id: str, lease_seconds: int,
+                                  now: datetime | None = None) -> bool:
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        now = now or datetime.now(UTC)
+        until = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("""INSERT INTO maintenance_leases (lease_name,owner_id,lease_until)
+                VALUES (%s,%s,%s) ON CONFLICT (lease_name) DO UPDATE SET
+                owner_id=EXCLUDED.owner_id,lease_until=EXCLUDED.lease_until
+                WHERE maintenance_leases.lease_until<=%s OR maintenance_leases.owner_id=%s""",
+                (lease_name, owner_id, until, now.isoformat(), owner_id))
+            return cursor.rowcount == 1
 
     def reserve_budget(self, request_id: str, application: str, amount_usd: float, monthly_limit_usd: float,
                        now: datetime | None = None) -> None:
@@ -467,8 +529,7 @@ class PostgresUsageStore:
                 updated_at=%s WHERE job_id=%s AND status='dead_letter' AND payload_json IS NOT NULL""",
                 (now, job_id))
             if cursor.rowcount:
-                cursor.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (%s,%s,%s,%s)",
-                    (now, actor, f"async_job_requeued:{job_id}", 200))
+                self._append_audit(cursor, actor, f"async_job_requeued:{job_id}", 200, now)
             return bool(cursor.rowcount)
 
     def async_job_cancel_requested(self, job_id: str) -> bool:
@@ -777,8 +838,7 @@ class PostgresUsageStore:
                 (now.isoformat(), event_id))
             redriven = bool(cursor.rowcount)
             if redriven and actor:
-                cursor.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (%s,%s,%s,%s)",
-                               (now.isoformat(), actor, f"webhook_redrive:{event_id}", 202))
+                self._append_audit(cursor, actor, f"webhook_redrive:{event_id}", 202, now.isoformat())
             return redriven
 
     def prune_webhook_history(self, retention_days: int, now: datetime | None = None) -> dict[str, int]:
@@ -852,8 +912,7 @@ class PostgresUsageStore:
                            (url,))
             active = int(cursor.fetchone()["count"])
             action = "pause" if paused else "resume"
-            cursor.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (%s,%s,%s,200)",
-                           (now.isoformat(), actor, f"webhook_endpoint_{action}:{endpoint_id}"))
+            self._append_audit(cursor, actor, f"webhook_endpoint_{action}:{endpoint_id}", 200, now.isoformat())
             return {"endpoint_id": endpoint_id, "paused": paused, "active_deliveries": active,
                     "updated_at": now.isoformat(), "updated_by": actor}
 
@@ -871,8 +930,7 @@ class PostgresUsageStore:
                 raise WebhookEndpointBusy(endpoint_id)
             cursor.execute("UPDATE webhook_endpoint_controls SET reset_at=%s,updated_at=%s,updated_by=%s WHERE webhook_url=%s",
                            (now.isoformat(), now.isoformat(), actor, url))
-            cursor.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (%s,%s,%s,200)",
-                           (now.isoformat(), actor, f"webhook_circuit_reset:{endpoint_id}"))
+            self._append_audit(cursor, actor, f"webhook_circuit_reset:{endpoint_id}", 200, now.isoformat())
             return {"endpoint_id": endpoint_id, "reset_at": now.isoformat(), "updated_by": actor}
 
     def webhook_endpoint_control(self, webhook_url: str) -> dict[str, Any]:
@@ -907,13 +965,70 @@ class PostgresUsageStore:
     def record_audit(self, actor: str, action: str, status_code: int,
                      now: datetime | None = None) -> None:
         now = now or datetime.now(UTC)
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            self._append_audit(cursor, actor, action, status_code, now.isoformat())
+
+    @staticmethod
+    def _audit_chain_status(cursor) -> dict[str, Any]:
+        cursor.execute("SELECT anchor_id,anchor_hash FROM admin_audit_chain_state WHERE singleton=1")
+        state = cursor.fetchone()
+        cursor.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
+                       "FROM admin_audit_events WHERE id>%s ORDER BY id", (state["anchor_id"],))
+        rows = cursor.fetchall()
+        previous, invalid_id = state["anchor_hash"], None
+        for row in rows:
+            expected = audit_entry_hash(row["id"], row["occurred_at"], row["actor"], row["action"],
+                                        row["status_code"], previous)
+            if row["previous_hash"] != previous or not row["entry_hash"] or row["entry_hash"] != expected:
+                invalid_id = int(row["id"])
+                break
+            previous = row["entry_hash"]
+        return {"verified": invalid_id is None, "record_count": len(rows),
+                "anchor_id": int(state["anchor_id"]), "anchor_hash": state["anchor_hash"],
+                "head_id": int(rows[-1]["id"]) if rows else int(state["anchor_id"]),
+                "head_hash": previous, "first_invalid_id": invalid_id}
+
+    def audit_chain_status(self) -> dict[str, Any]:
         with self.pool.connection() as conn, conn.cursor() as cursor:
-            cursor.execute("INSERT INTO admin_audit_events (occurred_at,actor,action,status_code) VALUES (%s,%s,%s,%s)",
-                           (now.isoformat(), actor, action, status_code))
+            return self._audit_chain_status(cursor)
+
+    def export_audit_events(self) -> dict[str, Any]:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            status = self._audit_chain_status(cursor)
+            cursor.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
+                           "FROM admin_audit_events ORDER BY id DESC")
+            events = cursor.fetchall()
+        canonical = json.dumps(events, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        return {"format": "llm-gateway-admin-audit-v1", "exported_at": datetime.now(UTC).isoformat(),
+                "chain": status, "export_sha256": hashlib.sha256(canonical).hexdigest(), "events": events}
+
+    def prune_admin_audit_events(self, retention_days: int, now: datetime | None = None) -> dict[str, Any]:
+        if not isinstance(retention_days, int) or isinstance(retention_days, bool) or retention_days < 1:
+            raise ValueError("retention_days must be a positive integer")
+        now = now or datetime.now(UTC)
+        cutoff = (now - timedelta(days=retention_days)).isoformat()
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('llm_gateway_admin_audit_chain'))")
+            status = self._audit_chain_status(cursor)
+            if not status["verified"]:
+                raise ValueError(f"admin audit chain integrity check failed at event {status['first_invalid_id']}")
+            cursor.execute("SELECT id,occurred_at,entry_hash FROM admin_audit_events ORDER BY id FOR UPDATE")
+            expired = []
+            for row in cursor.fetchall():
+                if row["occurred_at"] >= cutoff:
+                    break
+                expired.append(row)
+            if not expired:
+                return {"deleted": 0, "anchor_id": status["anchor_id"], "anchor_hash": status["anchor_hash"]}
+            anchor = expired[-1]
+            cursor.execute("DELETE FROM admin_audit_events WHERE id<=%s", (anchor["id"],))
+            cursor.execute("UPDATE admin_audit_chain_state SET anchor_id=%s,anchor_hash=%s WHERE singleton=1",
+                           (anchor["id"], anchor["entry_hash"]))
+            return {"deleted": len(expired), "anchor_id": int(anchor["id"]), "anchor_hash": anchor["entry_hash"]}
 
     def audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.pool.connection() as conn, conn.cursor() as cursor:
-            cursor.execute("SELECT occurred_at,actor,action,status_code FROM admin_audit_events ORDER BY id DESC LIMIT %s",
+            cursor.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash FROM admin_audit_events ORDER BY id DESC LIMIT %s",
                            (limit,))
             return cursor.fetchall()
 
