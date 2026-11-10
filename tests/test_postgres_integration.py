@@ -158,6 +158,11 @@ def test_postgres_hold_created_during_retention_prune_is_not_lost():
                    for row in first.query_audit_events(limit=1000, actor=actor)["events"])
         assert first.audit_chain_status()["verified"] is True
     finally:
+        # These integration tests share the CI PostgreSQL service. Release the
+        # hold created by the race test so later retention tests start clean.
+        first.release_admin_audit_hold(
+            event_id, "integration-operator", now + timedelta(seconds=2)
+        )
         with first.pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute(f"DROP TRIGGER IF EXISTS {trigger_name} ON admin_audit_holds")
             cursor.execute(f"DROP FUNCTION IF EXISTS {function_name}()")
