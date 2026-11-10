@@ -102,6 +102,102 @@ def test_postgres_audit_chain_is_valid_after_concurrent_replica_writes():
         second.close()
 
 
+def test_postgres_hold_created_during_retention_prune_is_not_lost():
+    first, second = _postgres_store(), _postgres_store()
+    suffix = uuid.uuid4().hex
+    function_name = f"test_hold_pause_{suffix}"
+    trigger_name = f"test_hold_pause_trigger_{suffix}"
+    now = datetime.now(UTC) + timedelta(days=500)
+    actor = f"integration-hold-race-{suffix}"
+    first.record_audit(actor, "hold-prune-race-target", 200, now - timedelta(days=500))
+    event_id = first.query_audit_events(limit=1, actor=actor)["events"][0]["id"]
+
+    try:
+        with first.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute(f"""CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN PERFORM pg_sleep(0.8); RETURN NEW; END $$""")
+            cursor.execute(f"CREATE TRIGGER {trigger_name} BEFORE INSERT ON admin_audit_holds "
+                           f"FOR EACH ROW EXECUTE FUNCTION {function_name}()")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            hold_future = executor.submit(first.create_admin_audit_hold, event_id,
+                "integration-operator", "race hold", now)
+            deadline = time.monotonic() + 10
+            hold_paused = False
+            while time.monotonic() < deadline:
+                with second.pool.connection() as conn, conn.cursor() as cursor:
+                    cursor.execute("""SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                        WHERE datname=current_database() AND state='active' AND wait_event='PgSleep'
+                        AND query ILIKE 'INSERT INTO admin_audit_holds%') AS paused""")
+                    hold_paused = cursor.fetchone()["paused"]
+                if hold_paused:
+                    break
+                time.sleep(0.025)
+            assert hold_paused, "hold insert did not reach the database pause trigger"
+
+            prune_future = executor.submit(second.prune_admin_audit_events, 365, now)
+            deadline = time.monotonic() + 10
+            prune_waiting = False
+            while time.monotonic() < deadline:
+                with first.pool.connection() as conn, conn.cursor() as cursor:
+                    cursor.execute("""SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                        WHERE datname=current_database() AND state='active' AND wait_event_type='Lock'
+                        AND query ILIKE 'SELECT pg_advisory_xact_lock%') AS waiting""")
+                    prune_waiting = cursor.fetchone()["waiting"]
+                if prune_waiting:
+                    break
+                time.sleep(0.025)
+            assert prune_waiting, "retention did not wait behind the hold transaction's audit lock"
+
+            hold = hold_future.result(timeout=10)
+            pruned = prune_future.result(timeout=10)
+
+        assert hold["event_id"] == event_id
+        assert pruned["held_event_id"] == event_id
+        assert any(row["id"] == event_id
+                   for row in first.query_audit_events(limit=1000, actor=actor)["events"])
+        assert first.audit_chain_status()["verified"] is True
+    finally:
+        with first.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {trigger_name} ON admin_audit_holds")
+            cursor.execute(f"DROP FUNCTION IF EXISTS {function_name}()")
+        first.close()
+        second.close()
+
+
+def test_postgres_audit_archive_metadata_survives_migrations_and_replica_reads():
+    writer = _postgres_store()
+    suffix = uuid.uuid4().hex
+    archive_id = "integration-archive-" + suffix
+    created_at = datetime.now(UTC).isoformat()
+    manifest = {"format": "llm-gateway-audit-archive-v1", "archive_id": archive_id,
+        "created_at": created_at, "created_by": "integration-operator",
+        "events_key": f"audit-archives/{archive_id}/events.json",
+        "manifest_key": f"audit-archives/{archive_id}/manifest.json", "event_count": 0,
+        "data_sha256": "0" * 64, "signature_key_id": "integration-key",
+        "retention_until": (datetime.now(UTC) + timedelta(days=60)).isoformat()}
+    try:
+        before = writer.admin_audit_archive_health(3650, 30)["verification_failures"]
+        writer.record_admin_audit_archive(manifest)
+        writer.record_admin_audit_archive_verification(archive_id, False, "intentional integration failure")
+        assert writer.audit_chain_status()["verified"] is True
+
+        # A fresh replica reruns all idempotent schema migrations before reading JSONB metadata.
+        reader = _postgres_store()
+        try:
+            archive = reader.admin_audit_archive(archive_id)
+            assert archive is not None
+            assert archive["manifest"] == manifest
+            health = reader.admin_audit_archive_health(3650, 30)
+            assert health["verification_failures"] == before + 1
+            assert health["latest_archive_at"] >= created_at
+            assert reader.audit_chain_status()["verified"] is True
+        finally:
+            reader.close()
+    finally:
+        writer.close()
+
+
 def test_postgres_audit_holds_are_transactional_and_audited():
     store = _postgres_store()
     # Keep synthetic event times monotonic even when CI runs this test twice

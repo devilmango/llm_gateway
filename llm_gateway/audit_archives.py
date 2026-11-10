@@ -10,7 +10,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .audit_cli import verify_export
-from .audit_security import canonical_json, configured_audit_signature
+from .audit_security import (
+    canonical_json,
+    configured_audit_manifest_signature,
+    configured_audit_signature,
+    verify_audit_manifest_signature,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +41,14 @@ def _verify_archive_objects(events_data: bytes, manifest_data: bytes,
         for field in ("archive_id", "events_key", "manifest_key", "event_count", "data_sha256"):
             if expected.get(field) != manifest.get(field):
                 raise ValueError(f"archive manifest {field} does not match its database record")
+    manifest_signature = manifest.get("manifest_signature")
+    if (not isinstance(manifest_signature, dict)
+            or manifest_signature.get("key_id") != manifest.get("signature_key_id")):
+        raise ValueError("archive manifest signature key ID does not match its metadata")
+    manifest_key = manifest_signature.get("public_key_pem")
+    if not manifest_key:
+        raise ValueError("archive manifest signature has no embedded public key")
+    verify_audit_manifest_signature(manifest, trusted_public_key or manifest_key)
     if hashlib.sha256(events_data).hexdigest() != manifest.get("data_sha256"):
         raise ValueError("archive object SHA-256 does not match the manifest")
     export = _json_object(events_data, "archive export")
@@ -55,12 +68,16 @@ def _verify_archive_objects(events_data: bytes, manifest_data: bytes,
         raise ValueError("archive first event ID does not match its manifest")
     if max(ids, default=None) != manifest.get("last_event_id"):
         raise ValueError("archive last event ID does not match its manifest")
+    export_signature = export.get("signature")
+    if (not isinstance(export_signature, dict)
+            or export_signature.get("key_id") != manifest_signature.get("key_id")):
+        raise ValueError("manifest and export signatures use different key IDs")
+    valid, message = verify_export(export, trusted_public_key or manifest_key)
+    if not valid:
+        raise ValueError(message)
     signature = export.get("signature")
     if not isinstance(signature, dict) or signature.get("key_id") != manifest.get("signature_key_id"):
         raise ValueError("archive signing key ID does not match its manifest")
-    valid, message = verify_export(export, trusted_public_key)
-    if not valid:
-        raise ValueError(message)
     return export, manifest
 
 
@@ -169,6 +186,7 @@ def create_admin_audit_archive(store: Any, artifacts: Any, config: dict[str, Any
     manifest["retention_until"] = ((datetime.now(UTC) + timedelta(days=int(retention_days))).isoformat()
         if retention_days else None)
     manifest["object_lock_mode"] = archive_config.get("audit_archive_object_lock_mode")
+    manifest = configured_audit_manifest_signature(manifest, config)
     manifest_data = canonical_json(manifest)
     written: list[str] = []
     try:

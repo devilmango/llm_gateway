@@ -15,6 +15,7 @@ from .audit_security import (
     audit_entry_hash,
     canonical_json,
     verify_audit_export_signature,
+    verify_audit_manifest_signature,
 )
 
 
@@ -85,6 +86,7 @@ def verify_archive_payload(manifest: dict[str, Any], raw_export: bytes,
     if actual_sha != str(manifest.get("data_sha256")):
         return False, "archive data object digest mismatch", None
     try:
+        verify_audit_manifest_signature(manifest, trusted_public_key_pem)
         export = json.loads(raw_export)
         if not isinstance(export, dict):
             return False, "archive data object is not a JSON export", None
@@ -105,6 +107,9 @@ def verify_archive_payload(manifest: dict[str, Any], raw_export: bytes,
         signature = export.get("signature", {})
         if signature.get("key_id") != manifest.get("signature_key_id"):
             return False, "manifest signing key ID does not match the signed export", None
+        manifest_signature = manifest.get("manifest_signature", {})
+        if manifest_signature.get("key_id") != signature.get("key_id"):
+            return False, "manifest and export signatures use different key IDs", None
         if export.get("archive_id", manifest.get("archive_id")) != manifest.get("archive_id"):
             return False, "manifest archive ID does not match the signed export", None
         return True, f"verified archive {manifest.get('archive_id')}: {message}", export

@@ -17,7 +17,7 @@ from llm_gateway.audit_archives import (
     verify_admin_audit_archive,
 )
 from llm_gateway.audit_cli import main as audit_cli_main
-from llm_gateway.audit_security import sign_audit_export
+from llm_gateway.audit_security import sign_audit_export, sign_audit_manifest
 from llm_gateway.storage import create_usage_store
 
 
@@ -40,6 +40,7 @@ def _signed_archive(tmp_path: Path):
         "last_event_id": max((row["id"] for row in export["events"]), default=None),
         "chain": export["chain"], "export_sha256": export["export_sha256"],
         "data_sha256": hashlib.sha256(data).hexdigest(), "signature_key_id": "audit-test-key"}
+    manifest = sign_audit_manifest(manifest, key_id="audit-test-key", private_key_pem=private)
     events_path.write_bytes(data)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     public_path = tmp_path / "trusted-public.pem"
@@ -61,6 +62,15 @@ def test_audit_archive_cli_verifies_and_restores_to_investigation_database(tmp_p
     assert rows == [(1, "sample-event")]
     assert audit_cli_main(["restore", str(manifest), "--archive-root", str(root), "--database", str(database),
                            "--public-key", str(public)]) == 1
+    capsys.readouterr()
+
+    tampered_manifest = dict(archive)
+    tampered_manifest["created_by"] = "attacker"
+    manifest.write_text(json.dumps(tampered_manifest), encoding="utf-8")
+    assert audit_cli_main(["verify-archive", str(manifest), "--archive-root", str(root),
+                           "--public-key", str(public)]) == 1
+    assert "manifest signature" in capsys.readouterr().err
+    manifest.write_text(json.dumps(archive), encoding="utf-8")
 
     events_path = root / archive["events_key"]
     events_path.write_bytes(events_path.read_bytes() + b" ")
