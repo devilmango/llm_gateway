@@ -57,6 +57,11 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
         raise ValueError("server.audit_signing_private_key_env must name an environment variable")
     if signing_key_id is not None and (not isinstance(signing_key_id, str) or not signing_key_id.strip()):
         raise ValueError("server.audit_signing_key_id must be a non-empty string")
+    archive_enabled = server.get("admin_audit_archive_enabled", False)
+    if not isinstance(archive_enabled, bool):
+        raise TypeError("server.admin_audit_archive_enabled must be a boolean")
+    if archive_enabled and (not signing_key_env or not signing_key_id):
+        raise ValueError("scheduled audit archiving requires configured audit signing keys")
     async_jobs = config.get("async_jobs", {})
     if not isinstance(async_jobs, dict):
         raise TypeError("async_jobs must be an object")
@@ -78,6 +83,23 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
         raise ValueError("object_storage must configure the 'local' or 's3' backend")
     if object_storage.get("backend") == "s3" and not object_storage.get("bucket"):
         raise ValueError("object_storage.bucket is required when using S3")
+    archive_retention_days = object_storage.get("audit_archive_retention_days")
+    if archive_retention_days is not None and (
+            not isinstance(archive_retention_days, int) or isinstance(archive_retention_days, bool)
+            or archive_retention_days < 1):
+        raise ValueError("object_storage.audit_archive_retention_days must be a positive integer")
+    object_lock_mode = object_storage.get("audit_archive_object_lock_mode")
+    if object_lock_mode is not None:
+        if object_storage.get("backend", "local") != "s3":
+            raise ValueError("audit archive object lock is supported only by the S3 backend")
+        if object_lock_mode not in {"GOVERNANCE", "COMPLIANCE"}:
+            raise ValueError("object_storage.audit_archive_object_lock_mode must be GOVERNANCE or COMPLIANCE")
+        if archive_retention_days is None:
+            raise ValueError("S3 audit archive object lock requires audit_archive_retention_days")
+    warning_days = server.get("admin_audit_retention_warning_days", min(30, audit_retention_days))
+    if (not isinstance(warning_days, int) or isinstance(warning_days, bool) or warning_days < 1
+            or warning_days > audit_retention_days):
+        raise ValueError("server.admin_audit_retention_warning_days must be positive and no greater than audit retention")
     tenant_data = config.get("tenant_data", {})
     if not isinstance(tenant_data, dict):
         raise TypeError("tenant_data must be an object")

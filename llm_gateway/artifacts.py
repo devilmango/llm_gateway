@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -48,13 +49,17 @@ class LocalArtifactStore(ArtifactStore):
 
 
 class S3ArtifactStore(ArtifactStore):
-    def __init__(self, bucket: str, prefix: str = "llm-gateway", region: str | None = None) -> None:
+    def __init__(self, bucket: str, prefix: str = "llm-gateway", region: str | None = None,
+                 audit_archive_retention_days: int | None = None,
+                 audit_archive_object_lock_mode: str | None = None) -> None:
         try:
             import boto3
         except ImportError as exc:
             raise RuntimeError("S3 artifact storage requires the optional llm-gateway[s3] dependency") from exc
         self.bucket = bucket
         self.prefix = prefix.strip("/")
+        self.audit_archive_retention_days = audit_archive_retention_days
+        self.audit_archive_object_lock_mode = audit_archive_object_lock_mode
         self.client = boto3.client("s3", region_name=region)
 
     def _key(self, key: str) -> str:
@@ -64,7 +69,12 @@ class S3ArtifactStore(ArtifactStore):
         return f"{self.prefix}/{relative.as_posix()}" if self.prefix else relative.as_posix()
 
     def put(self, key: str, body: bytes, content_type: str = "application/json") -> None:
-        self.client.put_object(Bucket=self.bucket, Key=self._key(key), Body=body, ContentType=content_type)
+        request = {"Bucket": self.bucket, "Key": self._key(key), "Body": body, "ContentType": content_type}
+        if key.startswith("audit-archives/") and self.audit_archive_object_lock_mode:
+            request["ObjectLockMode"] = self.audit_archive_object_lock_mode
+            request["ObjectLockRetainUntilDate"] = datetime.now(UTC) + timedelta(
+                days=int(self.audit_archive_retention_days))
+        self.client.put_object(**request)
 
     def get(self, key: str) -> bytes:
         try:
@@ -85,7 +95,8 @@ def create_artifact_store(config: dict[str, Any], database: str) -> ArtifactStor
         bucket = config.get("bucket")
         if not isinstance(bucket, str) or not bucket.strip():
             raise ValueError("object_storage.bucket is required for S3 storage")
-        return S3ArtifactStore(bucket, config.get("prefix", "llm-gateway"), config.get("region"))
+        return S3ArtifactStore(bucket, config.get("prefix", "llm-gateway"), config.get("region"),
+            config.get("audit_archive_retention_days"), config.get("audit_archive_object_lock_mode"))
     if backend != "local":
         raise ValueError("object_storage.backend must be 'local' or 's3'")
     directory = config.get("directory")

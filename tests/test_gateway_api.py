@@ -1137,13 +1137,20 @@ async def test_oidc_scopes_audit_log_and_dashboard(tmp_path, monkeypatch):
         assert all(event["actor"] == "finance-user" for event in filtered.json()["events"])
         held_event_id = filtered.json()["events"][0]["id"]
         held = await client.post("/v1/admin/audit/holds", headers={"Authorization": "Bearer audit-token"},
-            json={"event_id": held_event_id, "reason": "Compliance investigation CASE-42"})
+            json={"event_id": held_event_id, "reason": "Compliance investigation CASE-42",
+                  "case_reference": "CASE-42", "notes": "Review data access logs",
+                  "review_at": (datetime.now(UTC) + timedelta(days=30)).isoformat()})
         assert held.status_code == 201
         holds = await client.get("/v1/admin/audit/holds", headers={"Authorization": "Bearer audit-token"})
-        assert any(item["event_id"] == held_event_id for item in holds.json()["holds"])
+        hold_record = next(item for item in holds.json()["holds"] if item["event_id"] == held_event_id)
+        assert hold_record["case_reference"] == "CASE-42"
+        assert hold_record["notes"] == "Review data access logs"
+        assert hold_record["review_at"] is not None
+        assert hold_record["created_by"] == "auditor"
         released = await client.post(f"/v1/admin/audit/holds/{held_event_id}/release",
             headers={"Authorization": "Bearer audit-token"})
         assert released.status_code == 200
+        assert released.json()["released_by"] == "auditor"
         archived = await client.post("/v1/admin/audit/archive",
             headers={"Authorization": "Bearer audit-token"})
         assert archived.status_code == 201
@@ -1160,6 +1167,51 @@ async def test_oidc_scopes_audit_log_and_dashboard(tmp_path, monkeypatch):
             headers={"Authorization": "Bearer audit-token"})
         assert archives.status_code == 200
         assert archives.json()["archives"][0]["archive_id"] == archive_manifest["archive_id"]
+        verification = await client.post(
+            f"/v1/admin/audit/archives/{archive_manifest['archive_id']}/verify",
+            headers={"Authorization": "Bearer audit-token"})
+        assert verification.status_code == 200
+        assert verification.json()["verified"] is True
+        assert verification.json()["trust"] == "embedded-key-unpinned"
+        retrieved = await client.get(f"/v1/admin/audit/archives/{archive_manifest['archive_id']}",
+            headers={"Authorization": "Bearer audit-token"})
+        assert retrieved.status_code == 200
+        assert retrieved.json()["verification"]["verified"] is True
+        assert retrieved.json()["manifest"]["archive_id"] == archive_manifest["archive_id"]
+
+        incremental = await client.post("/v1/admin/audit/archive",
+            headers={"Authorization": "Bearer audit-token"})
+        assert incremental.status_code == 201
+        incremental_manifest = incremental.json()
+        assert incremental_manifest["incremental"] is True
+        assert incremental_manifest["previous_archive_id"] == archive_manifest["archive_id"]
+        incremental_data = json.loads((archive_root / incremental_manifest["events_key"]).read_bytes())
+        assert incremental_manifest["event_count"] == len(incremental_data["events"])
+        assert all(event["id"] > archive_manifest["chain"]["head_id"]
+                   for event in incremental_data["events"])
+        incremental_verification = await client.post(
+            f"/v1/admin/audit/archives/{incremental_manifest['archive_id']}/verify",
+            headers={"Authorization": "Bearer audit-token"})
+        assert incremental_verification.status_code == 200
+        assert incremental_verification.json()["verified"] is True
+        assert incremental_verification.json()["lineage_archives_verified"] == 2
+        health = await client.get("/v1/admin/audit/archive-health",
+            headers={"Authorization": "Bearer audit-token"})
+        assert health.status_code == 200
+        assert health.json()["latest_archive_age_seconds"] is not None
+        assert health.json()["verification_failures"] == 0
+        metrics = (await client.get("/metrics")).text
+        assert "llm_gateway_admin_audit_archive_latest_age_seconds" in metrics
+        assert "llm_gateway_admin_audit_archive_verification_failures 0.0" in metrics
+        (archive_root / archive_manifest["events_key"]).write_bytes(events_bytes + b" ")
+        failed_verification = await client.post(
+            f"/v1/admin/audit/archives/{archive_manifest['archive_id']}/verify",
+            headers={"Authorization": "Bearer audit-token"})
+        assert failed_verification.status_code == 200
+        assert failed_verification.json()["verified"] is False
+        failed_health = await client.get("/v1/admin/audit/archive-health",
+            headers={"Authorization": "Bearer audit-token"})
+        assert failed_health.json()["verification_failures"] == 1
 
 
 @pytest.mark.asyncio
@@ -3058,8 +3110,13 @@ def test_admin_audit_retention_hold_preserves_event_until_release(tmp_path):
     expired_at = now - timedelta(days=500)
     store.record_audit("operator", "investigation_event", 200, expired_at)
     target_id = store.audit_events(limit=1)[0]["id"]
-    hold = store.create_admin_audit_hold(target_id, "compliance", "Preserve CASE-9", now)
+    review_at = now + timedelta(days=14)
+    hold = store.create_admin_audit_hold(target_id, "compliance", "Preserve CASE-9", now,
+        case_reference="CASE-9", notes="Review before deletion", review_at=review_at)
     assert hold["event_id"] == target_id
+    assert hold["review_at"] == review_at.isoformat()
+    assert hold["case_reference"] == "CASE-9"
+    assert hold["notes"] == "Review before deletion"
     with pytest.raises(ValueError, match="already has an active retention hold"):
         store.create_admin_audit_hold(target_id, "compliance", "duplicate", now)
 
@@ -3071,6 +3128,8 @@ def test_admin_audit_retention_hold_preserves_event_until_release(tmp_path):
 
     released = store.release_admin_audit_hold(target_id, "compliance", now)
     assert released["released_by"] == "compliance"
+    assert released["case_reference"] == "CASE-9"
+    assert released["review_at"] == review_at.isoformat()
     assert store.admin_audit_holds(active_only=True) == []
     pruned = store.prune_admin_audit_events(365, now=now)
     assert pruned["deleted"] >= 1

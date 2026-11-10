@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -158,11 +159,18 @@ class ToolApprovalDecisionRequest(BaseModel):
 class AuditHoldRequest(BaseModel):
     event_id: int = Field(ge=1)
     reason: str = Field(min_length=1, max_length=1000)
+    case_reference: str | None = Field(default=None, max_length=200)
+    notes: str | None = Field(default=None, max_length=4000)
+    review_at: datetime | None = None
 
     @model_validator(mode="after")
     def validate_reason(self) -> AuditHoldRequest:
         if not self.reason.strip():
             raise ValueError("reason must not be blank")
+        if self.case_reference is not None and not self.case_reference.strip():
+            raise ValueError("case_reference must not be blank when supplied")
+        if self.review_at is not None and self.review_at.tzinfo is None:
+            raise ValueError("review_at must include a timezone")
         return self
 
 

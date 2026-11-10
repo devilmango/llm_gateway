@@ -133,8 +133,12 @@ class UsageStore:
             db.execute("""CREATE TABLE IF NOT EXISTS admin_audit_holds (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, event_id INTEGER NOT NULL,
                 reason TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
-                released_by TEXT, released_at TEXT
+                released_by TEXT, released_at TEXT, case_reference TEXT, notes TEXT, review_at TEXT
             )""")
+            hold_columns = {row[1] for row in db.execute("PRAGMA table_info(admin_audit_holds)")}
+            for column in ("case_reference", "notes", "review_at"):
+                if column not in hold_columns:
+                    db.execute(f"ALTER TABLE admin_audit_holds ADD COLUMN {column} TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS idx_admin_audit_holds_active ON admin_audit_holds(event_id, released_at)")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_admin_audit_holds_one_active "
                        "ON admin_audit_holds(event_id) WHERE released_at IS NULL")
@@ -144,6 +148,12 @@ class UsageStore:
                 data_sha256 TEXT NOT NULL, manifest_json TEXT NOT NULL
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS idx_admin_audit_archives_time ON admin_audit_archives(created_at)")
+            db.execute("""CREATE TABLE IF NOT EXISTS admin_audit_archive_verifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, archive_id TEXT NOT NULL, checked_at TEXT NOT NULL,
+                verified INTEGER NOT NULL, detail TEXT NOT NULL
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_admin_audit_archive_verifications_time "
+                       "ON admin_audit_archive_verifications(checked_at)")
             db.execute("""CREATE TABLE IF NOT EXISTS tool_call_audits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL,
                 tenant_id TEXT, application TEXT NOT NULL, occurred_at TEXT NOT NULL,
@@ -1118,7 +1128,12 @@ class UsageStore:
                     "anchor_hash": anchor["entry_hash"], "held_event_id": held_event_id}
 
     def create_admin_audit_hold(self, event_id: int, actor: str, reason: str,
-                                now: datetime | None = None) -> dict[str, Any] | None:
+                                now: datetime | None = None, *, case_reference: str | None = None,
+                                notes: str | None = None, review_at: datetime | None = None) -> dict[str, Any] | None:
+        if not reason.strip():
+            raise ValueError("audit hold reason must not be blank")
+        if review_at is not None and review_at.tzinfo is None:
+            raise ValueError("audit hold review_at must include a timezone")
         now = now or datetime.now(UTC)
         occurred_at = now.isoformat()
         with self._lock, self._connect() as db:
@@ -1130,11 +1145,14 @@ class UsageStore:
                                   (event_id,)).fetchone()
             if existing:
                 raise ValueError(f"audit event {event_id} already has an active retention hold")
-            cursor = db.execute("INSERT INTO admin_audit_holds (event_id,reason,created_by,created_at) VALUES (?,?,?,?)",
-                                (event_id, reason, actor, occurred_at))
+            review_at_value = review_at.astimezone(UTC).isoformat() if review_at else None
+            cursor = db.execute("INSERT INTO admin_audit_holds "
+                "(event_id,reason,created_by,created_at,case_reference,notes,review_at) VALUES (?,?,?,?,?,?,?)",
+                (event_id, reason, actor, occurred_at, case_reference, notes, review_at_value))
             self._append_audit(db, actor, f"audit_hold_created:{event_id}", 201, occurred_at)
             return {"hold_id": int(cursor.lastrowid), "event_id": event_id, "reason": reason,
-                    "created_by": actor, "created_at": occurred_at, "released_by": None, "released_at": None}
+                    "created_by": actor, "created_at": occurred_at, "released_by": None, "released_at": None,
+                    "case_reference": case_reference, "notes": notes, "review_at": review_at_value}
 
     def release_admin_audit_hold(self, event_id: int, actor: str,
                                  now: datetime | None = None) -> dict[str, Any] | None:
@@ -1142,7 +1160,8 @@ class UsageStore:
         occurred_at = now.isoformat()
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            hold = db.execute("SELECT id,reason,created_by,created_at FROM admin_audit_holds "
+            hold = db.execute("SELECT id,reason,created_by,created_at,case_reference,notes,review_at "
+                              "FROM admin_audit_holds "
                               "WHERE event_id=? AND released_at IS NULL", (event_id,)).fetchone()
             if not hold:
                 return None
@@ -1151,24 +1170,29 @@ class UsageStore:
             self._append_audit(db, actor, f"audit_hold_released:{event_id}", 200, occurred_at)
             return {"hold_id": int(hold["id"]), "event_id": event_id, "reason": hold["reason"],
                     "created_by": hold["created_by"], "created_at": hold["created_at"],
-                    "released_by": actor, "released_at": occurred_at}
+                    "released_by": actor, "released_at": occurred_at,
+                    "case_reference": hold["case_reference"], "notes": hold["notes"],
+                    "review_at": hold["review_at"]}
 
     def admin_audit_holds(self, *, active_only: bool = True, limit: int = 100) -> list[dict[str, Any]]:
         where = "WHERE h.released_at IS NULL" if active_only else ""
         with self._lock, self._connect() as db:
             rows = db.execute(f"""SELECT h.id AS hold_id,h.event_id,h.reason,h.created_by,h.created_at,
+                h.case_reference,h.notes,h.review_at,
                 h.released_by,h.released_at,e.actor AS event_actor,e.action AS event_action,
                 e.occurred_at AS event_occurred_at FROM admin_audit_holds h
                 LEFT JOIN admin_audit_events e ON e.id=h.event_id {where}
                 ORDER BY h.id DESC LIMIT ?""", (limit,)).fetchall()
             return [dict(row) for row in rows]
 
-    def record_admin_audit_archive(self, manifest: dict[str, Any]) -> None:
+    def record_admin_audit_archive(self, manifest: dict[str, Any],
+                                   lease: dict[str, Any] | None = None) -> None:
         occurred_at = manifest["created_at"]
         actor = manifest["created_by"]
         archive_id = manifest["archive_id"]
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._assert_maintenance_lease(db, lease)
             db.execute("INSERT INTO admin_audit_archives (archive_id,created_at,created_by,events_key,manifest_key,"
                 "event_count,data_sha256,manifest_json) VALUES (?,?,?,?,?,?,?,?)",
                 (archive_id, occurred_at, actor, manifest["events_key"], manifest["manifest_key"],
@@ -1181,6 +1205,93 @@ class UsageStore:
                               "data_sha256,manifest_json FROM admin_audit_archives ORDER BY created_at DESC LIMIT ?",
                               (limit,)).fetchall()
             return [{**dict(row), "manifest": json.loads(row["manifest_json"])} for row in rows]
+
+    def admin_audit_archive(self, archive_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT archive_id,created_at,created_by,events_key,manifest_key,event_count,"
+                "data_sha256,manifest_json FROM admin_audit_archives WHERE archive_id=?", (archive_id,)).fetchone()
+            if row is None:
+                return None
+            archive = dict(row)
+            archive["manifest"] = json.loads(archive.pop("manifest_json"))
+            return archive
+
+    def get_admin_audit_archive(self, archive_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT archive_id,created_at,created_by,events_key,manifest_key,event_count,"
+                "data_sha256,manifest_json FROM admin_audit_archives WHERE archive_id=?", (archive_id,)).fetchone()
+            return ({**dict(row), "manifest": json.loads(row["manifest_json"])} if row else None)
+
+    def record_admin_audit_archive_verification(self, archive_id: str, verified: bool, detail: str,
+                                                now: datetime | None = None) -> None:
+        now = now or datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            db.execute("INSERT INTO admin_audit_archive_verifications (archive_id,checked_at,verified,detail) "
+                       "VALUES (?,?,?,?)", (archive_id, now.isoformat(), int(verified), detail[:2000]))
+
+    def admin_audit_archive_health(self, retention_days: int, warning_days: int = 30,
+                                   now: datetime | None = None) -> dict[str, Any]:
+        now = now or datetime.now(UTC)
+        oldest_approaching = (now - timedelta(days=retention_days)).isoformat()
+        newest_approaching = (now - timedelta(days=retention_days - warning_days)).isoformat()
+        verification_since = (now - timedelta(hours=24)).isoformat()
+        with self._lock, self._connect() as db:
+            latest = db.execute("SELECT MAX(created_at) FROM admin_audit_archives").fetchone()[0]
+            failures = db.execute("SELECT COUNT(*) FROM admin_audit_archive_verifications "
+                                  "WHERE verified=0 AND checked_at>=?", (verification_since,)).fetchone()[0]
+            failures_total = db.execute("SELECT COUNT(*) FROM admin_audit_archive_verifications WHERE verified=0").fetchone()[0]
+            approaching = db.execute("""SELECT COUNT(*) FROM admin_audit_events e
+                WHERE e.occurred_at>=? AND e.occurred_at<? AND NOT EXISTS (
+                    SELECT 1 FROM admin_audit_holds h WHERE h.event_id=e.id AND h.released_at IS NULL)""",
+                (oldest_approaching, newest_approaching)).fetchone()[0]
+        latest_dt = datetime.fromisoformat(latest) if latest else None
+        return {"latest_archive_at": latest, "latest_archive_age_seconds":
+                (max(0, int((now-latest_dt).total_seconds())) if latest_dt else None),
+                "verification_failures": int(failures), "verification_failures_total": int(failures_total),
+                "records_approaching_retention": int(approaching),
+                "retention_days": retention_days, "warning_days": warning_days}
+
+    def expired_admin_audit_archives(self, now: datetime | None = None) -> list[dict[str, Any]]:
+        now = now or datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            rows = db.execute("SELECT archive_id,events_key,manifest_key,manifest_json FROM admin_audit_archives "
+                              "ORDER BY created_at").fetchall()
+        manifests = {row["archive_id"]: json.loads(row["manifest_json"]) for row in rows}
+        referenced = {manifest.get("previous_archive_id") for manifest in manifests.values()
+                      if manifest.get("previous_archive_id")}
+        expired = []
+        for row in rows:
+            manifest = manifests[row["archive_id"]]
+            until = manifest.get("retention_until")
+            if until and datetime.fromisoformat(until) <= now and row["archive_id"] not in referenced:
+                expired.append({"archive_id": row["archive_id"], "events_key": row["events_key"],
+                                "manifest_key": row["manifest_key"], "retention_until": until})
+        return expired
+
+    def delete_expired_admin_audit_archive(self, archive_id: str, actor: str = "retention-maintenance",
+                                           now: datetime | None = None,
+                                           lease: dict[str, Any] | None = None) -> bool:
+        now = now or datetime.now(UTC)
+        occurred_at = now.isoformat()
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._assert_maintenance_lease(db, lease)
+            row = db.execute("SELECT manifest_json FROM admin_audit_archives WHERE archive_id=?", (archive_id,)).fetchone()
+            if not row:
+                return False
+            manifest = json.loads(row["manifest_json"])
+            until = manifest.get("retention_until")
+            if not until or datetime.fromisoformat(until) > now:
+                return False
+            child_rows = db.execute("SELECT manifest_json FROM admin_audit_archives WHERE archive_id<>?",
+                                    (archive_id,)).fetchall()
+            if any(json.loads(child["manifest_json"]).get("previous_archive_id") == archive_id
+                   for child in child_rows):
+                return False
+            db.execute("DELETE FROM admin_audit_archive_verifications WHERE archive_id=?", (archive_id,))
+            db.execute("DELETE FROM admin_audit_archives WHERE archive_id=?", (archive_id,))
+            self._append_audit(db, actor, f"audit_archive_expired:{archive_id}", 200, occurred_at)
+            return True
 
     def audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock, self._connect() as db:

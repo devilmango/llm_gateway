@@ -1,0 +1,30 @@
+groups:
+  - name: llm-gateway-audit
+    interval: 30s
+    rules:
+      - alert: LLMGatewayAuditArchiveStale
+        expr: llm_gateway_admin_audit_archive_latest_age_seconds > 604800
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM gateway audit archive is stale"
+          description: "No successfully recorded audit archive has been created in the last seven days. Verify archive storage and create a fresh archive."
+
+      - alert: LLMGatewayAuditArchiveVerificationFailure
+        expr: llm_gateway_admin_audit_archive_verification_failures > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLM gateway audit archive verification failed"
+          description: "At least one archive verification failed in the last 24 hours. Inspect /v1/admin/audit/archive-health and verify affected objects against a pinned signing key."
+
+      - alert: LLMGatewayAuditRecordsApproachingRetention
+        expr: llm_gateway_admin_audit_records_approaching_retention > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM gateway audit records are approaching retention"
+          description: "{{ $value }} unheld audit records are within the configured warning window before retention. Archive or place required records on hold."

@@ -14,6 +14,9 @@ server:
   webhook_circuit_recovery_seconds: 30
   webhook_retention_days: 90
   admin_audit_retention_days: 3650
+  # Archives verified audit history once per daily maintenance pass before pruning.
+  # Requires both audit signing settings below and a shared artifact store in multi-replica deployments.
+  admin_audit_archive_enabled: false
   maintenance_lease_seconds: 3600
   # Optional: both values are required to sign audit exports.
   # audit_signing_key_id: audit-2026-11

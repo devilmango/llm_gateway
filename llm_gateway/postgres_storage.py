@@ -109,8 +109,11 @@ class PostgresUsageStore:
             """CREATE TABLE IF NOT EXISTS admin_audit_holds (
                 id BIGSERIAL PRIMARY KEY, event_id BIGINT NOT NULL,
                 reason TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
-                released_by TEXT, released_at TEXT
+                released_by TEXT, released_at TEXT, case_reference TEXT, notes TEXT, review_at TEXT
             )""",
+            "ALTER TABLE admin_audit_holds ADD COLUMN IF NOT EXISTS case_reference TEXT",
+            "ALTER TABLE admin_audit_holds ADD COLUMN IF NOT EXISTS notes TEXT",
+            "ALTER TABLE admin_audit_holds ADD COLUMN IF NOT EXISTS review_at TEXT",
             "CREATE INDEX IF NOT EXISTS idx_admin_audit_holds_active ON admin_audit_holds(event_id,released_at)",
             ("CREATE UNIQUE INDEX IF NOT EXISTS idx_admin_audit_holds_one_active "
              "ON admin_audit_holds(event_id) WHERE released_at IS NULL"),
@@ -120,6 +123,11 @@ class PostgresUsageStore:
                 data_sha256 TEXT NOT NULL, manifest_json JSONB NOT NULL
             )""",
             "CREATE INDEX IF NOT EXISTS idx_admin_audit_archives_time ON admin_audit_archives(created_at)",
+            """CREATE TABLE IF NOT EXISTS admin_audit_archive_verifications (
+                id BIGSERIAL PRIMARY KEY, archive_id TEXT NOT NULL, checked_at TEXT NOT NULL,
+                verified BOOLEAN NOT NULL, detail TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_admin_audit_archive_verifications_time ON admin_audit_archive_verifications(checked_at)",
             """CREATE TABLE IF NOT EXISTS admin_audit_chain_state (
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1), anchor_id BIGINT NOT NULL,
                 anchor_hash TEXT NOT NULL
@@ -1110,7 +1118,12 @@ class PostgresUsageStore:
                     "anchor_hash": anchor["entry_hash"], "held_event_id": held_event_id}
 
     def create_admin_audit_hold(self, event_id: int, actor: str, reason: str,
-                                now: datetime | None = None) -> dict[str, Any] | None:
+                                now: datetime | None = None, *, case_reference: str | None = None,
+                                notes: str | None = None, review_at: datetime | None = None) -> dict[str, Any] | None:
+        if not reason.strip():
+            raise ValueError("audit hold reason must not be blank")
+        if review_at is not None and review_at.tzinfo is None:
+            raise ValueError("audit hold review_at must include a timezone")
         now = now or datetime.now(UTC)
         occurred_at = now.isoformat()
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
@@ -1122,12 +1135,16 @@ class PostgresUsageStore:
                            (event_id,))
             if cursor.fetchone():
                 raise ValueError(f"audit event {event_id} already has an active retention hold")
-            cursor.execute("INSERT INTO admin_audit_holds (event_id,reason,created_by,created_at) "
-                           "VALUES (%s,%s,%s,%s) RETURNING id", (event_id, reason, actor, occurred_at))
+            review_at_value = review_at.astimezone(UTC).isoformat() if review_at else None
+            cursor.execute("INSERT INTO admin_audit_holds "
+                "(event_id,reason,created_by,created_at,case_reference,notes,review_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                (event_id, reason, actor, occurred_at, case_reference, notes, review_at_value))
             hold_id = cursor.fetchone()["id"]
             self._append_audit(cursor, actor, f"audit_hold_created:{event_id}", 201, occurred_at)
             return {"hold_id": int(hold_id), "event_id": event_id, "reason": reason,
-                    "created_by": actor, "created_at": occurred_at, "released_by": None, "released_at": None}
+                    "created_by": actor, "created_at": occurred_at, "released_by": None, "released_at": None,
+                    "case_reference": case_reference, "notes": notes, "review_at": review_at_value}
 
     def release_admin_audit_hold(self, event_id: int, actor: str,
                                  now: datetime | None = None) -> dict[str, Any] | None:
@@ -1135,7 +1152,8 @@ class PostgresUsageStore:
         occurred_at = now.isoformat()
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
             cursor.execute("SELECT pg_advisory_xact_lock(hashtext('llm_gateway_admin_audit_chain'))")
-            cursor.execute("SELECT id,reason,created_by,created_at FROM admin_audit_holds "
+            cursor.execute("SELECT id,reason,created_by,created_at,case_reference,notes,review_at "
+                           "FROM admin_audit_holds "
                            "WHERE event_id=%s AND released_at IS NULL FOR UPDATE", (event_id,))
             hold = cursor.fetchone()
             if not hold:
@@ -1145,23 +1163,28 @@ class PostgresUsageStore:
             self._append_audit(cursor, actor, f"audit_hold_released:{event_id}", 200, occurred_at)
             return {"hold_id": int(hold["id"]), "event_id": event_id, "reason": hold["reason"],
                     "created_by": hold["created_by"], "created_at": hold["created_at"],
-                    "released_by": actor, "released_at": occurred_at}
+                    "released_by": actor, "released_at": occurred_at,
+                    "case_reference": hold["case_reference"], "notes": hold["notes"],
+                    "review_at": hold["review_at"]}
 
     def admin_audit_holds(self, *, active_only: bool = True, limit: int = 100) -> list[dict[str, Any]]:
         where = "WHERE h.released_at IS NULL" if active_only else ""
         with self.pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute(f"""SELECT h.id AS hold_id,h.event_id,h.reason,h.created_by,h.created_at,
+                h.case_reference,h.notes,h.review_at,
                 h.released_by,h.released_at,e.actor AS event_actor,e.action AS event_action,
                 e.occurred_at AS event_occurred_at FROM admin_audit_holds h
                 LEFT JOIN admin_audit_events e ON e.id=h.event_id {where}
                 ORDER BY h.id DESC LIMIT %s""", (limit,))
             return cursor.fetchall()
 
-    def record_admin_audit_archive(self, manifest: dict[str, Any]) -> None:
+    def record_admin_audit_archive(self, manifest: dict[str, Any],
+                                   lease: dict[str, Any] | None = None) -> None:
         occurred_at, actor, archive_id = manifest["created_at"], manifest["created_by"], manifest["archive_id"]
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            self._assert_maintenance_lease(cursor, lease)
             cursor.execute("INSERT INTO admin_audit_archives (archive_id,created_at,created_by,events_key,manifest_key,"
-                "event_count,data_sha256,manifest_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                "event_count,data_sha256,manifest_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
                 (archive_id, occurred_at, actor, manifest["events_key"], manifest["manifest_key"],
                  manifest["event_count"], manifest["data_sha256"], json.dumps(manifest, sort_keys=True)))
             self._append_audit(cursor, actor, f"audit_archive_created:{archive_id}", 201, occurred_at)
@@ -1177,6 +1200,117 @@ class PostgresUsageStore:
                 archive["manifest_json"] = json.loads(archive["manifest_json"])
             archive["manifest"] = archive.pop("manifest_json")
         return archives
+
+    def admin_audit_archive(self, archive_id: str) -> dict[str, Any] | None:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT archive_id,created_at,created_by,events_key,manifest_key,event_count,"
+                "data_sha256,manifest_json FROM admin_audit_archives WHERE archive_id=%s", (archive_id,))
+            archive = cursor.fetchone()
+        if archive is None:
+            return None
+        if isinstance(archive["manifest_json"], str):
+            archive["manifest_json"] = json.loads(archive["manifest_json"])
+        archive["manifest"] = archive.pop("manifest_json")
+        return archive
+
+    def get_admin_audit_archive(self, archive_id: str) -> dict[str, Any] | None:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT archive_id,created_at,created_by,events_key,manifest_key,event_count,"
+                           "data_sha256,manifest_json FROM admin_audit_archives WHERE archive_id=%s",
+                           (archive_id,))
+            archive = cursor.fetchone()
+        if archive:
+            if isinstance(archive["manifest_json"], str):
+                archive["manifest_json"] = json.loads(archive["manifest_json"])
+            archive["manifest"] = archive.pop("manifest_json")
+        return archive
+
+    def record_admin_audit_archive_verification(self, archive_id: str, verified: bool, detail: str,
+                                                now: datetime | None = None) -> None:
+        now = now or datetime.now(UTC)
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("INSERT INTO admin_audit_archive_verifications "
+                "(archive_id,checked_at,verified,detail) VALUES (%s,%s,%s,%s)",
+                (archive_id, now.isoformat(), verified, detail[:2000]))
+
+    def admin_audit_archive_health(self, retention_days: int, warning_days: int = 30,
+                                   now: datetime | None = None) -> dict[str, Any]:
+        now = now or datetime.now(UTC)
+        oldest_approaching = (now - timedelta(days=retention_days)).isoformat()
+        newest_approaching = (now - timedelta(days=retention_days - warning_days)).isoformat()
+        verification_since = (now - timedelta(hours=24)).isoformat()
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT MAX(created_at) AS latest FROM admin_audit_archives")
+            latest = cursor.fetchone()["latest"]
+            cursor.execute("SELECT COUNT(*) AS failures FROM admin_audit_archive_verifications "
+                           "WHERE verified=FALSE AND checked_at>=%s", (verification_since,))
+            failed = cursor.fetchone()["failures"]
+            cursor.execute("SELECT COUNT(*) AS failures FROM admin_audit_archive_verifications WHERE verified=FALSE")
+            failed_total = cursor.fetchone()["failures"]
+            cursor.execute("""SELECT COUNT(*) AS total FROM admin_audit_events e
+                WHERE e.occurred_at>=%s AND e.occurred_at<%s AND NOT EXISTS (
+                    SELECT 1 FROM admin_audit_holds h WHERE h.event_id=e.id AND h.released_at IS NULL)""",
+                (oldest_approaching, newest_approaching))
+            approaching = cursor.fetchone()["total"]
+        latest_dt = datetime.fromisoformat(latest) if latest else None
+        return {"latest_archive_at": latest, "latest_archive_age_seconds":
+                (max(0, int((now-latest_dt).total_seconds())) if latest_dt else None),
+                "verification_failures": int(failed), "verification_failures_total": int(failed_total),
+                "records_approaching_retention": int(approaching),
+                "retention_days": retention_days, "warning_days": warning_days}
+
+    def expired_admin_audit_archives(self, now: datetime | None = None) -> list[dict[str, Any]]:
+        now = now or datetime.now(UTC)
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT archive_id,events_key,manifest_key,manifest_json FROM admin_audit_archives "
+                           "ORDER BY created_at")
+            rows = cursor.fetchall()
+        manifests = {}
+        for row in rows:
+            manifest = row["manifest_json"]
+            manifests[row["archive_id"]] = json.loads(manifest) if isinstance(manifest, str) else manifest
+        referenced = {manifest.get("previous_archive_id") for manifest in manifests.values()
+                      if manifest.get("previous_archive_id")}
+        expired = []
+        for row in rows:
+            manifest = manifests[row["archive_id"]]
+            until = manifest.get("retention_until")
+            if until and datetime.fromisoformat(until) <= now and row["archive_id"] not in referenced:
+                expired.append({"archive_id": row["archive_id"], "events_key": row["events_key"],
+                                "manifest_key": row["manifest_key"], "retention_until": until})
+        return expired
+
+    def delete_expired_admin_audit_archive(self, archive_id: str, actor: str = "retention-maintenance",
+                                           now: datetime | None = None,
+                                           lease: dict[str, Any] | None = None) -> bool:
+        now = now or datetime.now(UTC)
+        occurred_at = now.isoformat()
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            self._assert_maintenance_lease(cursor, lease)
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('llm_gateway_admin_audit_chain'))")
+            cursor.execute("SELECT manifest_json FROM admin_audit_archives WHERE archive_id=%s FOR UPDATE",
+                           (archive_id,))
+            row = cursor.fetchone()
+            if not row:
+                return False
+            manifest = row["manifest_json"]
+            if isinstance(manifest, str):
+                manifest = json.loads(manifest)
+            until = manifest.get("retention_until")
+            if not until or datetime.fromisoformat(until) > now:
+                return False
+            cursor.execute("SELECT manifest_json FROM admin_audit_archives WHERE archive_id<>%s", (archive_id,))
+            children = cursor.fetchall()
+            for child in children:
+                child_manifest = child["manifest_json"]
+                if isinstance(child_manifest, str):
+                    child_manifest = json.loads(child_manifest)
+                if child_manifest.get("previous_archive_id") == archive_id:
+                    return False
+            cursor.execute("DELETE FROM admin_audit_archive_verifications WHERE archive_id=%s", (archive_id,))
+            cursor.execute("DELETE FROM admin_audit_archives WHERE archive_id=%s", (archive_id,))
+            self._append_audit(cursor, actor, f"audit_archive_expired:{archive_id}", 200, occurred_at)
+            return True
 
     def audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.pool.connection() as conn, conn.cursor() as cursor:

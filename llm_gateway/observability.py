@@ -66,6 +66,22 @@ WEBHOOK_CIRCUIT_STATE = Gauge(
     ["endpoint"], registry=REGISTRY,
 )
 WEBHOOK_CIRCUIT_STATE.labels(endpoint="uninitialized").set(0)
+AUDIT_ARCHIVE_LATEST_AGE = Gauge(
+    "llm_gateway_admin_audit_archive_latest_age_seconds",
+    "Age of the latest successfully archived admin audit export",
+    registry=REGISTRY,
+)
+AUDIT_ARCHIVE_VERIFICATION_FAILURES = Gauge(
+    "llm_gateway_admin_audit_archive_verification_failures",
+    "Recorded failed admin audit archive verifications",
+    registry=REGISTRY,
+)
+AUDIT_RECORDS_APPROACHING_RETENTION = Gauge(
+    "llm_gateway_admin_audit_records_approaching_retention",
+    "Unheld admin audit records within the configured warning window before retention",
+    registry=REGISTRY,
+)
+AUDIT_ARCHIVE_LATEST_AGE.set(float("inf"))
 MAINTENANCE_LEASE_OWNED = Gauge(
     "llm_gateway_maintenance_lease_owned", "Whether this gateway replica currently owns a maintenance lease",
     ["task"], registry=REGISTRY,

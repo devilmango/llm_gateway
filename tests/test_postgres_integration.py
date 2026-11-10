@@ -114,8 +114,13 @@ def test_postgres_audit_holds_are_transactional_and_audited():
     try:
         store.record_audit(actor, "preserve-under-hold", 200, expired_at)
         event_id = store.query_audit_events(limit=1, actor=actor)["events"][0]["id"]
-        hold = store.create_admin_audit_hold(event_id, "integration-operator", "CI retention hold", now)
+        review_at = now + timedelta(days=30)
+        hold = store.create_admin_audit_hold(event_id, "integration-operator", "CI retention hold", now,
+            case_reference="CI-RETENTION", notes="Integration coverage", review_at=review_at)
         assert hold["event_id"] == event_id
+        assert hold["case_reference"] == "CI-RETENTION"
+        assert hold["notes"] == "Integration coverage"
+        assert hold["review_at"] == review_at.isoformat()
         assert any(item["event_id"] == event_id
                    for item in store.admin_audit_holds(active_only=True, limit=1000))
         assert store.audit_chain_status()["verified"] is True

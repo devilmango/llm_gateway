@@ -25,6 +25,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from opentelemetry import trace
 
 from .artifacts import create_artifact_store
+from .audit_archives import create_admin_audit_archive
+from .audit_archives import verify_admin_audit_archive as verify_archive_lineage
 from .audit_security import configured_audit_signature
 from .billing_import import normalize_billing_export
 from .capabilities import provider_capabilities
@@ -39,6 +41,9 @@ from .observability import (
     ASYNC_JOBS_DEAD_LETTER,
     ASYNC_JOBS_QUEUED,
     ASYNC_JOBS_RUNNING,
+    AUDIT_ARCHIVE_LATEST_AGE,
+    AUDIT_ARCHIVE_VERIFICATION_FAILURES,
+    AUDIT_RECORDS_APPROACHING_RETENTION,
     CACHE_HITS,
     COST,
     FALLBACKS,
@@ -383,11 +388,49 @@ async def _tenant_retention_loop(app: FastAPI, tenants: dict[str, Any]) -> None:
                                         pruned["events"], pruned["attempts"])
                         await _renew_maintenance_lease(app, lease, lease_seconds)
                         audit_days = int(server.get("admin_audit_retention_days", 3650))
-                        audit_pruned = await asyncio.to_thread(app.state.store.prune_admin_audit_events,
-                            audit_days, lease=lease)
-                        if audit_pruned["deleted"]:
-                            logger.info("admin_audit_retention deleted=%s anchor_id=%s",
-                                        audit_pruned["deleted"], audit_pruned["anchor_id"])
+                        archive_ready = True
+                        if server.get("admin_audit_archive_enabled", False):
+                            try:
+                                async with app.state.audit_archive_lock:
+                                    await _renew_maintenance_lease(app, lease, lease_seconds)
+                                    await asyncio.to_thread(create_admin_audit_archive, app.state.store,
+                                        app.state.artifacts, app.state.config, "system:audit-archiver", lease)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                archive_ready = False
+                                logger.exception("admin_audit_scheduled_archive_failed")
+                        if archive_ready:
+                            await _renew_maintenance_lease(app, lease, lease_seconds)
+                            audit_pruned = await asyncio.to_thread(app.state.store.prune_admin_audit_events,
+                                audit_days, lease=lease)
+                            if audit_pruned["deleted"]:
+                                logger.info("admin_audit_retention deleted=%s anchor_id=%s",
+                                            audit_pruned["deleted"], audit_pruned["anchor_id"])
+                        else:
+                            logger.warning("admin_audit_retention_skipped reason=archive_failed")
+                        archive_retention = app.state.config.get("object_storage", {}).get(
+                            "audit_archive_retention_days")
+                        if archive_retention:
+                            candidates = await asyncio.to_thread(app.state.store.expired_admin_audit_archives)
+                            for archive in candidates:
+                                await _renew_maintenance_lease(app, lease, lease_seconds)
+                                try:
+                                    # Keep the manifest available until its payload has been removed.
+                                    # S3 locks the manifest slightly longer because it is written last.
+                                    for key in (archive["events_key"], archive["manifest_key"]):
+                                        try:
+                                            await asyncio.to_thread(app.state.artifacts.delete, key)
+                                        except FileNotFoundError:
+                                            pass
+                                    removed = await asyncio.to_thread(app.state.store.delete_expired_admin_audit_archive,
+                                        archive["archive_id"], now=datetime.now(UTC), lease=lease)
+                                    if removed:
+                                        logger.info("admin_audit_archive_expired archive_id=%s",
+                                                    archive["archive_id"])
+                                except Exception:
+                                    logger.exception("admin_audit_archive_expiry_failed archive_id=%s",
+                                                     archive["archive_id"])
                         last_run = now
         except asyncio.CancelledError:
             raise
@@ -798,6 +841,7 @@ def create_app(config: dict[str, Any] | None = None,
         app.state.job_dispatch_task = None
         app.state.job_tasks = set()
         app.state.config = cfg
+        app.state.audit_archive_lock = asyncio.Lock()
         app.state.maintenance_owner = f"{os.getpid()}:{uuid.uuid4()}"
         app.state.shadow_tasks = set()
         app.state.webhook_circuits = {}
@@ -1042,6 +1086,15 @@ def create_app(config: dict[str, Any] | None = None,
             WEBHOOK_DELIVERY_ATTEMPTS_24H.labels(endpoint=endpoint_id).set(endpoint["attempt_count"])
             WEBHOOK_DELIVERY_SUCCESS_RATE.labels(endpoint=endpoint_id).set(endpoint["success_rate"] or 0.0)
             WEBHOOK_CIRCUIT_STATE.labels(endpoint=endpoint_id).set(int(is_open))
+        audit_retention_days = int(cfg.get("server", {}).get("admin_audit_retention_days", 3650))
+        warning_days = int(cfg.get("server", {}).get("admin_audit_retention_warning_days",
+                                                     min(30, audit_retention_days)))
+        archive_health = await asyncio.to_thread(request.app.state.store.admin_audit_archive_health,
+            audit_retention_days, warning_days)
+        AUDIT_ARCHIVE_LATEST_AGE.set(archive_health["latest_archive_age_seconds"]
+            if archive_health["latest_archive_age_seconds"] is not None else float("inf"))
+        AUDIT_ARCHIVE_VERIFICATION_FAILURES.set(archive_health["verification_failures"])
+        AUDIT_RECORDS_APPROACHING_RETENTION.set(archive_health["records_approaching_retention"])
         body, content_type = metrics_response()
         return Response(content=body, media_type=content_type)
 
@@ -2420,7 +2473,9 @@ def create_app(config: dict[str, Any] | None = None,
     async def create_admin_audit_hold(body: AuditHoldRequest, request: Request) -> dict[str, Any]:
         try:
             hold = await asyncio.to_thread(request.app.state.store.create_admin_audit_hold,
-                body.event_id, request.state.admin_actor, body.reason)
+                body.event_id, request.state.admin_actor, body.reason.strip(),
+                case_reference=body.case_reference.strip() if body.case_reference else None,
+                notes=body.notes, review_at=body.review_at)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not hold:
@@ -2442,45 +2497,72 @@ def create_app(config: dict[str, Any] | None = None,
         archives = await asyncio.to_thread(request.app.state.store.admin_audit_archives, limit)
         return {"archives": archives}
 
+    @app.get("/v1/admin/audit/archives/{archive_id}",
+             dependencies=[Depends(admin_dependency("audit"))])
+    async def retrieve_admin_audit_archive(archive_id: str, request: Request) -> dict[str, Any]:
+        record = await asyncio.to_thread(request.app.state.store.get_admin_audit_archive, archive_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Audit archive not found")
+        try:
+            result = await asyncio.to_thread(verify_archive_lineage,
+                request.app.state.store, request.app.state.artifacts, archive_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=409, detail="Audit archive object is missing") from exc
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(status_code=409, detail={"message": "Audit archive verification failed",
+                "reason": str(exc)}) from exc
+        result["verification"]["trust"] = "embedded-key-unpinned"
+        await asyncio.to_thread(request.app.state.store.record_admin_audit_archive_verification,
+            archive_id, True, "archive objects, signature, chain, and lineage verified")
+        return result
+
+    @app.get("/v1/admin/audit/archive-health", dependencies=[Depends(admin_dependency("audit"))])
+    async def admin_audit_archive_health(request: Request) -> dict[str, Any]:
+        server = cfg.get("server", {})
+        retention_days = int(server.get("admin_audit_retention_days", 3650))
+        return await asyncio.to_thread(request.app.state.store.admin_audit_archive_health,
+            retention_days, int(server.get("admin_audit_retention_warning_days", min(30, retention_days))))
+
+    @app.post("/v1/admin/audit/archives/{archive_id}/verify",
+              dependencies=[Depends(admin_dependency("audit"))])
+    async def verify_admin_audit_archive(archive_id: str, request: Request) -> dict[str, Any]:
+        stored = await asyncio.to_thread(request.app.state.store.get_admin_audit_archive, archive_id)
+        if not stored:
+            raise HTTPException(status_code=404, detail="Audit archive not found")
+        valid, detail = False, "archive verification could not be completed"
+        try:
+            result = await asyncio.to_thread(verify_archive_lineage,
+                request.app.state.store, request.app.state.artifacts, archive_id)
+            valid = result["verification"]["verified"]
+            detail = "archive objects, signature, chain, and lineage verified"
+        except FileNotFoundError:
+            detail = "archive manifest or data object is missing"
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+            detail = f"archive verification failed: {exc}"
+        await asyncio.to_thread(request.app.state.store.record_admin_audit_archive_verification,
+            archive_id, valid, detail)
+        return {"archive_id": archive_id, "verified": valid, "trust": "embedded-key-unpinned",
+                "detail": detail, "lineage_archives_verified":
+                    result["verification"]["archives_verified"] if valid else 0}
+
     @app.post("/v1/admin/audit/archive", dependencies=[Depends(admin_dependency("audit"))], status_code=201)
     async def archive_admin_audit(request: Request) -> dict[str, Any]:
-        export = await asyncio.to_thread(request.app.state.store.export_audit_events)
-        if not export["chain"]["verified"]:
-            raise HTTPException(status_code=409, detail={"message": "Admin audit chain integrity check failed",
-                "first_invalid_id": export["chain"]["first_invalid_id"]})
-        try:
-            signed_export = configured_audit_signature(export, cfg)
-        except (ValueError, TypeError) as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        archive_id = uuid.uuid4().hex
-        created_at = datetime.now(UTC).isoformat()
-        events_key = f"audit-archives/{archive_id}/events.json"
-        manifest_key = f"audit-archives/{archive_id}/manifest.json"
-        data = json.dumps(signed_export, sort_keys=True, separators=(",", ":"),
-                          ensure_ascii=False).encode("utf-8")
-        events = export["events"]
-        signature = signed_export["signature"]
-        manifest = {"format": "llm-gateway-audit-archive-v1", "archive_id": archive_id,
-            "created_at": created_at, "created_by": request.state.admin_actor,
-            "events_key": events_key, "manifest_key": manifest_key,
-            "event_count": len(events), "first_event_id": min((event["id"] for event in events), default=None),
-            "last_event_id": max((event["id"] for event in events), default=None),
-            "chain": export["chain"], "export_sha256": export["export_sha256"],
-            "data_sha256": hashlib.sha256(data).hexdigest(), "signature_key_id": signature["key_id"]}
-        manifest_data = json.dumps(manifest, sort_keys=True, separators=(",", ":"),
-                                   ensure_ascii=False).encode("utf-8")
-        try:
-            await asyncio.to_thread(request.app.state.artifacts.put, events_key, data, "application/json")
-            await asyncio.to_thread(request.app.state.artifacts.put, manifest_key, manifest_data,
-                                    "application/json")
-            await asyncio.to_thread(request.app.state.store.record_admin_audit_archive, manifest)
-        except Exception as exc:
-            for key in (manifest_key, events_key):
-                try:
-                    await asyncio.to_thread(request.app.state.artifacts.delete, key)
-                except Exception:
-                    logger.exception("audit_archive_cleanup_failed archive_id=%s", archive_id)
-            raise HTTPException(status_code=503, detail="Unable to persist the audit archive") from exc
+        lease_seconds = int(cfg.get("server", {}).get("maintenance_lease_seconds", 3600))
+        async with request.app.state.audit_archive_lock:
+            lease = await _acquire_maintenance_lease(request.app, "retention", lease_seconds)
+            if lease is None:
+                raise HTTPException(status_code=409,
+                    detail="Audit archive or retention maintenance is already running")
+            try:
+                async with _maintenance_task_metrics("retention", request.app, lease, lease_seconds):
+                    manifest = await asyncio.to_thread(create_admin_audit_archive,
+                        request.app.state.store, request.app.state.artifacts, cfg,
+                        request.state.admin_actor, lease)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.exception("audit_archive_failed")
+                raise HTTPException(status_code=503, detail="Unable to persist the audit archive") from exc
         return manifest
 
     @app.get("/v1/admin/tool-audit", dependencies=[Depends(admin_dependency("audit"))])
