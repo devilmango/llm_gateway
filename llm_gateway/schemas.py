@@ -155,6 +155,17 @@ class ToolApprovalDecisionRequest(BaseModel):
     expires_in_seconds: int | None = Field(default=None, ge=1, le=604800)
 
 
+class AuditHoldRequest(BaseModel):
+    event_id: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_reason(self) -> AuditHoldRequest:
+        if not self.reason.strip():
+            raise ValueError("reason must not be blank")
+        return self
+
+
 class ChatMessage(BaseModel):
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | list[dict[str, Any]] | None = None

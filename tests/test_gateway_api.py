@@ -1112,6 +1112,7 @@ async def test_oidc_scopes_audit_log_and_dashboard(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_AUDIT_SIGNING_KEY", private_pem)
     cfg["server"].update({"audit_signing_key_id": "audit-test-2026",
         "audit_signing_private_key_env": "TEST_AUDIT_SIGNING_KEY"})
+    cfg["object_storage"] = {"backend": "local", "directory": str(tmp_path / "audit-archives")}
     cfg["security"]["oidc"] = {"enabled": True, "issuer": "https://identity.test/",
         "audience": "llm-gateway", "jwks_url": "https://identity.test/jwks"}
     async with gateway_client(cfg, httpx.MockTransport(lambda request: success_response())) as client:
@@ -1134,6 +1135,31 @@ async def test_oidc_scopes_audit_log_and_dashboard(tmp_path, monkeypatch):
             params={"actor": "finance-user", "action": "GET /v1/admin/report", "limit": 1})
         assert filtered.status_code == 200
         assert all(event["actor"] == "finance-user" for event in filtered.json()["events"])
+        held_event_id = filtered.json()["events"][0]["id"]
+        held = await client.post("/v1/admin/audit/holds", headers={"Authorization": "Bearer audit-token"},
+            json={"event_id": held_event_id, "reason": "Compliance investigation CASE-42"})
+        assert held.status_code == 201
+        holds = await client.get("/v1/admin/audit/holds", headers={"Authorization": "Bearer audit-token"})
+        assert any(item["event_id"] == held_event_id for item in holds.json()["holds"])
+        released = await client.post(f"/v1/admin/audit/holds/{held_event_id}/release",
+            headers={"Authorization": "Bearer audit-token"})
+        assert released.status_code == 200
+        archived = await client.post("/v1/admin/audit/archive",
+            headers={"Authorization": "Bearer audit-token"})
+        assert archived.status_code == 201
+        from pathlib import Path
+        archive_manifest = archived.json()
+        archive_root = Path(cfg["object_storage"]["directory"])
+        events_bytes = (archive_root / archive_manifest["events_key"]).read_bytes()
+        stored_manifest = json.loads((archive_root / archive_manifest["manifest_key"]).read_text())
+        assert hashlib.sha256(events_bytes).hexdigest() == archive_manifest["data_sha256"]
+        assert stored_manifest == archive_manifest
+        valid_archive, archive_message = verify_export(json.loads(events_bytes), public_pem)
+        assert valid_archive, archive_message
+        archives = await client.get("/v1/admin/audit/archives",
+            headers={"Authorization": "Bearer audit-token"})
+        assert archives.status_code == 200
+        assert archives.json()["archives"][0]["archive_id"] == archive_manifest["archive_id"]
 
 
 @pytest.mark.asyncio
@@ -3024,6 +3050,32 @@ def test_admin_audit_hash_chain_export_retention_and_tamper_detection(tmp_path):
     assert store.audit_chain_status()["verified"] is False
     with pytest.raises(ValueError, match="integrity check failed"):
         store.prune_admin_audit_events(365, now=fresh)
+
+
+def test_admin_audit_retention_hold_preserves_event_until_release(tmp_path):
+    store = create_usage_store(str(tmp_path / "audit-hold.sqlite3"))
+    now = datetime.now(UTC)
+    expired_at = now - timedelta(days=500)
+    store.record_audit("operator", "investigation_event", 200, expired_at)
+    target_id = store.audit_events(limit=1)[0]["id"]
+    hold = store.create_admin_audit_hold(target_id, "compliance", "Preserve CASE-9", now)
+    assert hold["event_id"] == target_id
+    with pytest.raises(ValueError, match="already has an active retention hold"):
+        store.create_admin_audit_hold(target_id, "compliance", "duplicate", now)
+
+    pruned = store.prune_admin_audit_events(365, now=now)
+    assert pruned["deleted"] == 0
+    assert pruned["held_event_id"] == target_id
+    assert any(event["id"] == target_id for event in store.audit_events(limit=10))
+    assert store.audit_chain_status()["verified"] is True
+
+    released = store.release_admin_audit_hold(target_id, "compliance", now)
+    assert released["released_by"] == "compliance"
+    assert store.admin_audit_holds(active_only=True) == []
+    pruned = store.prune_admin_audit_events(365, now=now)
+    assert pruned["deleted"] >= 1
+    assert all(event["id"] != target_id for event in store.audit_events(limit=20))
+    assert store.audit_chain_status()["verified"] is True
 
 
 def test_audit_export_verifier_reports_first_broken_chain_link(tmp_path):

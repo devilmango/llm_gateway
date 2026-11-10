@@ -106,6 +106,20 @@ class PostgresUsageStore:
             "ALTER TABLE admin_audit_events ADD COLUMN IF NOT EXISTS previous_hash TEXT",
             "ALTER TABLE admin_audit_events ADD COLUMN IF NOT EXISTS entry_hash TEXT",
             "CREATE INDEX IF NOT EXISTS idx_admin_audit_time ON admin_audit_events(occurred_at)",
+            """CREATE TABLE IF NOT EXISTS admin_audit_holds (
+                id BIGSERIAL PRIMARY KEY, event_id BIGINT NOT NULL,
+                reason TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+                released_by TEXT, released_at TEXT
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_admin_audit_holds_active ON admin_audit_holds(event_id,released_at)",
+            ("CREATE UNIQUE INDEX IF NOT EXISTS idx_admin_audit_holds_one_active "
+             "ON admin_audit_holds(event_id) WHERE released_at IS NULL"),
+            """CREATE TABLE IF NOT EXISTS admin_audit_archives (
+                archive_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, created_by TEXT NOT NULL,
+                events_key TEXT NOT NULL, manifest_key TEXT NOT NULL, event_count INTEGER NOT NULL,
+                data_sha256 TEXT NOT NULL, manifest_json JSONB NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_admin_audit_archives_time ON admin_audit_archives(created_at)",
             """CREATE TABLE IF NOT EXISTS admin_audit_chain_state (
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1), anchor_id BIGINT NOT NULL,
                 anchor_hash TEXT NOT NULL
@@ -1046,11 +1060,13 @@ class PostgresUsageStore:
                 "head_hash": previous, "first_invalid_id": invalid_id}
 
     def audit_chain_status(self) -> dict[str, Any]:
-        with self.pool.connection() as conn, conn.cursor() as cursor:
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             return self._audit_chain_status(cursor)
 
     def export_audit_events(self) -> dict[str, Any]:
-        with self.pool.connection() as conn, conn.cursor() as cursor:
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             status = self._audit_chain_status(cursor)
             cursor.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
                            "FROM admin_audit_events ORDER BY id DESC")
@@ -1071,19 +1087,96 @@ class PostgresUsageStore:
             status = self._audit_chain_status(cursor)
             if not status["verified"]:
                 raise ValueError(f"admin audit chain integrity check failed at event {status['first_invalid_id']}")
-            cursor.execute("SELECT id,occurred_at,entry_hash FROM admin_audit_events ORDER BY id FOR UPDATE")
             expired = []
+            held_event_id = None
+            cursor.execute("SELECT event_id FROM admin_audit_holds WHERE released_at IS NULL")
+            active_holds = {int(row["event_id"]) for row in cursor.fetchall()}
+            cursor.execute("SELECT id,occurred_at,entry_hash FROM admin_audit_events ORDER BY id FOR UPDATE")
             for row in cursor.fetchall():
                 if row["occurred_at"] >= cutoff:
                     break
+                if int(row["id"]) in active_holds:
+                    held_event_id = int(row["id"])
+                    break
                 expired.append(row)
             if not expired:
-                return {"deleted": 0, "anchor_id": status["anchor_id"], "anchor_hash": status["anchor_hash"]}
+                return {"deleted": 0, "anchor_id": status["anchor_id"], "anchor_hash": status["anchor_hash"],
+                        "held_event_id": held_event_id}
             anchor = expired[-1]
             cursor.execute("DELETE FROM admin_audit_events WHERE id<=%s", (anchor["id"],))
             cursor.execute("UPDATE admin_audit_chain_state SET anchor_id=%s,anchor_hash=%s WHERE singleton=1",
                            (anchor["id"], anchor["entry_hash"]))
-            return {"deleted": len(expired), "anchor_id": int(anchor["id"]), "anchor_hash": anchor["entry_hash"]}
+            return {"deleted": len(expired), "anchor_id": int(anchor["id"]),
+                    "anchor_hash": anchor["entry_hash"], "held_event_id": held_event_id}
+
+    def create_admin_audit_hold(self, event_id: int, actor: str, reason: str,
+                                now: datetime | None = None) -> dict[str, Any] | None:
+        now = now or datetime.now(UTC)
+        occurred_at = now.isoformat()
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('llm_gateway_admin_audit_chain'))")
+            cursor.execute("SELECT id FROM admin_audit_events WHERE id=%s FOR UPDATE", (event_id,))
+            if not cursor.fetchone():
+                return None
+            cursor.execute("SELECT id FROM admin_audit_holds WHERE event_id=%s AND released_at IS NULL FOR UPDATE",
+                           (event_id,))
+            if cursor.fetchone():
+                raise ValueError(f"audit event {event_id} already has an active retention hold")
+            cursor.execute("INSERT INTO admin_audit_holds (event_id,reason,created_by,created_at) "
+                           "VALUES (%s,%s,%s,%s) RETURNING id", (event_id, reason, actor, occurred_at))
+            hold_id = cursor.fetchone()["id"]
+            self._append_audit(cursor, actor, f"audit_hold_created:{event_id}", 201, occurred_at)
+            return {"hold_id": int(hold_id), "event_id": event_id, "reason": reason,
+                    "created_by": actor, "created_at": occurred_at, "released_by": None, "released_at": None}
+
+    def release_admin_audit_hold(self, event_id: int, actor: str,
+                                 now: datetime | None = None) -> dict[str, Any] | None:
+        now = now or datetime.now(UTC)
+        occurred_at = now.isoformat()
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('llm_gateway_admin_audit_chain'))")
+            cursor.execute("SELECT id,reason,created_by,created_at FROM admin_audit_holds "
+                           "WHERE event_id=%s AND released_at IS NULL FOR UPDATE", (event_id,))
+            hold = cursor.fetchone()
+            if not hold:
+                return None
+            cursor.execute("UPDATE admin_audit_holds SET released_by=%s,released_at=%s WHERE id=%s",
+                           (actor, occurred_at, hold["id"]))
+            self._append_audit(cursor, actor, f"audit_hold_released:{event_id}", 200, occurred_at)
+            return {"hold_id": int(hold["id"]), "event_id": event_id, "reason": hold["reason"],
+                    "created_by": hold["created_by"], "created_at": hold["created_at"],
+                    "released_by": actor, "released_at": occurred_at}
+
+    def admin_audit_holds(self, *, active_only: bool = True, limit: int = 100) -> list[dict[str, Any]]:
+        where = "WHERE h.released_at IS NULL" if active_only else ""
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute(f"""SELECT h.id AS hold_id,h.event_id,h.reason,h.created_by,h.created_at,
+                h.released_by,h.released_at,e.actor AS event_actor,e.action AS event_action,
+                e.occurred_at AS event_occurred_at FROM admin_audit_holds h
+                LEFT JOIN admin_audit_events e ON e.id=h.event_id {where}
+                ORDER BY h.id DESC LIMIT %s""", (limit,))
+            return cursor.fetchall()
+
+    def record_admin_audit_archive(self, manifest: dict[str, Any]) -> None:
+        occurred_at, actor, archive_id = manifest["created_at"], manifest["created_by"], manifest["archive_id"]
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("INSERT INTO admin_audit_archives (archive_id,created_at,created_by,events_key,manifest_key,"
+                "event_count,data_sha256,manifest_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (archive_id, occurred_at, actor, manifest["events_key"], manifest["manifest_key"],
+                 manifest["event_count"], manifest["data_sha256"], json.dumps(manifest, sort_keys=True)))
+            self._append_audit(cursor, actor, f"audit_archive_created:{archive_id}", 201, occurred_at)
+
+    def admin_audit_archives(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT archive_id,created_at,created_by,events_key,manifest_key,event_count,"
+                           "data_sha256,manifest_json FROM admin_audit_archives ORDER BY created_at DESC LIMIT %s",
+                           (limit,))
+            archives = cursor.fetchall()
+        for archive in archives:
+            if isinstance(archive["manifest_json"], str):
+                archive["manifest_json"] = json.loads(archive["manifest_json"])
+            archive["manifest"] = archive.pop("manifest_json")
+        return archives
 
     def audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.pool.connection() as conn, conn.cursor() as cursor:

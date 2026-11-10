@@ -73,6 +73,7 @@ from .observability import (
 from .providers import ProviderError
 from .redaction import redact
 from .schemas import (
+    AuditHoldRequest,
     ChatChoice,
     ChatRequest,
     ChatResponse,
@@ -2406,6 +2407,81 @@ def create_app(config: dict[str, Any] | None = None,
         body = json.dumps(export, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return Response(body, media_type="application/json",
             headers={"Content-Disposition": 'attachment; filename="llm-gateway-admin-audit.json"'})
+
+    @app.get("/v1/admin/audit/holds", dependencies=[Depends(admin_dependency("audit"))])
+    async def list_admin_audit_holds(request: Request,
+                                    active_only: bool = True,
+                                    limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
+        holds = await asyncio.to_thread(request.app.state.store.admin_audit_holds,
+                                        active_only=active_only, limit=limit)
+        return {"holds": holds}
+
+    @app.post("/v1/admin/audit/holds", dependencies=[Depends(admin_dependency("audit"))], status_code=201)
+    async def create_admin_audit_hold(body: AuditHoldRequest, request: Request) -> dict[str, Any]:
+        try:
+            hold = await asyncio.to_thread(request.app.state.store.create_admin_audit_hold,
+                body.event_id, request.state.admin_actor, body.reason)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not hold:
+            raise HTTPException(status_code=404, detail="Audit event not found")
+        return hold
+
+    @app.post("/v1/admin/audit/holds/{event_id}/release",
+              dependencies=[Depends(admin_dependency("audit"))])
+    async def release_admin_audit_hold(event_id: int, request: Request) -> dict[str, Any]:
+        hold = await asyncio.to_thread(request.app.state.store.release_admin_audit_hold,
+            event_id, request.state.admin_actor)
+        if not hold:
+            raise HTTPException(status_code=404, detail="Active audit hold not found")
+        return hold
+
+    @app.get("/v1/admin/audit/archives", dependencies=[Depends(admin_dependency("audit"))])
+    async def list_admin_audit_archives(request: Request,
+                                        limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
+        archives = await asyncio.to_thread(request.app.state.store.admin_audit_archives, limit)
+        return {"archives": archives}
+
+    @app.post("/v1/admin/audit/archive", dependencies=[Depends(admin_dependency("audit"))], status_code=201)
+    async def archive_admin_audit(request: Request) -> dict[str, Any]:
+        export = await asyncio.to_thread(request.app.state.store.export_audit_events)
+        if not export["chain"]["verified"]:
+            raise HTTPException(status_code=409, detail={"message": "Admin audit chain integrity check failed",
+                "first_invalid_id": export["chain"]["first_invalid_id"]})
+        try:
+            signed_export = configured_audit_signature(export, cfg)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        archive_id = uuid.uuid4().hex
+        created_at = datetime.now(UTC).isoformat()
+        events_key = f"audit-archives/{archive_id}/events.json"
+        manifest_key = f"audit-archives/{archive_id}/manifest.json"
+        data = json.dumps(signed_export, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False).encode("utf-8")
+        events = export["events"]
+        signature = signed_export["signature"]
+        manifest = {"format": "llm-gateway-audit-archive-v1", "archive_id": archive_id,
+            "created_at": created_at, "created_by": request.state.admin_actor,
+            "events_key": events_key, "manifest_key": manifest_key,
+            "event_count": len(events), "first_event_id": min((event["id"] for event in events), default=None),
+            "last_event_id": max((event["id"] for event in events), default=None),
+            "chain": export["chain"], "export_sha256": export["export_sha256"],
+            "data_sha256": hashlib.sha256(data).hexdigest(), "signature_key_id": signature["key_id"]}
+        manifest_data = json.dumps(manifest, sort_keys=True, separators=(",", ":"),
+                                   ensure_ascii=False).encode("utf-8")
+        try:
+            await asyncio.to_thread(request.app.state.artifacts.put, events_key, data, "application/json")
+            await asyncio.to_thread(request.app.state.artifacts.put, manifest_key, manifest_data,
+                                    "application/json")
+            await asyncio.to_thread(request.app.state.store.record_admin_audit_archive, manifest)
+        except Exception as exc:
+            for key in (manifest_key, events_key):
+                try:
+                    await asyncio.to_thread(request.app.state.artifacts.delete, key)
+                except Exception:
+                    logger.exception("audit_archive_cleanup_failed archive_id=%s", archive_id)
+            raise HTTPException(status_code=503, detail="Unable to persist the audit archive") from exc
+        return manifest
 
     @app.get("/v1/admin/tool-audit", dependencies=[Depends(admin_dependency("audit"))])
     async def tool_audit_events(request: Request, tenant_id: str | None = Query(default=None),
