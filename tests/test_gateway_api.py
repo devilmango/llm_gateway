@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import struct
+import subprocess
 import sys
 import zlib
 from contextlib import asynccontextmanager
@@ -18,13 +19,14 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+from llm_gateway.audit_cli import verify_export
 from llm_gateway.client import ToolApprovalError, execute_tool_with_approval
 from llm_gateway.evaluation import compare_routes, evaluate_cases
 from llm_gateway.main import _deliver_webhook_batch, _emit_async_job_event, create_app
 from llm_gateway.observability import metrics_response
 from llm_gateway.providers import ProviderClient
 from llm_gateway.schemas import ChatRequest
-from llm_gateway.storage import create_usage_store
+from llm_gateway.storage import MaintenanceLeaseLost, create_usage_store
 from llm_gateway.webhook_security import (
     UnsafeWebhookTarget,
     validate_webhook_url,
@@ -1103,6 +1105,13 @@ async def test_oidc_scopes_audit_log_and_dashboard(tmp_path, monkeypatch):
     fake_jwt.decode = decode
     monkeypatch.setitem(sys.modules, "jwt", fake_jwt)
     cfg = config(str(tmp_path / "oidc.sqlite3"))
+    private_pem = (await asyncio.to_thread(subprocess.run, ["openssl", "genrsa", "2048"],
+        check=True, capture_output=True, text=True)).stdout
+    public_pem = (await asyncio.to_thread(subprocess.run, ["openssl", "rsa", "-pubout"],
+        input=private_pem, check=True, capture_output=True, text=True)).stdout
+    monkeypatch.setenv("TEST_AUDIT_SIGNING_KEY", private_pem)
+    cfg["server"].update({"audit_signing_key_id": "audit-test-2026",
+        "audit_signing_private_key_env": "TEST_AUDIT_SIGNING_KEY"})
     cfg["security"]["oidc"] = {"enabled": True, "issuer": "https://identity.test/",
         "audience": "llm-gateway", "jwks_url": "https://identity.test/jwks"}
     async with gateway_client(cfg, httpx.MockTransport(lambda request: success_response())) as client:
@@ -1119,6 +1128,12 @@ async def test_oidc_scopes_audit_log_and_dashboard(tmp_path, monkeypatch):
         assert exported.status_code == 200
         assert exported.json()["chain"]["verified"] is True
         assert len(exported.json()["export_sha256"]) == 64
+        valid, message = verify_export(exported.json(), public_pem)
+        assert valid, message
+        filtered = await client.get("/v1/admin/audit", headers={"Authorization": "Bearer audit-token"},
+            params={"actor": "finance-user", "action": "GET /v1/admin/report", "limit": 1})
+        assert filtered.status_code == 200
+        assert all(event["actor"] == "finance-user" for event in filtered.json()["events"])
 
 
 @pytest.mark.asyncio
@@ -2372,6 +2387,9 @@ async def test_webhook_retry_after_and_endpoint_circuit_breaker(tmp_path):
     assert "llm_gateway_webhook_deliveries_total" in exposition
     assert "llm_gateway_webhook_delivery_duration_seconds" in exposition
     assert "llm_gateway_webhook_circuit_state" in exposition
+    assert "llm_gateway_maintenance_lease_owned" in exposition
+    assert "llm_gateway_maintenance_lease_seconds_to_expiry" in exposition
+    assert "llm_gateway_maintenance_task_duration_seconds" in exposition
     await app.state.http.aclose()
 
 
@@ -3008,12 +3026,71 @@ def test_admin_audit_hash_chain_export_retention_and_tamper_detection(tmp_path):
         store.prune_admin_audit_events(365, now=fresh)
 
 
+def test_audit_export_verifier_reports_first_broken_chain_link(tmp_path):
+    store = create_usage_store(str(tmp_path / "audit-cli.sqlite3"))
+    store.record_audit("operator", "first", 200)
+    store.record_audit("operator", "second", 201)
+    export = store.export_audit_events()
+    export["signature"] = {"algorithm": "RSA-SHA256", "key_id": "test",
+        "public_key_pem": "ignored", "value": ""}
+    event = min(export["events"], key=lambda item: item["id"])
+    event["action"] = "changed"
+    valid, message = verify_export(export)
+    assert valid is False
+    assert f"event id {event['id']}" in message
+
+
 def test_maintenance_lease_is_exclusive_and_recovers_after_expiry(tmp_path):
     database = str(tmp_path / "maintenance-leases.sqlite3")
     first = create_usage_store(database)
     second = create_usage_store(database)
     now = datetime(2026, 10, 31, tzinfo=UTC)
-    assert first.acquire_maintenance_lease("retention", "replica-a", 60, now)
-    assert second.acquire_maintenance_lease("retention", "replica-b", 60, now) is False
-    assert second.acquire_maintenance_lease("retention", "replica-b", 60,
-        now + timedelta(seconds=61)) is True
+    first_token = first.acquire_maintenance_lease("retention", "replica-a", 60, now)
+    assert first_token == 1
+    assert second.acquire_maintenance_lease("retention", "replica-b", 60, now) is None
+    second_token = second.acquire_maintenance_lease("retention", "replica-b", 60,
+        now + timedelta(seconds=61))
+    assert second_token == 2
+    assert first.renew_maintenance_lease("retention", "replica-a", first_token, 60,
+        now + timedelta(seconds=62)) is False
+
+
+def test_maintenance_lease_renewal_extends_expiry_without_changing_fence(tmp_path):
+    store = create_usage_store(str(tmp_path / "maintenance-renewal.sqlite3"))
+    now = datetime.now(UTC)
+    token = store.acquire_maintenance_lease("retention", "replica-a", 60, now)
+    assert token == 1
+    assert store.renew_maintenance_lease("retention", "replica-a", token, 60,
+        now + timedelta(seconds=30)) is True
+    state = store.maintenance_lease_state("retention", now + timedelta(seconds=30))
+    assert state["fencing_token"] == token
+    assert state["remaining_seconds"] == 60
+    assert store.acquire_maintenance_lease("retention", "replica-b", 60,
+        now + timedelta(seconds=61)) is None
+
+
+def test_audit_query_uses_filtered_cursor_pagination(tmp_path):
+    store = create_usage_store(str(tmp_path / "audit-pages.sqlite3"))
+    for actor, action, status in (("alice", "read", 200), ("bob", "write", 202),
+                                  ("alice", "read", 200), ("alice", "delete", 403)):
+        store.record_audit(actor, action, status)
+    first = store.query_audit_events(limit=1, actor="alice", action="read", status_code=200)
+    assert [event["actor"] for event in first["events"]] == ["alice"]
+    assert first["next_cursor"] is not None
+    second = store.query_audit_events(limit=1, cursor=first["next_cursor"],
+                                      actor="alice", action="read", status_code=200)
+    assert len(second["events"]) == 1
+    assert second["next_cursor"] is None
+
+
+def test_expired_maintenance_owner_is_fenced_from_pruning(tmp_path):
+    store = create_usage_store(str(tmp_path / "maintenance-fence.sqlite3"))
+    now = datetime.now(UTC)
+    first = store.acquire_maintenance_lease("retention", "replica-a", 30, now)
+    store.record_audit("operator", "old_event", 200, now - timedelta(days=400))
+    second = store.acquire_maintenance_lease("retention", "replica-b", 30,
+        now + timedelta(seconds=31))
+    assert second == first + 1
+    stale_lease = {"name": "retention", "owner_id": "replica-a", "fencing_token": first}
+    with pytest.raises(MaintenanceLeaseLost):
+        store.prune_admin_audit_events(365, now=now, lease=stale_lease)

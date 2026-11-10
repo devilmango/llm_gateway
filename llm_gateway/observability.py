@@ -66,6 +66,22 @@ WEBHOOK_CIRCUIT_STATE = Gauge(
     ["endpoint"], registry=REGISTRY,
 )
 WEBHOOK_CIRCUIT_STATE.labels(endpoint="uninitialized").set(0)
+MAINTENANCE_LEASE_OWNED = Gauge(
+    "llm_gateway_maintenance_lease_owned", "Whether this gateway replica currently owns a maintenance lease",
+    ["task"], registry=REGISTRY,
+)
+MAINTENANCE_LEASE_SECONDS_TO_EXPIRY = Gauge(
+    "llm_gateway_maintenance_lease_seconds_to_expiry", "Seconds until the observed maintenance lease expires",
+    ["task"], registry=REGISTRY,
+)
+MAINTENANCE_TASK_DURATION = Histogram(
+    "llm_gateway_maintenance_task_duration_seconds", "Duration of coordinated maintenance tasks",
+    ["task", "outcome"], registry=REGISTRY,
+    buckets=(0.1, 1, 5, 15, 30, 60, 300, 900, 3600),
+)
+for _maintenance_name in ("retention", "async-job-recovery"):
+    MAINTENANCE_LEASE_OWNED.labels(task=_maintenance_name).set(0)
+    MAINTENANCE_LEASE_SECONDS_TO_EXPIRY.labels(task=_maintenance_name).set(0)
 
 # GenAI semantic-convention metric names and bounded attributes. These mirror the
 # corresponding OTel instruments so Prometheus dashboards can use the same concepts.

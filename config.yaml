@@ -15,6 +15,9 @@ server:
   webhook_retention_days: 90
   admin_audit_retention_days: 3650
   maintenance_lease_seconds: 3600
+  # Optional: both values are required to sign audit exports.
+  # audit_signing_key_id: audit-2026-11
+  # audit_signing_private_key_env: LLM_GATEWAY_AUDIT_PRIVATE_KEY
   webhook_dns_timeout_seconds: 2
   webhooks_allow_private_targets: false
 

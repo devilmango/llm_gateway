@@ -37,6 +37,7 @@ dev = [
 [project.scripts]
 llm-gateway = "llm_gateway.main:run"
 llm-gateway-eval = "llm_gateway.evaluation:main"
+llm-gateway-audit = "llm_gateway.audit_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

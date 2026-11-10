@@ -9,14 +9,15 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from .audit_security import audit_entry_hash, canonical_json
 from .config import MIN_TENANT_USAGE_RETENTION_DAYS
 from .storage import (
     AUDIT_GENESIS_HASH,
     AsyncJobIdempotencyConflict,
     AsyncJobQueueLimitExceeded,
     BudgetExceeded,
+    MaintenanceLeaseLost,
     WebhookEndpointBusy,
-    audit_entry_hash,
 )
 from .webhook_security import webhook_endpoint_id
 
@@ -111,8 +112,10 @@ class PostgresUsageStore:
             )""",
             "INSERT INTO admin_audit_chain_state VALUES (1,0,'" + AUDIT_GENESIS_HASH + "') ON CONFLICT (singleton) DO NOTHING",
             """CREATE TABLE IF NOT EXISTS maintenance_leases (
-                lease_name TEXT PRIMARY KEY, owner_id TEXT NOT NULL, lease_until TEXT NOT NULL
+                lease_name TEXT PRIMARY KEY, owner_id TEXT NOT NULL, lease_until TEXT NOT NULL,
+                fencing_token BIGINT NOT NULL DEFAULT 1
             )""",
+            "ALTER TABLE maintenance_leases ADD COLUMN IF NOT EXISTS fencing_token BIGINT NOT NULL DEFAULT 1",
             """CREATE TABLE IF NOT EXISTS tool_call_audits (
                 id BIGSERIAL PRIMARY KEY, request_id TEXT NOT NULL, tenant_id TEXT,
                 application TEXT NOT NULL, occurred_at TEXT NOT NULL, tool_name TEXT NOT NULL,
@@ -198,6 +201,10 @@ class PostgresUsageStore:
             cursor.execute("SELECT pg_advisory_xact_lock(hashtext('llm_gateway_admin_audit_chain'))")
             cursor.execute("SELECT anchor_id,anchor_hash FROM admin_audit_chain_state WHERE singleton=1")
             state = cursor.fetchone()
+            cursor.execute("SELECT 1 FROM admin_audit_events WHERE id>%s "
+                           "AND (previous_hash IS NULL OR entry_hash IS NULL) LIMIT 1", (state["anchor_id"],))
+            if not cursor.fetchone():
+                return
             previous = state["anchor_hash"]
             cursor.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
                            "FROM admin_audit_events WHERE id>%s ORDER BY id FOR UPDATE", (state["anchor_id"],))
@@ -228,18 +235,60 @@ class PostgresUsageStore:
         cursor.execute("UPDATE admin_audit_events SET entry_hash=%s WHERE id=%s", (digest, event_id))
 
     def acquire_maintenance_lease(self, lease_name: str, owner_id: str, lease_seconds: int,
-                                  now: datetime | None = None) -> bool:
+                                  now: datetime | None = None) -> int | None:
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be positive")
         now = now or datetime.now(UTC)
         until = (now + timedelta(seconds=lease_seconds)).isoformat()
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
-            cursor.execute("""INSERT INTO maintenance_leases (lease_name,owner_id,lease_until)
-                VALUES (%s,%s,%s) ON CONFLICT (lease_name) DO UPDATE SET
-                owner_id=EXCLUDED.owner_id,lease_until=EXCLUDED.lease_until
-                WHERE maintenance_leases.lease_until<=%s OR maintenance_leases.owner_id=%s""",
-                (lease_name, owner_id, until, now.isoformat(), owner_id))
+            cursor.execute("""INSERT INTO maintenance_leases (lease_name,owner_id,lease_until,fencing_token)
+                VALUES (%s,%s,%s,1) ON CONFLICT (lease_name) DO UPDATE SET
+                fencing_token=CASE WHEN maintenance_leases.lease_until<=%s
+                    THEN maintenance_leases.fencing_token+1 ELSE maintenance_leases.fencing_token END,
+                owner_id=CASE WHEN maintenance_leases.lease_until<=%s THEN EXCLUDED.owner_id
+                    ELSE maintenance_leases.owner_id END,
+                lease_until=EXCLUDED.lease_until
+                WHERE maintenance_leases.lease_until<=%s OR maintenance_leases.owner_id=%s
+                RETURNING fencing_token""",
+                (lease_name, owner_id, until, now.isoformat(), now.isoformat(), now.isoformat(), owner_id))
+            row = cursor.fetchone()
+            return int(row["fencing_token"]) if row else None
+
+    def renew_maintenance_lease(self, lease_name: str, owner_id: str, fencing_token: int,
+                                lease_seconds: int, now: datetime | None = None) -> bool:
+        now = now or datetime.now(UTC)
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            cursor.execute("""UPDATE maintenance_leases SET lease_until=%s WHERE lease_name=%s
+                AND owner_id=%s AND fencing_token=%s AND lease_until>%s""",
+                ((now + timedelta(seconds=lease_seconds)).isoformat(), lease_name, owner_id,
+                 fencing_token, now.isoformat()))
             return cursor.rowcount == 1
+
+    def maintenance_lease_state(self, lease_name: str, now: datetime | None = None) -> dict[str, Any] | None:
+        now = now or datetime.now(UTC)
+        with self.pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT owner_id,lease_until,fencing_token FROM maintenance_leases WHERE lease_name=%s",
+                           (lease_name,))
+            row = cursor.fetchone()
+        if not row:
+            return None
+        expires = datetime.fromisoformat(row["lease_until"])
+        remaining = max(0.0, (expires - now).total_seconds())
+        return {"owner_id": row["owner_id"], "lease_until": row["lease_until"],
+                "fencing_token": int(row["fencing_token"]), "remaining_seconds": remaining,
+                "active": remaining > 0}
+
+    @staticmethod
+    def _assert_maintenance_lease(cursor, lease: dict[str, Any] | None) -> None:
+        if lease is None:
+            return
+        cursor.execute("""SELECT owner_id,lease_until,fencing_token FROM maintenance_leases
+            WHERE lease_name=%s FOR UPDATE""", (lease["name"],))
+        row = cursor.fetchone()
+        if (not row or row["owner_id"] != lease["owner_id"]
+                or int(row["fencing_token"]) != int(lease["fencing_token"])
+                or row["lease_until"] <= datetime.now(UTC).isoformat()):
+            raise MaintenanceLeaseLost(f"maintenance lease {lease['name']!r} expired or was fenced")
 
     def reserve_budget(self, request_id: str, application: str, amount_usd: float, monthly_limit_usd: float,
                        now: datetime | None = None) -> None:
@@ -323,13 +372,15 @@ class PostgresUsageStore:
         return {"source": source, "reconciled_requests": len(records), "reconciled_at": reconciled_at.isoformat()}
 
     def prune_tenant_requests(self, tenant_id: str, retention_days: int,
-                              now: datetime | None = None) -> int:
+                              now: datetime | None = None,
+                              lease: dict[str, Any] | None = None) -> int:
         if int(retention_days) < MIN_TENANT_USAGE_RETENTION_DAYS:
             raise ValueError(f"usage_retention_days must be at least {MIN_TENANT_USAGE_RETENTION_DAYS}")
         now = now or datetime.now(UTC)
         cutoff = (now - timedelta(days=int(retention_days))).isoformat()
         prefix = f"{tenant_id}:"
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            self._assert_maintenance_lease(cursor, lease)
             deleted = 0
             for table in ("requests", "routing_decisions", "shadow_observations"):
                 cursor.execute(f"DELETE FROM {table} WHERE left(application, length(%s))=%s AND occurred_at < %s",
@@ -564,9 +615,11 @@ class PostgresUsageStore:
             return status
 
     def recover_stalled_async_jobs(self, *, max_attempts: int, base_delay_seconds: float,
-                                   max_delay_seconds: float) -> int:
+                                   max_delay_seconds: float,
+                                   lease: dict[str, Any] | None = None) -> int:
         now = datetime.now(UTC)
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            self._assert_maintenance_lease(cursor, lease)
             cursor.execute("""SELECT job_id, attempt_count, cancel_requested FROM async_jobs
                 WHERE status='running' AND lease_until <= %s FOR UPDATE""", (now.isoformat(),))
             stalled = cursor.fetchall()
@@ -691,9 +744,11 @@ class PostgresUsageStore:
                     keys.add(value["artifact_key"])
         return sorted(keys)
 
-    def prune_tenant_async_jobs(self, tenant_id: str, retention_days: int) -> int:
+    def prune_tenant_async_jobs(self, tenant_id: str, retention_days: int,
+                                lease: dict[str, Any] | None = None) -> int:
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            self._assert_maintenance_lease(cursor, lease)
             cursor.execute("""DELETE FROM async_jobs WHERE tenant_id=%s
                 AND status IN ('completed','failed','cancelled','dead_letter')
                 AND COALESCE(completed_at, updated_at, created_at) < %s""", (tenant_id, cutoff))
@@ -841,12 +896,14 @@ class PostgresUsageStore:
                 self._append_audit(cursor, actor, f"webhook_redrive:{event_id}", 202, now.isoformat())
             return redriven
 
-    def prune_webhook_history(self, retention_days: int, now: datetime | None = None) -> dict[str, int]:
+    def prune_webhook_history(self, retention_days: int, now: datetime | None = None,
+                              lease: dict[str, Any] | None = None) -> dict[str, int]:
         if not isinstance(retention_days, int) or isinstance(retention_days, bool) or retention_days < 1:
             raise ValueError("retention_days must be a positive integer")
         cutoff = ((now or datetime.now(UTC)) - timedelta(days=retention_days)).isoformat()
         terminal = "SELECT event_id FROM webhook_outbox WHERE status IN ('delivered','dead_letter') AND COALESCE(delivered_at,updated_at,created_at) < %s"
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            self._assert_maintenance_lease(cursor, lease)
             cursor.execute(f"DELETE FROM webhook_delivery_attempts WHERE event_id IN ({terminal})", (cutoff,))
             attempts = cursor.rowcount
             cursor.execute(f"DELETE FROM webhook_outbox WHERE event_id IN ({terminal})", (cutoff,))
@@ -998,16 +1055,18 @@ class PostgresUsageStore:
             cursor.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
                            "FROM admin_audit_events ORDER BY id DESC")
             events = cursor.fetchall()
-        canonical = json.dumps(events, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        canonical = canonical_json(events)
         return {"format": "llm-gateway-admin-audit-v1", "exported_at": datetime.now(UTC).isoformat(),
                 "chain": status, "export_sha256": hashlib.sha256(canonical).hexdigest(), "events": events}
 
-    def prune_admin_audit_events(self, retention_days: int, now: datetime | None = None) -> dict[str, Any]:
+    def prune_admin_audit_events(self, retention_days: int, now: datetime | None = None,
+                                 lease: dict[str, Any] | None = None) -> dict[str, Any]:
         if not isinstance(retention_days, int) or isinstance(retention_days, bool) or retention_days < 1:
             raise ValueError("retention_days must be a positive integer")
         now = now or datetime.now(UTC)
         cutoff = (now - timedelta(days=retention_days)).isoformat()
         with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cursor:
+            self._assert_maintenance_lease(cursor, lease)
             cursor.execute("SELECT pg_advisory_xact_lock(hashtext('llm_gateway_admin_audit_chain'))")
             status = self._audit_chain_status(cursor)
             if not status["verified"]:
@@ -1031,6 +1090,31 @@ class PostgresUsageStore:
             cursor.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash FROM admin_audit_events ORDER BY id DESC LIMIT %s",
                            (limit,))
             return cursor.fetchall()
+
+    def query_audit_events(self, *, limit: int = 100, cursor: int | None = None,
+                           actor: str | None = None, action: str | None = None,
+                           status_code: int | None = None, occurred_from: str | None = None,
+                           occurred_to: str | None = None) -> dict[str, Any]:
+        clauses, values = [], []
+        for column, value in (("id", cursor), ("actor", actor), ("action", action),
+                              ("status_code", status_code)):
+            if value is not None:
+                clauses.append(f"{column} < %s" if column == "id" else f"{column} = %s")
+                values.append(value)
+        if occurred_from is not None:
+            clauses.append("occurred_at >= %s")
+            values.append(occurred_from)
+        if occurred_to is not None:
+            clauses.append("occurred_at <= %s")
+            values.append(occurred_to)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self.pool.connection() as conn, conn.cursor() as db_cursor:
+            db_cursor.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
+                f"FROM admin_audit_events{where} ORDER BY id DESC LIMIT %s", [*values, limit + 1])
+            rows = db_cursor.fetchall()
+        has_more = len(rows) > limit
+        events = rows[:limit]
+        return {"events": events, "next_cursor": events[-1]["id"] if has_more and events else None}
 
     def record_tool_call_audits(self, request_id: str, tenant_id: str | None, application: str,
                                 events: list[dict[str, Any]]) -> None:

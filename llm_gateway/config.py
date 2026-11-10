@@ -49,6 +49,14 @@ def validate_tenant_policies(config: dict[str, Any]) -> None:
         raise ValueError("server.webhook_dns_timeout_seconds must be a positive number")
     if not isinstance(server.get("webhooks_allow_private_targets", False), bool):
         raise TypeError("server.webhooks_allow_private_targets must be a boolean")
+    signing_key_env = server.get("audit_signing_private_key_env")
+    signing_key_id = server.get("audit_signing_key_id")
+    if (signing_key_env is None) != (signing_key_id is None):
+        raise ValueError("server.audit_signing_private_key_env and audit_signing_key_id must be configured together")
+    if signing_key_env is not None and (not isinstance(signing_key_env, str) or not signing_key_env.strip()):
+        raise ValueError("server.audit_signing_private_key_env must name an environment variable")
+    if signing_key_id is not None and (not isinstance(signing_key_id, str) or not signing_key_id.strip()):
+        raise ValueError("server.audit_signing_key_id must be a non-empty string")
     async_jobs = config.get("async_jobs", {})
     if not isinstance(async_jobs, dict):
         raise TypeError("async_jobs must be an object")

@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .audit_security import audit_entry_hash
 from .config import MIN_TENANT_USAGE_RETENTION_DAYS
 from .webhook_security import webhook_endpoint_id
 
@@ -30,15 +31,11 @@ class WebhookEndpointBusy(ValueError):
     """An endpoint circuit cannot be reset while a delivery is in flight."""
 
 
+class MaintenanceLeaseLost(RuntimeError):
+    """A maintenance task attempted a write with an expired or superseded lease."""
+
+
 AUDIT_GENESIS_HASH = "0" * 64
-
-
-def audit_entry_hash(event_id: int, occurred_at: str, actor: str, action: str,
-                     status_code: int, previous_hash: str) -> str:
-    payload = json.dumps({"id": event_id, "occurred_at": occurred_at, "actor": actor,
-        "action": action, "status_code": int(status_code), "previous_hash": previous_hash},
-        sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    return hashlib.sha256(payload).hexdigest()
 
 
 class UsageStore:
@@ -218,8 +215,12 @@ class UsageStore:
                 ON async_jobs(idempotency_scope, job_type, idempotency_key_hash)
                 WHERE idempotency_key_hash IS NOT NULL""")
             db.execute("""CREATE TABLE IF NOT EXISTS maintenance_leases (
-                lease_name TEXT PRIMARY KEY, owner_id TEXT NOT NULL, lease_until TEXT NOT NULL
+                lease_name TEXT PRIMARY KEY, owner_id TEXT NOT NULL, lease_until TEXT NOT NULL,
+                fencing_token INTEGER NOT NULL DEFAULT 1
             )""")
+            lease_columns = {row[1] for row in db.execute("PRAGMA table_info(maintenance_leases)")}
+            if "fencing_token" not in lease_columns:
+                db.execute("ALTER TABLE maintenance_leases ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 1")
             self._backfill_audit_chain(db)
 
     def _connect(self) -> sqlite3.Connection:
@@ -231,6 +232,10 @@ class UsageStore:
     @staticmethod
     def _backfill_audit_chain(db: sqlite3.Connection) -> None:
         state = db.execute("SELECT anchor_id,anchor_hash FROM admin_audit_chain_state WHERE singleton=1").fetchone()
+        missing = db.execute("SELECT 1 FROM admin_audit_events WHERE id>? AND (previous_hash IS NULL OR entry_hash IS NULL) LIMIT 1",
+                             (state["anchor_id"],)).fetchone()
+        if not missing:
+            return
         previous = state["anchor_hash"]
         rows = db.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
                           "FROM admin_audit_events WHERE id>? ORDER BY id", (state["anchor_id"],)).fetchall()
@@ -260,19 +265,59 @@ class UsageStore:
         db.execute("UPDATE admin_audit_events SET entry_hash=? WHERE id=?", (entry_hash, cursor.lastrowid))
 
     def acquire_maintenance_lease(self, lease_name: str, owner_id: str, lease_seconds: int,
-                                  now: datetime | None = None) -> bool:
+                                  now: datetime | None = None) -> int | None:
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be positive")
         now = now or datetime.now(UTC)
         until = (now + timedelta(seconds=lease_seconds)).isoformat()
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            cursor = db.execute("""INSERT INTO maintenance_leases (lease_name,owner_id,lease_until)
-                VALUES (?,?,?) ON CONFLICT(lease_name) DO UPDATE SET
-                owner_id=excluded.owner_id,lease_until=excluded.lease_until
-                WHERE maintenance_leases.lease_until<=? OR maintenance_leases.owner_id=?""",
-                (lease_name, owner_id, until, now.isoformat(), owner_id))
+            cursor = db.execute("""INSERT INTO maintenance_leases (lease_name,owner_id,lease_until,fencing_token)
+                VALUES (?,?,?,1) ON CONFLICT(lease_name) DO UPDATE SET
+                fencing_token=CASE WHEN maintenance_leases.lease_until<=? THEN maintenance_leases.fencing_token+1
+                    ELSE maintenance_leases.fencing_token END,
+                owner_id=CASE WHEN maintenance_leases.lease_until<=? THEN excluded.owner_id
+                    ELSE maintenance_leases.owner_id END,
+                lease_until=excluded.lease_until
+                WHERE maintenance_leases.lease_until<=? OR maintenance_leases.owner_id=?
+                RETURNING fencing_token""",
+                (lease_name, owner_id, until, now.isoformat(), now.isoformat(), now.isoformat(), owner_id))
+            row = cursor.fetchone()
+            return int(row[0]) if row else None
+
+    def renew_maintenance_lease(self, lease_name: str, owner_id: str, fencing_token: int,
+                                lease_seconds: int, now: datetime | None = None) -> bool:
+        now = now or datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            cursor = db.execute("""UPDATE maintenance_leases SET lease_until=? WHERE lease_name=?
+                AND owner_id=? AND fencing_token=? AND lease_until>?""",
+                ((now + timedelta(seconds=lease_seconds)).isoformat(), lease_name, owner_id,
+                 fencing_token, now.isoformat()))
             return cursor.rowcount == 1
+
+    def maintenance_lease_state(self, lease_name: str, now: datetime | None = None) -> dict[str, Any] | None:
+        now = now or datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT owner_id,lease_until,fencing_token FROM maintenance_leases WHERE lease_name=?",
+                             (lease_name,)).fetchone()
+        if not row:
+            return None
+        expires = datetime.fromisoformat(row["lease_until"])
+        remaining = max(0.0, (expires - now).total_seconds())
+        return {"owner_id": row["owner_id"], "lease_until": row["lease_until"],
+                "fencing_token": int(row["fencing_token"]), "remaining_seconds": remaining,
+                "active": remaining > 0}
+
+    @staticmethod
+    def _assert_maintenance_lease(db: sqlite3.Connection, lease: dict[str, Any] | None) -> None:
+        if lease is None:
+            return
+        row = db.execute("SELECT owner_id,lease_until,fencing_token FROM maintenance_leases WHERE lease_name=?",
+                         (lease["name"],)).fetchone()
+        if (not row or row["owner_id"] != lease["owner_id"]
+                or int(row["fencing_token"]) != int(lease["fencing_token"])
+                or row["lease_until"] <= datetime.now(UTC).isoformat()):
+            raise MaintenanceLeaseLost(f"maintenance lease {lease['name']!r} expired or was fenced")
 
     def reserve_budget(self, request_id: str, application: str, amount_usd: float, monthly_limit_usd: float,
                        now: datetime | None = None) -> None:
@@ -338,7 +383,8 @@ class UsageStore:
             return [dict(row) for row in rows]
 
     def prune_tenant_requests(self, tenant_id: str, retention_days: int,
-                              now: datetime | None = None) -> int:
+                              now: datetime | None = None,
+                              lease: dict[str, Any] | None = None) -> int:
         if int(retention_days) < MIN_TENANT_USAGE_RETENTION_DAYS:
             raise ValueError(f"usage_retention_days must be at least {MIN_TENANT_USAGE_RETENTION_DAYS}")
         now = now or datetime.now(UTC)
@@ -346,6 +392,7 @@ class UsageStore:
         prefix = f"{tenant_id}:"
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._assert_maintenance_lease(db, lease)
             deleted = 0
             for table in ("requests", "routing_decisions", "shadow_observations"):
                 cursor = db.execute(f"DELETE FROM {table} WHERE substr(application,1,length(?))=? AND occurred_at < ?",
@@ -573,10 +620,12 @@ class UsageStore:
             return status
 
     def recover_stalled_async_jobs(self, *, max_attempts: int, base_delay_seconds: float,
-                                   max_delay_seconds: float) -> int:
+                                   max_delay_seconds: float,
+                                   lease: dict[str, Any] | None = None) -> int:
         now = datetime.now(UTC)
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._assert_maintenance_lease(db, lease)
             stalled = db.execute("""SELECT job_id, attempt_count, cancel_requested FROM async_jobs
                 WHERE status='running' AND lease_until <= ?""", (now.isoformat(),)).fetchall()
             for job in stalled:
@@ -686,9 +735,12 @@ class UsageStore:
                     keys.add(value["artifact_key"])
         return sorted(keys)
 
-    def prune_tenant_async_jobs(self, tenant_id: str, retention_days: int) -> int:
+    def prune_tenant_async_jobs(self, tenant_id: str, retention_days: int,
+                                lease: dict[str, Any] | None = None) -> int:
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
         with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._assert_maintenance_lease(db, lease)
             cursor = db.execute("""DELETE FROM async_jobs WHERE tenant_id=?
                 AND status IN ('completed','failed','cancelled','dead_letter')
                 AND COALESCE(completed_at, updated_at, created_at) < ?""", (tenant_id, cutoff))
@@ -857,12 +909,15 @@ class UsageStore:
                 self._append_audit(db, actor, f"webhook_redrive:{event_id}", 202, now.isoformat())
             return redriven
 
-    def prune_webhook_history(self, retention_days: int, now: datetime | None = None) -> dict[str, int]:
+    def prune_webhook_history(self, retention_days: int, now: datetime | None = None,
+                              lease: dict[str, Any] | None = None) -> dict[str, int]:
         if not isinstance(retention_days, int) or isinstance(retention_days, bool) or retention_days < 1:
             raise ValueError("retention_days must be a positive integer")
         cutoff = ((now or datetime.now(UTC)) - timedelta(days=retention_days)).isoformat()
         terminal = "SELECT event_id FROM webhook_outbox WHERE status IN ('delivered','dead_letter') AND COALESCE(delivered_at,updated_at,created_at) < ?"
         with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._assert_maintenance_lease(db, lease)
             attempts = db.execute(f"DELETE FROM webhook_delivery_attempts WHERE event_id IN ({terminal})", (cutoff,)).rowcount
             events = db.execute(f"DELETE FROM webhook_outbox WHERE event_id IN ({terminal})", (cutoff,)).rowcount
             return {"events": int(events), "attempts": int(attempts)}
@@ -1007,17 +1062,20 @@ class UsageStore:
             status = self._audit_chain_status(db)
             events = [dict(row) for row in db.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
                 "FROM admin_audit_events ORDER BY id DESC")]
-        canonical = json.dumps(events, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        from .audit_security import canonical_json
+        canonical = canonical_json(events)
         return {"format": "llm-gateway-admin-audit-v1", "exported_at": datetime.now(UTC).isoformat(),
                 "chain": status, "export_sha256": hashlib.sha256(canonical).hexdigest(), "events": events}
 
-    def prune_admin_audit_events(self, retention_days: int, now: datetime | None = None) -> dict[str, Any]:
+    def prune_admin_audit_events(self, retention_days: int, now: datetime | None = None,
+                                 lease: dict[str, Any] | None = None) -> dict[str, Any]:
         if not isinstance(retention_days, int) or isinstance(retention_days, bool) or retention_days < 1:
             raise ValueError("retention_days must be a positive integer")
         now = now or datetime.now(UTC)
         cutoff = (now - timedelta(days=retention_days)).isoformat()
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._assert_maintenance_lease(db, lease)
             status = self._audit_chain_status(db)
             if not status["verified"]:
                 raise ValueError(f"admin audit chain integrity check failed at event {status['first_invalid_id']}")
@@ -1040,6 +1098,30 @@ class UsageStore:
             return [dict(row) for row in db.execute(
                 "SELECT id, occurred_at, actor, action, status_code, previous_hash, entry_hash FROM admin_audit_events ORDER BY id DESC LIMIT ?",
                 (limit,)).fetchall()]
+
+    def query_audit_events(self, *, limit: int = 100, cursor: int | None = None,
+                           actor: str | None = None, action: str | None = None,
+                           status_code: int | None = None, occurred_from: str | None = None,
+                           occurred_to: str | None = None) -> dict[str, Any]:
+        clauses, values = [], []
+        for column, value in (("id", cursor), ("actor", actor), ("action", action),
+                              ("status_code", status_code)):
+            if value is not None:
+                clauses.append(f"{column} < ?" if column == "id" else f"{column} = ?")
+                values.append(value)
+        if occurred_from is not None:
+            clauses.append("occurred_at >= ?")
+            values.append(occurred_from)
+        if occurred_to is not None:
+            clauses.append("occurred_at <= ?")
+            values.append(occurred_to)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock, self._connect() as db:
+            rows = db.execute("SELECT id,occurred_at,actor,action,status_code,previous_hash,entry_hash "
+                f"FROM admin_audit_events{where} ORDER BY id DESC LIMIT ?", (*values, limit + 1)).fetchall()
+        has_more = len(rows) > limit
+        events = [dict(row) for row in rows[:limit]]
+        return {"events": events, "next_cursor": events[-1]["id"] if has_more and events else None}
 
     def record_tool_call_audits(self, request_id: str, tenant_id: str | None, application: str,
                                 events: list[dict[str, Any]]) -> None:
