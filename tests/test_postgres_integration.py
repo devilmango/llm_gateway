@@ -107,7 +107,10 @@ def test_postgres_hold_created_during_retention_prune_is_not_lost():
     suffix = uuid.uuid4().hex
     function_name = f"test_hold_pause_{suffix}"
     trigger_name = f"test_hold_pause_trigger_{suffix}"
-    now = datetime.now(UTC) + timedelta(days=500)
+    # Age all events that precede this target in the shared CI database, while
+    # keeping the actual hold and audit action timestamps near wall-clock time.
+    now = datetime.now(UTC)
+    prune_now = now + timedelta(days=500)
     actor = f"integration-hold-race-{suffix}"
     first.record_audit(actor, "hold-prune-race-target", 200, now - timedelta(days=500))
     event_id = first.query_audit_events(limit=1, actor=actor)["events"][0]["id"]
@@ -135,7 +138,7 @@ def test_postgres_hold_created_during_retention_prune_is_not_lost():
                 time.sleep(0.025)
             assert hold_paused, "hold insert did not reach the database pause trigger"
 
-            prune_future = executor.submit(second.prune_admin_audit_events, 365, now)
+            prune_future = executor.submit(second.prune_admin_audit_events, 365, prune_now)
             deadline = time.monotonic() + 10
             prune_waiting = False
             while time.monotonic() < deadline:
@@ -205,11 +208,10 @@ def test_postgres_audit_archive_metadata_survives_migrations_and_replica_reads()
 
 def test_postgres_audit_holds_are_transactional_and_audited():
     store = _postgres_store()
-    # Keep synthetic event times monotonic even when CI runs this test twice
-    # against the same service database.
-    latest = store.audit_events(limit=1)
-    latest_time = datetime.fromisoformat(latest[0]["occurred_at"]) if latest else datetime.now(UTC)
-    now = max(datetime.now(UTC), latest_time) + timedelta(days=500)
+    # Keep persisted audit timestamps near wall-clock time. Advance only the
+    # retention operation's clock to make this target eligible for pruning.
+    now = datetime.now(UTC)
+    prune_now = now + timedelta(days=500)
     expired_at = now - timedelta(days=500)
     actor = "integration-retention-" + uuid.uuid4().hex
     try:
@@ -226,14 +228,14 @@ def test_postgres_audit_holds_are_transactional_and_audited():
                    for item in store.admin_audit_holds(active_only=True, limit=1000))
         assert store.audit_chain_status()["verified"] is True
 
-        pruned = store.prune_admin_audit_events(365, now=now)
+        pruned = store.prune_admin_audit_events(365, now=prune_now)
         assert pruned["held_event_id"] == event_id
         assert store.query_audit_events(limit=1000, actor=actor)["events"]
 
         released = store.release_admin_audit_hold(event_id, "integration-operator", now + timedelta(seconds=1))
         assert released["released_by"] == "integration-operator"
         assert store.admin_audit_holds(active_only=True, limit=1000) == []
-        store.prune_admin_audit_events(365, now=now + timedelta(seconds=1))
+        store.prune_admin_audit_events(365, now=prune_now + timedelta(seconds=1))
         assert not store.query_audit_events(limit=1000, actor=actor)["events"]
         assert store.audit_chain_status()["verified"] is True
     finally:
